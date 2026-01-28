@@ -1,0 +1,168 @@
+# CartPole Q-Learning Project
+# Complete Command Reference
+
+# ============================================================
+# SETUP (One-time)
+# ============================================================
+
+# 1. Navigate to project
+cd cartpole-qlearning
+
+# 2. Create virtual environment (recommended)
+python -m venv venv
+
+# 3. Activate virtual environment
+.\venv\Scripts\Activate.ps1   # Windows PowerShell
+# source venv/bin/activate     # macOS/Linux
+
+# 4. Install all dependencies
+pip install -r requirements.txt
+
+# ============================================================
+# RUNNING THE SIMULATIONS
+# ============================================================
+
+# Option 1: Pygame Desktop Visualization
+# - Opens a window showing the CartPole
+# - Updates in real-time at 60 FPS
+# - Press ESC to stop
+python train_pygame.py
+
+# Option 2: Web Dashboard
+# - Runs a FastAPI server
+# - Open browser to http://localhost:8000
+# - Click "Start Training" button
+python train_web.py
+
+# Option 3: Train Without Visualization (Fast)
+# - Trains and evaluates agent
+# - Shows only console output
+# - Saves trained agent to file
+python evaluate_agent.py
+
+# ============================================================
+# POLICY GRADIENT COMPARISON
+# ============================================================
+
+# Compare Q-Learning vs Policy Gradient
+# - Shows side-by-side differences
+# - Optional: Train policy gradient agent
+# - Demonstrates neural network approach
+python policy_gradient.py
+
+# ============================================================
+# CUSTOMIZATION EXAMPLES
+# ============================================================
+
+# To modify training parameters, edit the Python files:
+
+# train_pygame.py - Line ~265
+# Change these values:
+#   num_episodes=500         → Number of training episodes
+#   max_steps_per_episode=500 → Max steps per episode
+#   render_delay=0           → Delay in ms (higher = slower)
+
+# train_web.py - Line ~347
+# Change these values:
+#   num_episodes = 500       → Number of episodes
+#   max_steps = 500          → Max steps per episode
+
+# q_agent.py - Line ~165
+# Change these hyperparameters:
+#   n_bins=(6, 6, 12, 12)    → State discretization bins
+#   learning_rate=0.1        → How fast to learn (α)
+#   discount_factor=0.99     → Future reward importance (γ)
+#   epsilon_start=1.0        → Initial exploration rate
+#   epsilon_min=0.01         → Minimum exploration rate
+#   epsilon_decay=0.995      → Exploration decay per episode
+
+# ============================================================
+# TROUBLESHOOTING
+# ============================================================
+
+# If packages fail to install:
+pip install --upgrade pip
+pip install -r requirements.txt --force-reinstall
+
+# If Pygame window doesn't open:
+pip install --upgrade pygame
+
+# If web server fails to start:
+pip install --upgrade fastapi uvicorn websockets
+
+# If gymnasium import fails:
+pip install gymnasium
+
+# If torch import fails (for policy gradient):
+pip install torch
+
+# To check installed packages:
+pip list
+
+# To verify Python version (need 3.8+):
+python --version
+
+# ============================================================
+# FILE STRUCTURE
+# ============================================================
+
+# cartpole-qlearning/
+# ├── q_agent.py              # Q-learning agent implementation
+# ├── train_pygame.py         # Pygame visualization
+# ├── train_web.py            # Web dashboard with FastAPI
+# ├── evaluate_agent.py       # Training/evaluation without viz
+# ├── policy_gradient.py      # Policy gradient comparison
+# ├── requirements.txt        # Python dependencies
+# ├── README.md              # Full documentation
+# ├── QUICKSTART.md          # Quick start guide
+# └── COMMANDS.txt           # This file
+
+# ============================================================
+# EXPECTED RESULTS
+# ============================================================
+
+# After ~200-300 episodes:
+#   - Average reward: 150-300
+#   - Epsilon: ~0.5
+#   - Pole noticeably more stable
+
+# After ~500 episodes:
+#   - Average reward: 300-500 (near optimal)
+#   - Epsilon: ~0.01
+#   - Pole stays upright for full 500 steps
+
+# CartPole is "solved" when average reward >= 195 over 100 episodes
+
+# ============================================================
+# LEARNING RESOURCES
+# ============================================================
+
+# Read the files in this order:
+# 1. QUICKSTART.md    - Get started immediately
+# 2. q_agent.py       - Understand Q-learning core
+# 3. train_pygame.py  - See visualization implementation
+# 4. README.md        - Deep dive into theory
+# 5. policy_gradient.py - Learn about deep RL transition
+
+# ============================================================
+# TIPS
+# ============================================================
+
+# - Start with Pygame version (simplest)
+# - Use web version to share with others
+# - Read code comments - they explain everything
+# - Experiment with hyperparameters
+# - Compare Q-learning with policy gradient
+# - Save trained agents for later evaluation
+
+# ============================================================
+# NEXT STEPS
+# ============================================================
+
+# 1. Run the basic Pygame version
+# 2. Modify hyperparameters and see effects
+# 3. Try the web version
+# 4. Study the policy gradient comparison
+# 5. Implement your own improvements!
+
+# Happy Learning! 🎓
