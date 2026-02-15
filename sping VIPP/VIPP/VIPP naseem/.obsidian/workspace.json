@@ -1,0 +1,361 @@
+{
+  "main": {
+    "id": "a148b73ad5c9c455",
+    "type": "split",
+    "children": [
+      {
+        "id": "414cc9bdced840ae",
+        "type": "tabs",
+        "children": [
+          {
+            "id": "14b40539a7e0898a",
+            "type": "leaf",
+            "state": {
+              "type": "markdown",
+              "state": {
+                "file": "week 0/highway-env Implementation.md",
+                "mode": "source",
+                "source": false
+              },
+              "icon": "lucide-file",
+              "title": "highway-env Implementation"
+            }
+          },
+          {
+            "id": "ae5479fe68fa3630",
+            "type": "leaf",
+            "state": {
+              "type": "markdown",
+              "state": {
+                "file": "week 0/implementation2.md",
+                "mode": "source",
+                "source": false
+              },
+              "icon": "lucide-file",
+              "title": "implementation2"
+            }
+          },
+          {
+            "id": "3a1bb02dcc6bb98f",
+            "type": "leaf",
+            "state": {
+              "type": "markdown",
+              "state": {
+                "file": "week 0/implementation3_meetingnotes.md",
+                "mode": "source",
+                "source": false
+              },
+              "icon": "lucide-file",
+              "title": "implementation3_meetingnotes"
+            }
+          },
+          {
+            "id": "546e3c9772ee24aa",
+            "type": "leaf",
+            "state": {
+              "type": "markdown",
+              "state": {
+                "file": "week 0/highway-env Implementation.md",
+                "mode": "source",
+                "source": false
+              },
+              "icon": "lucide-file",
+              "title": "highway-env Implementation"
+            }
+          },
+          {
+            "id": "1cd93e3be0884dfc",
+            "type": "leaf",
+            "state": {
+              "type": "markdown",
+              "state": {
+                "file": "week 1/implementation.md",
+                "mode": "source",
+                "source": false
+              },
+              "icon": "lucide-file",
+              "title": "implementation"
+            }
+          },
+          {
+            "id": "a4fd0d8e907458fe",
+            "type": "leaf",
+            "state": {
+              "type": "markdown",
+              "state": {
+                "file": "literature review/Literature review.md",
+                "mode": "source",
+                "source": false
+              },
+              "icon": "lucide-file",
+              "title": "Literature review"
+            }
+          },
+          {
+            "id": "8ad7d7bbad7b0171",
+            "type": "leaf",
+            "state": {
+              "type": "markdown",
+              "state": {
+                "file": "week 1/implementation.md",
+                "mode": "source",
+                "source": false
+              },
+              "icon": "lucide-file",
+              "title": "implementation"
+            }
+          },
+          {
+            "id": "df135e8fe3500aca",
+            "type": "leaf",
+            "state": {
+              "type": "markdown",
+              "state": {
+                "file": "VIPP/week 1/Presentation preparation.md",
+                "mode": "source",
+                "source": false
+              },
+              "icon": "lucide-file",
+              "title": "Presentation preparation"
+            }
+          },
+          {
+            "id": "c99e4e885ed741af",
+            "type": "leaf",
+            "state": {
+              "type": "markdown",
+              "state": {
+                "file": "2026-02-06.md",
+                "mode": "source",
+                "source": false
+              },
+              "icon": "lucide-file",
+              "title": "2026-02-06"
+            }
+          },
+          {
+            "id": "a3fc2c56259c7ddf",
+            "type": "leaf",
+            "state": {
+              "type": "markdown",
+              "state": {
+                "file": "Teleop/Teleop.md",
+                "mode": "source",
+                "source": false
+              },
+              "icon": "lucide-file",
+              "title": "Teleop"
+            }
+          },
+          {
+            "id": "f5d1f598c65c20b4",
+            "type": "leaf",
+            "state": {
+              "type": "markdown",
+              "state": {
+                "file": "Teleop/Literature Review.md",
+                "mode": "source",
+                "source": false
+              },
+              "icon": "lucide-file",
+              "title": "Literature Review"
+            }
+          }
+        ],
+        "currentTab": 10
+      }
+    ],
+    "direction": "vertical"
+  },
+  "left": {
+    "id": "f5baf7dd73434b38",
+    "type": "split",
+    "children": [
+      {
+        "id": "6281a04c3a0be5cf",
+        "type": "tabs",
+        "children": [
+          {
+            "id": "833dff8d790cfe14",
+            "type": "leaf",
+            "state": {
+              "type": "file-explorer",
+              "state": {
+                "sortOrder": "alphabetical",
+                "autoReveal": false
+              },
+              "icon": "lucide-folder-closed",
+              "title": "Files"
+            }
+          },
+          {
+            "id": "ae71913c1567fae3",
+            "type": "leaf",
+            "state": {
+              "type": "search",
+              "state": {
+                "query": "",
+                "matchingCase": false,
+                "explainSearch": false,
+                "collapseAll": false,
+                "extraContext": false,
+                "sortOrder": "alphabetical"
+              },
+              "icon": "lucide-search",
+              "title": "Search"
+            }
+          },
+          {
+            "id": "a37a512e4eceda07",
+            "type": "leaf",
+            "state": {
+              "type": "bookmarks",
+              "state": {},
+              "icon": "lucide-bookmark",
+              "title": "Bookmarks"
+            }
+          }
+        ]
+      }
+    ],
+    "direction": "horizontal",
+    "width": 200
+  },
+  "right": {
+    "id": "2794b84cd94d7453",
+    "type": "split",
+    "children": [
+      {
+        "id": "90eb59b0dba625d7",
+        "type": "tabs",
+        "children": [
+          {
+            "id": "e27c443baf1038e9",
+            "type": "leaf",
+            "state": {
+              "type": "backlink",
+              "state": {
+                "file": "Literature review/summary of week 0.md",
+                "collapseAll": false,
+                "extraContext": false,
+                "sortOrder": "alphabetical",
+                "showSearch": false,
+                "searchQuery": "",
+                "backlinkCollapsed": false,
+                "unlinkedCollapsed": true
+              },
+              "icon": "links-coming-in",
+              "title": "Backlinks for summary of week 0"
+            }
+          },
+          {
+            "id": "7fad67c979928157",
+            "type": "leaf",
+            "state": {
+              "type": "outgoing-link",
+              "state": {
+                "file": "Literature review/summary of week 0.md",
+                "linksCollapsed": false,
+                "unlinkedCollapsed": true
+              },
+              "icon": "links-going-out",
+              "title": "Outgoing links from summary of week 0"
+            }
+          },
+          {
+            "id": "3c805f7c450b56d6",
+            "type": "leaf",
+            "state": {
+              "type": "tag",
+              "state": {
+                "sortOrder": "frequency",
+                "useHierarchy": true,
+                "showSearch": false,
+                "searchQuery": ""
+              },
+              "icon": "lucide-tags",
+              "title": "Tags"
+            }
+          },
+          {
+            "id": "cd59bea17e7bc99b",
+            "type": "leaf",
+            "state": {
+              "type": "all-properties",
+              "state": {
+                "sortOrder": "frequency",
+                "showSearch": false,
+                "searchQuery": ""
+              },
+              "icon": "lucide-archive",
+              "title": "All properties"
+            }
+          },
+          {
+            "id": "f3d732fef38417e3",
+            "type": "leaf",
+            "state": {
+              "type": "outline",
+              "state": {
+                "file": "Literature review/summary of week 0.md",
+                "followCursor": false,
+                "showSearch": false,
+                "searchQuery": ""
+              },
+              "icon": "lucide-list",
+              "title": "Outline of summary of week 0"
+            }
+          }
+        ]
+      }
+    ],
+    "direction": "horizontal",
+    "width": 300,
+    "collapsed": true
+  },
+  "left-ribbon": {
+    "hiddenItems": {
+      "switcher:Open quick switcher": false,
+      "graph:Open graph view": false,
+      "canvas:Create new canvas": false,
+      "daily-notes:Open today's daily note": false,
+      "templates:Insert template": false,
+      "command-palette:Open command palette": false,
+      "bases:Create new base": false
+    }
+  },
+  "active": "f5d1f598c65c20b4",
+  "lastOpenFiles": [
+    "Teleop/Teleop.md",
+    "Teleop/Literature Review.md",
+    "episode_comparison.png",
+    "Pasted image 20260213202226.png",
+    "given (1).png",
+    "VIPP/Documentation/Project overview.md",
+    "VIPP/literature review/Literature review.md",
+    "VIPP/literature review/Explainable AI.md",
+    "2026-02-06.md",
+    "Teleop",
+    "2026-02-03.md",
+    "2026-02-01.md",
+    "VIPP/week 1/Next steps.md",
+    "VIPP",
+    "Documentation/Naseem",
+    "VIPP/week 1/Presentation preparation.md",
+    "VIPP/week 1/implementation.md",
+    "VIPP/literature review",
+    "VIPP/week 0/highway-env Implementation.md",
+    "VIPP/week 1",
+    "VIPP/week 0/implementation3_meetingnotes.md",
+    "VIPP/week 0/implementation2.md",
+    "Untitled.base",
+    "week 0/highway-env impl. 2.canvas",
+    "VIPP/week 0",
+    "Literature review/Untitled",
+    "VIPP/week 0_/first meeting/week 0.md",
+    "VIPP/week 0_/first meeting/Meeting 0.md",
+    "VIPP/week 0_/first meeting/summary of week 0.md",
+    "VIPP/week 0_/first meeting",
+    "Literature review/Untitled"
+  ]
+}
