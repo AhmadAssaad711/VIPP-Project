@@ -1,9 +1,9 @@
-"""
-Physics-Informed RL Agent - Q-Learning with (e_y, e_psi, kappa_err) State
-==========================================================================
-Tabular Q-learning agent that adds curvature error (kappa_err) to the
-state representation. Curvature is defined as the rate of change of
-heading over an arc-length window.
+"""Physics-Informed RL Agent - Q-Learning with (e_y, e_psi, kappa_err, kappa_near, kappa_la) State
+=================================================================================================
+Tabular Q-learning agent that adds curvature error (kappa_err), lane
+curvature at the nearest point (kappa_near), and lane curvature at a
+lookahead distance along arc length (kappa_la) to the state representation.
+Curvature is defined as the rate of change of heading over an arc-length window.
 """
 
 import matplotlib
@@ -43,6 +43,7 @@ env.reset()
 vehicle = env.unwrapped.vehicle
 CAR_LENGTH = vehicle.LENGTH
 CURVATURE_DS = 2.0 * CAR_LENGTH   # arc-length window
+LOOKAHEAD_DIST = 5.0 * CAR_LENGTH  # lookahead distance for curvature preview
 
 # =======================
 # ACTION SPACE (curvature commands)
@@ -61,10 +62,14 @@ KAPPA_MAX = 0.2
 N_EY = 10
 N_EPSI = 10
 N_KAPPA = 10
+N_KAPPA_NEAR = 5     # bins for lane curvature at nearest point
+N_KAPPA_LA = 5       # bins for lane curvature at lookahead
 
 e_y_bins = np.linspace(-EY_MAX, EY_MAX, N_EY)
 e_psi_bins = np.linspace(-EPSI_MAX, EPSI_MAX, N_EPSI)
 kappa_bins = np.linspace(-KAPPA_MAX, KAPPA_MAX, N_KAPPA)
+kappa_near_bins = np.linspace(-KAPPA_MAX, KAPPA_MAX, N_KAPPA_NEAR)
+kappa_la_bins = np.linspace(-KAPPA_MAX, KAPPA_MAX, N_KAPPA_LA)
 
 # =======================
 # UTILS
@@ -88,7 +93,8 @@ def discretize_obs(prev_heading, prev_pos):
     psi_lane = lane.heading_at(s)
     e_psi = wrap_angle(vehicle.heading - psi_lane)
 
-    kappa_lane = lane_curvature(lane, s, CURVATURE_DS)
+    kappa_near = lane_curvature(lane, s, CURVATURE_DS)          # curvature at nearest point
+    kappa_la = lane_curvature(lane, s + LOOKAHEAD_DIST, CURVATURE_DS)  # curvature at lookahead
 
     ds = np.linalg.norm(vehicle.position - prev_pos)
     if ds > 1e-6:
@@ -96,17 +102,21 @@ def discretize_obs(prev_heading, prev_pos):
     else:
         kappa_vehicle = 0.0
 
-    kappa_err = kappa_vehicle - kappa_lane
+    kappa_err = kappa_vehicle - kappa_near
 
     e_y = np.clip(e_y, -EY_MAX, EY_MAX)
     e_psi = np.clip(e_psi, -EPSI_MAX, EPSI_MAX)
     kappa_vehicle = np.clip(kappa_vehicle, -KAPPA_MAX, KAPPA_MAX)
     kappa_err = np.clip(kappa_err, -KAPPA_MAX, KAPPA_MAX)
+    kappa_near = np.clip(kappa_near, -KAPPA_MAX, KAPPA_MAX)
+    kappa_la = np.clip(kappa_la, -KAPPA_MAX, KAPPA_MAX)
 
     return (
         np.digitize(e_y, e_y_bins),
         np.digitize(e_psi, e_psi_bins),
         np.digitize(kappa_err, kappa_bins),
+        np.digitize(kappa_near, kappa_near_bins),
+        np.digitize(kappa_la, kappa_la_bins),
     ), e_y, e_psi, kappa_vehicle, kappa_err
 
 # =======================
@@ -214,7 +224,7 @@ plt.figure(figsize=(8, 4))
 plt.plot(x, avg_steps)
 plt.xlabel("Episodes")
 plt.ylabel("Avg Steps")
-plt.title("Steps vs Training (e_y, e_psi, kappa)")
+plt.title("Steps vs Training (e_y, e_psi, kappa, kappa_near, kappa_la)")
 plt.grid(True)
 plt.tight_layout()
 plt.savefig(os.path.join(RESULTS_DIR, "steps_vs_training.png"), dpi=300)
@@ -224,7 +234,7 @@ plt.figure(figsize=(8, 4))
 plt.plot(x, avg_return)
 plt.xlabel("Episodes")
 plt.ylabel("Avg Return")
-plt.title("Reward vs Training (e_y, e_psi, kappa)")
+plt.title("Reward vs Training (e_y, e_psi, kappa, kappa_near, kappa_la)")
 plt.grid(True)
 plt.tight_layout()
 plt.savefig(os.path.join(RESULTS_DIR, "reward_vs_training.png"), dpi=300)
@@ -237,21 +247,23 @@ plt.figure(figsize=(8, 4))
 plt.plot(x, avg_error)
 plt.xlabel("Episodes")
 plt.ylabel("Avg Normalized Error/Step")
-plt.title("Error per Step vs Training (e_y, e_psi, kappa)")
+plt.title("Error per Step vs Training (e_y, e_psi, kappa, kappa_near, kappa_la)")
 plt.grid(True)
 plt.tight_layout()
 plt.savefig(os.path.join(RESULTS_DIR, "error_per_step_vs_training.png"), dpi=300)
 plt.close()
 
 # =======================
-# 3D POLICY HEATMAP (kappa slices)
+# 3D POLICY HEATMAP (kappa slices, mid kappa_near & kappa_la)
 # =======================
+mid_kn = N_KAPPA_NEAR // 2
+mid_kla = N_KAPPA_LA // 2
 for k_bin in [2, N_KAPPA // 2, N_KAPPA - 3]:
     policy = np.zeros((N_EY, N_EPSI))
 
     for i in range(N_EY):
         for j in range(N_EPSI):
-            state = (i + 1, j + 1, k_bin)
+            state = (i + 1, j + 1, k_bin, mid_kn, mid_kla)
             if state in Q:
                 policy[i, j] = ACTIONS[np.argmax(Q[state])]
 
@@ -270,19 +282,19 @@ for k_bin in [2, N_KAPPA // 2, N_KAPPA - 3]:
     plt.colorbar(label="Curvature [1/m]")
     plt.xlabel("Heading Error e_psi [deg]")
     plt.ylabel("Lateral Error e_y [m]")
-    plt.title(f"Policy Heatmap at Curvature Bin {k_bin}")
+    plt.title(f"Policy Heatmap at kappa_err bin {k_bin} (kn={mid_kn}, kla={mid_kla})")
     plt.tight_layout()
     plt.savefig(os.path.join(RESULTS_DIR, f"policy_heatmap_kappa_bin_{k_bin}.png"), dpi=300)
     plt.close()
 
 # =======================
-# 3D Q-TABLE HEATMAP
+# 3D Q-TABLE HEATMAP (marginalised over kappa_near & kappa_la at mid bins)
 # =======================
 q_max_grid = np.zeros((N_EY, N_EPSI, N_KAPPA))
 for i in range(N_EY):
     for j in range(N_EPSI):
         for k in range(N_KAPPA):
-            state = (i + 1, j + 1, k)
+            state = (i + 1, j + 1, k, mid_kn, mid_kla)
             if state in Q:
                 q_max_grid[i, j, k] = np.max(Q[state])
 
@@ -307,8 +319,8 @@ sc = ax.scatter(
 fig.colorbar(sc, ax=ax, label="Max Q")
 ax.set_xlabel("e_y bin")
 ax.set_ylabel("e_psi bin")
-ax.set_zlabel("kappa bin")
-ax.set_title("3D Q-Table Heatmap")
+ax.set_zlabel("kappa_err bin")
+ax.set_title("3D Q-Table Heatmap (kn=mid, kla=mid)")
 plt.tight_layout()
 plt.savefig(os.path.join(RESULTS_DIR, "q_table_3d_heatmap.png"), dpi=300)
 plt.close()
