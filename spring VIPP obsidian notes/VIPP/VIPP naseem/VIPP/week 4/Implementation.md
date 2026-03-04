@@ -7,6 +7,10 @@
 		* so want to change a couple of things
 		* curvature is currently map-centric defined, then agent would memorize rather than generalize
 
+### memorization vs generalization
+
+
+
 
 #### changing observation space
 
@@ -18,15 +22,29 @@
 ### changing reward function
 
 * an ablation study, how does each term affect the reward function
+	* normal reward function: 3 terms norm error, alive rewad, and jerk
+
+![[error_per_step_vs_training.png]]
+
+
+![[path_following_q_learning.png]]
 
 
 
 
 
+![[steps_vs_training.png]]
 
-* 
+---
+#### no alive reward:
 
 
+![[error_per_step_vs_training 1.png]]
+
+![[policy_heatmap.png]]
+
+
+### jerk cost
 
 ==key ideas to look out for:==
 

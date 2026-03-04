@@ -137,7 +137,7 @@ try:
 
             norm_error = (e_y / EY_MAX) ** 2 + lambda_psi * (e_psi / EPSI_MAX) ** 2
             jerk_cost = (action - prev_action) ** 2
-            reward = alive_reward - norm_error - lambda_jerk * jerk_cost
+            reward = alive_reward - norm_error
 
             Q[s][a_idx] += alpha * (
                 reward + gamma * np.max(Q[s_next]) - Q[s][a_idx]
