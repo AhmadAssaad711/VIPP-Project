@@ -46,6 +46,20 @@
 
 ### jerk cost
 
+
+- performance did not shift greatly, but it did shift nonetheless
+- less steps per episode
+
+
+
+## PIRL
+
+![[Pasted image 20260304153042.png]]
+
+- still even after changing the training data, bad performance
+- but i think there is a fundemental error, that is with the constant lookahead distance, really is a big reason why the first formulation worked so much more better
+
+
 ==key ideas to look out for:==
 
 * convergence of the Q-table, how much of the Q-table has been visited

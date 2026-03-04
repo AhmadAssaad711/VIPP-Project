@@ -16,6 +16,8 @@ from collections import defaultdict
 import matplotlib.pyplot as plt
 from mpl_toolkits.mplot3d import Axes3D  # noqa: F401
 import os
+import pickle
+import sys
 
 from highway_env.envs.racetrack_env import RacetrackEnv
 from highway_env.road.road import Road, RoadNetwork
@@ -284,8 +286,10 @@ def lane_curvature(lane, s, ds):
 # =======================
 # OBSERVATION FUNCTION
 # =======================
-def discretize_obs(prev_heading, prev_pos):
-    vehicle = env.unwrapped.vehicle
+def discretize_obs(prev_heading, prev_pos, target_env=None):
+    if target_env is None:
+        target_env = env
+    vehicle = target_env.unwrapped.vehicle
     lane = vehicle.lane
 
     s, e_y = lane.local_coordinates(vehicle.position)
@@ -323,6 +327,9 @@ def discretize_obs(prev_heading, prev_pos):
 # =======================
 Q = defaultdict(lambda: np.zeros(N_ACTIONS))
 
+Q_TABLE_PATH = os.path.join(RESULTS_DIR, "q_table.pkl")
+SKIP_TRAINING = "--eval-only" in sys.argv or os.path.exists(Q_TABLE_PATH)
+
 # =======================
 # HYPERPARAMS
 # =======================
@@ -339,194 +346,211 @@ lambda_jerk = 0.1
 alive_reward = 0.2
 
 # =======================
-# TRAINING METRICS
+# TRAINING (skip if Q-table already saved)
 # =======================
-window = 50
-avg_return, avg_steps, avg_error = [], [], []
-ret_buf, step_buf, err_buf = [], [], []
+if SKIP_TRAINING and os.path.exists(Q_TABLE_PATH):
+    print(f"Loading Q-table from {Q_TABLE_PATH} (skipping training)")
+    with open(Q_TABLE_PATH, "rb") as f:
+        saved = pickle.load(f)
+    # Restore into defaultdict
+    Q = defaultdict(lambda: np.zeros(N_ACTIONS))
+    Q.update(saved)
+    print(f"  Loaded {len(Q)} states")
+else:
+    # =======================
+    # TRAINING METRICS
+    # =======================
+    window = 50
+    avg_return, avg_steps, avg_error = [], [], []
+    ret_buf, step_buf, err_buf = [], [], []
 
-# =======================
-# TRAINING LOOP
-# =======================
-for ep in range(1, episodes + 1):
-    # --- Cycle through maps every MAP_SWITCH_INTERVAL episodes ---
-    current_map_idx = ((ep - 1) // MAP_SWITCH_INTERVAL) % len(MAP_SEEDS)
-    env.reset(seed=MAP_SEEDS[current_map_idx])
-    vehicle = env.unwrapped.vehicle
-    prev_heading = vehicle.heading
-    prev_pos = vehicle.position.copy()
-    s, _, _, _, _ = discretize_obs(prev_heading, prev_pos)
-
-    done = False
-    total_reward = 0.0
-    error_sum = 0.0
-    steps = 0
-    prev_kappa_cmd = 0.0
-
-    while not done:
-        if np.random.rand() < epsilon:
-            a_idx = np.random.randint(N_ACTIONS)
-        else:
-            a_idx = np.argmax(Q[s])
-
-        kappa_cmd = ACTIONS[a_idx]
-        steer_cmd = np.arctan(CAR_LENGTH * kappa_cmd)
-
-        _, _, terminated, truncated, _ = env.step([steer_cmd])
-        done = terminated or truncated
-
-        s_next, e_y, e_psi, kappa_vehicle, kappa_err = discretize_obs(prev_heading, prev_pos)
-
-        norm_error = (
-            (e_y / EY_MAX) ** 2
-            + lambda_psi * (e_psi / EPSI_MAX) ** 2
-            + lambda_kappa * (kappa_err / KAPPA_MAX) ** 2
-        )
-        jerk_cost = (kappa_cmd - prev_kappa_cmd) ** 2
-        reward = alive_reward - norm_error - lambda_jerk * jerk_cost
-
-        Q[s][a_idx] += alpha * (
-            reward + gamma * np.max(Q[s_next]) - Q[s][a_idx]
-        )
-
-        s = s_next
-        total_reward += reward
-        error_sum += norm_error
-        steps += 1
-
+    # =======================
+    # TRAINING LOOP
+    # =======================
+    for ep in range(1, episodes + 1):
+        # --- Cycle through maps every MAP_SWITCH_INTERVAL episodes ---
+        current_map_idx = ((ep - 1) // MAP_SWITCH_INTERVAL) % len(MAP_SEEDS)
+        env.reset(seed=MAP_SEEDS[current_map_idx])
+        vehicle = env.unwrapped.vehicle
         prev_heading = vehicle.heading
         prev_pos = vehicle.position.copy()
-        prev_kappa_cmd = kappa_cmd
+        s, _, _, _, _ = discretize_obs(prev_heading, prev_pos)
 
-        if steps >= 200:
-            break
+        done = False
+        total_reward = 0.0
+        error_sum = 0.0
+        steps = 0
+        prev_kappa_cmd = 0.0
 
-    epsilon = max(epsilon_min, epsilon * epsilon_decay)
+        while not done:
+            if np.random.rand() < epsilon:
+                a_idx = np.random.randint(N_ACTIONS)
+            else:
+                a_idx = np.argmax(Q[s])
 
-    ret_buf.append(total_reward)
-    step_buf.append(steps)
-    err_buf.append(error_sum / max(steps, 1))
+            kappa_cmd = ACTIONS[a_idx]
+            steer_cmd = np.arctan(CAR_LENGTH * kappa_cmd)
 
-    if ep % window == 0:
-        avg_return.append(np.mean(ret_buf))
-        avg_steps.append(np.mean(step_buf))
-        avg_error.append(np.mean(err_buf))
-        ret_buf.clear(); step_buf.clear(); err_buf.clear()
-        print(f"Ep {ep} [Map {current_map_idx}] | return {avg_return[-1]:.2f} | steps {avg_steps[-1]:.1f}")
+            _, _, terminated, truncated, _ = env.step([steer_cmd])
+            done = terminated or truncated
 
-env.close()
+            s_next, e_y, e_psi, kappa_vehicle, kappa_err = discretize_obs(prev_heading, prev_pos)
 
-# =======================
-# TRAINING CURVES
-# =======================
-x = np.arange(len(avg_steps)) * window
+            norm_error = (
+                (e_y / EY_MAX) ** 2
+                + lambda_psi * (e_psi / EPSI_MAX) ** 2
+                + lambda_kappa * (kappa_err / KAPPA_MAX) ** 2
+            )
+            jerk_cost = (kappa_cmd - prev_kappa_cmd) ** 2
+            reward = alive_reward - norm_error - lambda_jerk * jerk_cost
 
-plt.figure(figsize=(8, 4))
-plt.plot(x, avg_steps)
-plt.xlabel("Episodes")
-plt.ylabel("Avg Steps")
-plt.title("Steps vs Training (Multi-Map)")
-plt.grid(True)
-plt.tight_layout()
-plt.savefig(os.path.join(RESULTS_DIR, "steps_vs_training.png"), dpi=300)
-plt.close()
+            Q[s][a_idx] += alpha * (
+                reward + gamma * np.max(Q[s_next]) - Q[s][a_idx]
+            )
 
-plt.figure(figsize=(8, 4))
-plt.plot(x, avg_return)
-plt.xlabel("Episodes")
-plt.ylabel("Avg Return")
-plt.title("Reward vs Training (Multi-Map)")
-plt.grid(True)
-plt.tight_layout()
-plt.savefig(os.path.join(RESULTS_DIR, "reward_vs_training.png"), dpi=300)
-plt.close()
+            s = s_next
+            total_reward += reward
+            error_sum += norm_error
+            steps += 1
 
-# =======================
-# ERROR PER STEP
-# =======================
-plt.figure(figsize=(8, 4))
-plt.plot(x, avg_error)
-plt.xlabel("Episodes")
-plt.ylabel("Avg Normalized Error/Step")
-plt.title("Error per Step vs Training (Multi-Map)")
-plt.grid(True)
-plt.tight_layout()
-plt.savefig(os.path.join(RESULTS_DIR, "error_per_step_vs_training.png"), dpi=300)
-plt.close()
+            prev_heading = vehicle.heading
+            prev_pos = vehicle.position.copy()
+            prev_kappa_cmd = kappa_cmd
 
-# =======================
-# 3D POLICY HEATMAP (kappa slices, mid kappa_near & kappa_la)
-# =======================
-mid_kn = N_KAPPA_NEAR // 2
-mid_kla = N_KAPPA_LA // 2
-for k_bin in [2, N_KAPPA // 2, N_KAPPA - 3]:
-    policy = np.zeros((N_EY, N_EPSI))
+            if steps >= 200:
+                break
 
-    for i in range(N_EY):
-        for j in range(N_EPSI):
-            state = (i + 1, j + 1, k_bin, mid_kn, mid_kla)
-            if state in Q:
-                policy[i, j] = ACTIONS[np.argmax(Q[state])]
+        epsilon = max(epsilon_min, epsilon * epsilon_decay)
 
-    plt.figure(figsize=(7, 5))
-    plt.imshow(
-        policy,
-        origin="lower",
-        extent=[
-            np.rad2deg(-EPSI_MAX),
-            np.rad2deg(EPSI_MAX),
-            -EY_MAX,
-            EY_MAX,
-        ],
-        aspect="auto",
-    )
-    plt.colorbar(label="Curvature [1/m]")
-    plt.xlabel("Heading Error e_psi [deg]")
-    plt.ylabel("Lateral Error e_y [m]")
-    plt.title(f"Policy Heatmap at kappa_err bin {k_bin} (kn={mid_kn}, kla={mid_kla})")
+        ret_buf.append(total_reward)
+        step_buf.append(steps)
+        err_buf.append(error_sum / max(steps, 1))
+
+        if ep % window == 0:
+            avg_return.append(np.mean(ret_buf))
+            avg_steps.append(np.mean(step_buf))
+            avg_error.append(np.mean(err_buf))
+            ret_buf.clear(); step_buf.clear(); err_buf.clear()
+            print(f"Ep {ep} [Map {current_map_idx}] | return {avg_return[-1]:.2f} | steps {avg_steps[-1]:.1f}")
+
+    env.close()
+
+    # --- Save Q-table ---
+    with open(Q_TABLE_PATH, "wb") as f:
+        pickle.dump(dict(Q), f)
+    print(f"\nQ-table saved to {Q_TABLE_PATH} ({len(Q)} states)")
+
+    # =======================
+    # TRAINING CURVES
+    # =======================
+    x = np.arange(len(avg_steps)) * window
+
+    plt.figure(figsize=(8, 4))
+    plt.plot(x, avg_steps)
+    plt.xlabel("Episodes")
+    plt.ylabel("Avg Steps")
+    plt.title("Steps vs Training (Multi-Map)")
+    plt.grid(True)
     plt.tight_layout()
-    plt.savefig(os.path.join(RESULTS_DIR, f"policy_heatmap_kappa_bin_{k_bin}.png"), dpi=300)
+    plt.savefig(os.path.join(RESULTS_DIR, "steps_vs_training.png"), dpi=300)
     plt.close()
 
-# =======================
-# 3D Q-TABLE HEATMAP (marginalised over kappa_near & kappa_la at mid bins)
-# =======================
-q_max_grid = np.zeros((N_EY, N_EPSI, N_KAPPA))
-for i in range(N_EY):
-    for j in range(N_EPSI):
-        for k in range(N_KAPPA):
-            state = (i + 1, j + 1, k, mid_kn, mid_kla)
-            if state in Q:
-                q_max_grid[i, j, k] = np.max(Q[state])
+    plt.figure(figsize=(8, 4))
+    plt.plot(x, avg_return)
+    plt.xlabel("Episodes")
+    plt.ylabel("Avg Return")
+    plt.title("Reward vs Training (Multi-Map)")
+    plt.grid(True)
+    plt.tight_layout()
+    plt.savefig(os.path.join(RESULTS_DIR, "reward_vs_training.png"), dpi=300)
+    plt.close()
 
-I, J, K = np.meshgrid(
-    np.arange(N_EY),
-    np.arange(N_EPSI),
-    np.arange(N_KAPPA),
-    indexing="ij",
-)
+    # =======================
+    # ERROR PER STEP
+    # =======================
+    plt.figure(figsize=(8, 4))
+    plt.plot(x, avg_error)
+    plt.xlabel("Episodes")
+    plt.ylabel("Avg Normalized Error/Step")
+    plt.title("Error per Step vs Training (Multi-Map)")
+    plt.grid(True)
+    plt.tight_layout()
+    plt.savefig(os.path.join(RESULTS_DIR, "error_per_step_vs_training.png"), dpi=300)
+    plt.close()
 
-fig = plt.figure(figsize=(8, 6))
-ax = fig.add_subplot(111, projection="3d")
-sc = ax.scatter(
-    I.flatten(),
-    J.flatten(),
-    K.flatten(),
-    c=q_max_grid.flatten(),
-    cmap="viridis",
-    s=15,
-    alpha=0.8,
-)
-fig.colorbar(sc, ax=ax, label="Max Q")
-ax.set_xlabel("e_y bin")
-ax.set_ylabel("e_psi bin")
-ax.set_zlabel("kappa_err bin")
-ax.set_title("3D Q-Table Heatmap (kn=mid, kla=mid)")
-plt.tight_layout()
-plt.savefig(os.path.join(RESULTS_DIR, "q_table_3d_heatmap.png"), dpi=300)
-plt.close()
+    # =======================
+    # 3D POLICY HEATMAP (kappa slices, mid kappa_near & kappa_la)
+    # =======================
+    mid_kn = N_KAPPA_NEAR // 2
+    mid_kla = N_KAPPA_LA // 2
+    for k_bin in [2, N_KAPPA // 2, N_KAPPA - 3]:
+        policy = np.zeros((N_EY, N_EPSI))
 
-print("\nTraining complete. Plots saved to", RESULTS_DIR)
+        for i in range(N_EY):
+            for j in range(N_EPSI):
+                state = (i + 1, j + 1, k_bin, mid_kn, mid_kla)
+                if state in Q:
+                    policy[i, j] = ACTIONS[np.argmax(Q[state])]
+
+        plt.figure(figsize=(7, 5))
+        plt.imshow(
+            policy,
+            origin="lower",
+            extent=[
+                np.rad2deg(-EPSI_MAX),
+                np.rad2deg(EPSI_MAX),
+                -EY_MAX,
+                EY_MAX,
+            ],
+            aspect="auto",
+        )
+        plt.colorbar(label="Curvature [1/m]")
+        plt.xlabel("Heading Error e_psi [deg]")
+        plt.ylabel("Lateral Error e_y [m]")
+        plt.title(f"Policy Heatmap at kappa_err bin {k_bin} (kn={mid_kn}, kla={mid_kla})")
+        plt.tight_layout()
+        plt.savefig(os.path.join(RESULTS_DIR, f"policy_heatmap_kappa_bin_{k_bin}.png"), dpi=300)
+        plt.close()
+
+    # =======================
+    # 3D Q-TABLE HEATMAP (marginalised over kappa_near & kappa_la at mid bins)
+    # =======================
+    q_max_grid = np.zeros((N_EY, N_EPSI, N_KAPPA))
+    for i in range(N_EY):
+        for j in range(N_EPSI):
+            for k in range(N_KAPPA):
+                state = (i + 1, j + 1, k, mid_kn, mid_kla)
+                if state in Q:
+                    q_max_grid[i, j, k] = np.max(Q[state])
+
+    I, J, K = np.meshgrid(
+        np.arange(N_EY),
+        np.arange(N_EPSI),
+        np.arange(N_KAPPA),
+        indexing="ij",
+    )
+
+    fig = plt.figure(figsize=(8, 6))
+    ax = fig.add_subplot(111, projection="3d")
+    sc = ax.scatter(
+        I.flatten(),
+        J.flatten(),
+        K.flatten(),
+        c=q_max_grid.flatten(),
+        cmap="viridis",
+        s=15,
+        alpha=0.8,
+    )
+    fig.colorbar(sc, ax=ax, label="Max Q")
+    ax.set_xlabel("e_y bin")
+    ax.set_ylabel("e_psi bin")
+    ax.set_zlabel("kappa_err bin")
+    ax.set_title("3D Q-Table Heatmap (kn=mid, kla=mid)")
+    plt.tight_layout()
+    plt.savefig(os.path.join(RESULTS_DIR, "q_table_3d_heatmap.png"), dpi=300)
+    plt.close()
+
+    print("\nTraining complete. Plots saved to", RESULTS_DIR)
 
 # =======================
 # EVALUATION ON RANDOM MAPS
@@ -548,7 +572,7 @@ for ep in range(EVAL_EPISODES):
     vehicle = eval_env.unwrapped.vehicle
     prev_heading = vehicle.heading
     prev_pos = vehicle.position.copy()
-    s, _, _, _, _ = discretize_obs(prev_heading, prev_pos)
+    s, _, _, _, _ = discretize_obs(prev_heading, prev_pos, eval_env)
 
     done = False
     total_error = 0.0
@@ -567,7 +591,7 @@ for ep in range(EVAL_EPISODES):
         _, _, terminated, truncated, _ = eval_env.step([steer_cmd])
         done = terminated or truncated
 
-        s_next, e_y, e_psi, _, _ = discretize_obs(prev_heading, prev_pos)
+        s_next, e_y, e_psi, _, _ = discretize_obs(prev_heading, prev_pos, eval_env)
 
         total_error += abs(e_y)
         steps += 1

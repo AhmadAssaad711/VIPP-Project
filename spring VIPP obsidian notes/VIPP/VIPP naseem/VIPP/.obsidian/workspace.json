@@ -69,12 +69,12 @@
             "state": {
               "type": "markdown",
               "state": {
-                "file": "week 4/Implementation.md",
+                "file": "week 3.md",
                 "mode": "source",
                 "source": false
               },
               "icon": "lucide-file",
-              "title": "Implementation"
+              "title": "week 3"
             }
           },
           {
@@ -254,10 +254,11 @@
       "bases:Create new base": false
     }
   },
-  "active": "40948d2f0003dad7",
+  "active": "9c99d32707870938",
   "lastOpenFiles": [
-    "week 4/error_per_step_vs_training.png",
+    "Pasted image 20260304153042.png",
     "week 4/Implementation.md",
+    "week 4/error_per_step_vs_training.png",
     "week 4/path_following_q_learning.png",
     "week 4/error_per_step_vs_training 1.png",
     "week 4/policy_heatmap.png",
