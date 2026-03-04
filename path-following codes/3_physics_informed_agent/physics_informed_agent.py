@@ -1,9 +1,10 @@
-"""Physics-Informed RL Agent - Q-Learning with (e_y, e_psi, kappa_err, kappa_near, kappa_la) State
-=================================================================================================
-Tabular Q-learning agent that adds curvature error (kappa_err), lane
-curvature at the nearest point (kappa_near), and lane curvature at a
-lookahead distance along arc length (kappa_la) to the state representation.
-Curvature is defined as the rate of change of heading over an arc-length window.
+"""Physics-Informed RL Agent - Q-Learning with (e_y, e_psi, kappa_near, kappa_la) State
+=========================================================================================
+Tabular Q-learning agent with lateral error, heading error, lane curvature
+at the nearest point (kappa_near), and lane curvature at a lookahead
+distance along arc length (kappa_la) in the state representation.
+
+Curvature features are path properties used for anticipation — NOT in the reward.
 """
 
 import matplotlib
@@ -243,8 +244,8 @@ env.reset(seed=MAP_SEEDS[0])
 
 vehicle = env.unwrapped.vehicle
 CAR_LENGTH = vehicle.LENGTH
-CURVATURE_DS = 2.0 * CAR_LENGTH   # arc-length window
-LOOKAHEAD_DIST = 5.0 * CAR_LENGTH  # lookahead distance for curvature preview
+CURVATURE_DS = 1.0 * CAR_LENGTH   # arc-length window for curvature estimation
+LOOKAHEAD_DIST = 2.5 * CAR_LENGTH  # arc-length lookahead for curvature preview
 
 # =======================
 # ACTION SPACE (curvature commands)
@@ -262,13 +263,11 @@ KAPPA_MAX = 0.2
 
 N_EY = 10
 N_EPSI = 10
-N_KAPPA = 10
 N_KAPPA_NEAR = 5     # bins for lane curvature at nearest point
 N_KAPPA_LA = 5       # bins for lane curvature at lookahead
 
 e_y_bins = np.linspace(-EY_MAX, EY_MAX, N_EY)
 e_psi_bins = np.linspace(-EPSI_MAX, EPSI_MAX, N_EPSI)
-kappa_bins = np.linspace(-KAPPA_MAX, KAPPA_MAX, N_KAPPA)
 kappa_near_bins = np.linspace(-KAPPA_MAX, KAPPA_MAX, N_KAPPA_NEAR)
 kappa_la_bins = np.linspace(-KAPPA_MAX, KAPPA_MAX, N_KAPPA_LA)
 
@@ -286,7 +285,7 @@ def lane_curvature(lane, s, ds):
 # =======================
 # OBSERVATION FUNCTION
 # =======================
-def discretize_obs(prev_heading, prev_pos, target_env=None):
+def discretize_obs(target_env=None):
     if target_env is None:
         target_env = env
     vehicle = target_env.unwrapped.vehicle
@@ -296,31 +295,20 @@ def discretize_obs(prev_heading, prev_pos, target_env=None):
     psi_lane = lane.heading_at(s)
     e_psi = wrap_angle(vehicle.heading - psi_lane)
 
-    kappa_near = lane_curvature(lane, s, CURVATURE_DS)          # curvature at nearest point
-    kappa_la = lane_curvature(lane, s + LOOKAHEAD_DIST, CURVATURE_DS)  # curvature at lookahead
-
-    ds = np.linalg.norm(vehicle.position - prev_pos)
-    if ds > 1e-6:
-        kappa_vehicle = wrap_angle(vehicle.heading - prev_heading) / ds
-    else:
-        kappa_vehicle = 0.0
-
-    kappa_err = kappa_vehicle - kappa_near
+    kappa_near = lane_curvature(lane, s, CURVATURE_DS)
+    kappa_la = lane_curvature(lane, s + LOOKAHEAD_DIST, CURVATURE_DS)
 
     e_y = np.clip(e_y, -EY_MAX, EY_MAX)
     e_psi = np.clip(e_psi, -EPSI_MAX, EPSI_MAX)
-    kappa_vehicle = np.clip(kappa_vehicle, -KAPPA_MAX, KAPPA_MAX)
-    kappa_err = np.clip(kappa_err, -KAPPA_MAX, KAPPA_MAX)
     kappa_near = np.clip(kappa_near, -KAPPA_MAX, KAPPA_MAX)
     kappa_la = np.clip(kappa_la, -KAPPA_MAX, KAPPA_MAX)
 
     return (
         np.digitize(e_y, e_y_bins),
         np.digitize(e_psi, e_psi_bins),
-        np.digitize(kappa_err, kappa_bins),
         np.digitize(kappa_near, kappa_near_bins),
         np.digitize(kappa_la, kappa_la_bins),
-    ), e_y, e_psi, kappa_vehicle, kappa_err
+    ), e_y, e_psi
 
 # =======================
 # Q TABLE
@@ -328,7 +316,15 @@ def discretize_obs(prev_heading, prev_pos, target_env=None):
 Q = defaultdict(lambda: np.zeros(N_ACTIONS))
 
 Q_TABLE_PATH = os.path.join(RESULTS_DIR, "q_table.pkl")
-SKIP_TRAINING = "--eval-only" in sys.argv or os.path.exists(Q_TABLE_PATH)
+SKIP_TRAINING = "--eval-only" in sys.argv
+
+# Load existing Q-table for eval-only mode
+if SKIP_TRAINING and os.path.exists(Q_TABLE_PATH):
+    with open(Q_TABLE_PATH, "rb") as f:
+        loaded = pickle.load(f)
+    for k, v in loaded.items():
+        Q[k] = v
+    print(f"Loaded Q-table from {Q_TABLE_PATH} ({len(Q)} states)")
 
 # =======================
 # HYPERPARAMS
@@ -341,40 +337,27 @@ epsilon_min = 0.05
 episodes = 20000
 
 lambda_psi = 0.5
-lambda_kappa = 1.0
 lambda_jerk = 0.1
 alive_reward = 0.2
 
 # =======================
-# TRAINING (skip if Q-table already saved)
+# TRAINING LOOP
 # =======================
-if SKIP_TRAINING and os.path.exists(Q_TABLE_PATH):
-    print(f"Loading Q-table from {Q_TABLE_PATH} (skipping training)")
-    with open(Q_TABLE_PATH, "rb") as f:
-        saved = pickle.load(f)
-    # Restore into defaultdict
-    Q = defaultdict(lambda: np.zeros(N_ACTIONS))
-    Q.update(saved)
-    print(f"  Loaded {len(Q)} states")
-else:
-    # =======================
-    # TRAINING METRICS
-    # =======================
-    window = 50
-    avg_return, avg_steps, avg_error = [], [], []
-    ret_buf, step_buf, err_buf = [], [], []
+ret_buf = []
+step_buf = []
+err_buf = []
+window = 100
+avg_return = []
+avg_steps = []
+avg_error = []
 
-    # =======================
-    # TRAINING LOOP
-    # =======================
+if not SKIP_TRAINING:
     for ep in range(1, episodes + 1):
         # --- Cycle through maps every MAP_SWITCH_INTERVAL episodes ---
         current_map_idx = ((ep - 1) // MAP_SWITCH_INTERVAL) % len(MAP_SEEDS)
         env.reset(seed=MAP_SEEDS[current_map_idx])
         vehicle = env.unwrapped.vehicle
-        prev_heading = vehicle.heading
-        prev_pos = vehicle.position.copy()
-        s, _, _, _, _ = discretize_obs(prev_heading, prev_pos)
+        s, _, _ = discretize_obs()
 
         done = False
         total_reward = 0.0
@@ -394,15 +377,14 @@ else:
             _, _, terminated, truncated, _ = env.step([steer_cmd])
             done = terminated or truncated
 
-            s_next, e_y, e_psi, kappa_vehicle, kappa_err = discretize_obs(prev_heading, prev_pos)
+            s_next, e_y, e_psi = discretize_obs()
 
             norm_error = (
                 (e_y / EY_MAX) ** 2
                 + lambda_psi * (e_psi / EPSI_MAX) ** 2
-                + lambda_kappa * (kappa_err / KAPPA_MAX) ** 2
             )
             jerk_cost = (kappa_cmd - prev_kappa_cmd) ** 2
-            reward = alive_reward - norm_error - lambda_jerk * jerk_cost
+            reward = alive_reward - 10*norm_error - lambda_jerk * jerk_cost
 
             Q[s][a_idx] += alpha * (
                 reward + gamma * np.max(Q[s_next]) - Q[s][a_idx]
@@ -413,8 +395,6 @@ else:
             error_sum += norm_error
             steps += 1
 
-            prev_heading = vehicle.heading
-            prev_pos = vehicle.position.copy()
             prev_kappa_cmd = kappa_cmd
 
             if steps >= 200:
@@ -433,16 +413,17 @@ else:
             ret_buf.clear(); step_buf.clear(); err_buf.clear()
             print(f"Ep {ep} [Map {current_map_idx}] | return {avg_return[-1]:.2f} | steps {avg_steps[-1]:.1f}")
 
-    env.close()
-
-    # --- Save Q-table ---
+    # Save Q-table
     with open(Q_TABLE_PATH, "wb") as f:
         pickle.dump(dict(Q), f)
-    print(f"\nQ-table saved to {Q_TABLE_PATH} ({len(Q)} states)")
+    print(f"Q-table saved to {Q_TABLE_PATH} ({len(Q)} states)")
 
-    # =======================
-    # TRAINING CURVES
-    # =======================
+    env.close()
+
+# =======================
+# TRAINING CURVES
+# =======================
+if avg_steps:  # Only plot if training was performed
     x = np.arange(len(avg_steps)) * window
 
     plt.figure(figsize=(8, 4))
@@ -479,16 +460,16 @@ else:
     plt.close()
 
     # =======================
-    # 3D POLICY HEATMAP (kappa slices, mid kappa_near & kappa_la)
+    # POLICY HEATMAPS (sliced at mid kappa_near & kappa_la)
     # =======================
     mid_kn = N_KAPPA_NEAR // 2
     mid_kla = N_KAPPA_LA // 2
-    for k_bin in [2, N_KAPPA // 2, N_KAPPA - 3]:
+    for kn_bin in [1, mid_kn, N_KAPPA_NEAR]:
         policy = np.zeros((N_EY, N_EPSI))
 
         for i in range(N_EY):
             for j in range(N_EPSI):
-                state = (i + 1, j + 1, k_bin, mid_kn, mid_kla)
+                state = (i + 1, j + 1, kn_bin, mid_kla)
                 if state in Q:
                     policy[i, j] = ACTIONS[np.argmax(Q[state])]
 
@@ -504,29 +485,29 @@ else:
             ],
             aspect="auto",
         )
-        plt.colorbar(label="Curvature [1/m]")
+        plt.colorbar(label="Curvature cmd [1/m]")
         plt.xlabel("Heading Error e_psi [deg]")
         plt.ylabel("Lateral Error e_y [m]")
-        plt.title(f"Policy Heatmap at kappa_err bin {k_bin} (kn={mid_kn}, kla={mid_kla})")
+        plt.title(f"Policy Heatmap (kappa_near bin={kn_bin}, kappa_la bin={mid_kla})")
         plt.tight_layout()
-        plt.savefig(os.path.join(RESULTS_DIR, f"policy_heatmap_kappa_bin_{k_bin}.png"), dpi=300)
+        plt.savefig(os.path.join(RESULTS_DIR, f"policy_heatmap_kn_{kn_bin}.png"), dpi=300)
         plt.close()
 
     # =======================
-    # 3D Q-TABLE HEATMAP (marginalised over kappa_near & kappa_la at mid bins)
+    # 3D Q-TABLE HEATMAP (e_y × e_psi × kappa_near at mid kappa_la)
     # =======================
-    q_max_grid = np.zeros((N_EY, N_EPSI, N_KAPPA))
+    q_max_grid = np.zeros((N_EY, N_EPSI, N_KAPPA_NEAR))
     for i in range(N_EY):
         for j in range(N_EPSI):
-            for k in range(N_KAPPA):
-                state = (i + 1, j + 1, k, mid_kn, mid_kla)
+            for k in range(N_KAPPA_NEAR):
+                state = (i + 1, j + 1, k + 1, mid_kla)
                 if state in Q:
                     q_max_grid[i, j, k] = np.max(Q[state])
 
     I, J, K = np.meshgrid(
         np.arange(N_EY),
         np.arange(N_EPSI),
-        np.arange(N_KAPPA),
+        np.arange(N_KAPPA_NEAR),
         indexing="ij",
     )
 
@@ -544,8 +525,8 @@ else:
     fig.colorbar(sc, ax=ax, label="Max Q")
     ax.set_xlabel("e_y bin")
     ax.set_ylabel("e_psi bin")
-    ax.set_zlabel("kappa_err bin")
-    ax.set_title("3D Q-Table Heatmap (kn=mid, kla=mid)")
+    ax.set_zlabel("kappa_near bin")
+    ax.set_title("3D Q-Table Heatmap (kappa_la=mid)")
     plt.tight_layout()
     plt.savefig(os.path.join(RESULTS_DIR, "q_table_3d_heatmap.png"), dpi=300)
     plt.close()
@@ -570,9 +551,7 @@ eval_steps = []
 for ep in range(EVAL_EPISODES):
     eval_env.reset(seed=EVAL_SEED + ep)  # unique random map each episode
     vehicle = eval_env.unwrapped.vehicle
-    prev_heading = vehicle.heading
-    prev_pos = vehicle.position.copy()
-    s, _, _, _, _ = discretize_obs(prev_heading, prev_pos, eval_env)
+    s, _, _ = discretize_obs(eval_env)
 
     done = False
     total_error = 0.0
@@ -591,15 +570,11 @@ for ep in range(EVAL_EPISODES):
         _, _, terminated, truncated, _ = eval_env.step([steer_cmd])
         done = terminated or truncated
 
-        s_next, e_y, e_psi, _, _ = discretize_obs(prev_heading, prev_pos, eval_env)
+        s_next, e_y, e_psi = discretize_obs(eval_env)
 
         total_error += abs(e_y)
         steps += 1
         s = s_next
-
-        vehicle = eval_env.unwrapped.vehicle
-        prev_heading = vehicle.heading
-        prev_pos = vehicle.position.copy()
 
         if steps >= 200:
             break
