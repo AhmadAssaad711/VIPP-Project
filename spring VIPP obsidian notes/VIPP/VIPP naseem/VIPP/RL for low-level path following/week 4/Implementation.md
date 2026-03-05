@@ -206,7 +206,8 @@ Q(st,at)←Q(st,at)+α[rt+γmax⁡a′Q(st+1,a′)−Q(st,at)]Q(st​,at​)←Q
         └──────────────┘
 
 
-
+---
+something wrong with map 3, making training very bad
 
 ==key ideas to look out for:==
 

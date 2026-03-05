@@ -88,19 +88,19 @@ class RandomizedRacetrackEnv(RacetrackEnv):
         # --- 3. Short vertical straight (c -> d) ---
         straight2_len = rng.uniform(8, 18)
         net.add_lane("c", "d", StraightLane(
-            [cx1 + radii1, cy1], [cx1 + radii1, cy1 - straight2_len],
+            [arc1_x, arc1_y], [arc1_x, arc1_y - straight2_len],
             line_types=(LineType.CONTINUOUS, LineType.NONE),
             width=width, speed_limit=speed))
         net.add_lane("c", "d", StraightLane(
-            [cx1 + radii1 + width, cy1],
-            [cx1 + radii1 + width, cy1 - straight2_len],
+            [arc1_x + width, arc1_y],
+            [arc1_x + width, arc1_y - straight2_len],
             line_types=(LineType.STRIPED, LineType.CONTINUOUS),
             width=width, speed_limit=speed))
 
         # --- 4. Circular arc #2 (d -> e) — U-turn ---
         radii2 = rng.uniform(12, 22)
-        center2_x = cx1 + radii1 - radii2
-        center2_y = cy1 - straight2_len
+        center2_x = arc1_x - radii2
+        center2_y = arc1_y - straight2_len
         center2 = [center2_x, center2_y]
         net.add_lane("d", "e", CircularLane(
             center2, radii2, np.deg2rad(0), np.deg2rad(-181),
@@ -250,7 +250,7 @@ LOOKAHEAD_DIST = 2.5 * CAR_LENGTH  # arc-length lookahead for curvature preview
 # =======================
 # ACTION SPACE (curvature commands)
 # =======================
-N_ACTIONS = 11
+N_ACTIONS = 21
 KAPPA_CMD_MAX = 0.2
 ACTIONS = np.linspace(-KAPPA_CMD_MAX, KAPPA_CMD_MAX, N_ACTIONS)
 
@@ -261,8 +261,8 @@ EY_MAX = 2.0
 EPSI_MAX = np.deg2rad(45)
 KAPPA_MAX = 0.2
 
-N_EY = 10
-N_EPSI = 10
+N_EY = 20
+N_EPSI = 20
 N_KAPPA_NEAR = 5     # bins for lane curvature at nearest point
 N_KAPPA_LA = 5       # bins for lane curvature at lookahead
 
@@ -330,9 +330,9 @@ if SKIP_TRAINING and os.path.exists(Q_TABLE_PATH):
 # HYPERPARAMS
 # =======================
 alpha = 0.1
-gamma = 0.99
+gamma = 0.95
 epsilon = 1.0
-epsilon_decay = 0.99985
+epsilon_decay = 0.99977
 epsilon_min = 0.05
 episodes = 20000
 
@@ -384,7 +384,7 @@ if not SKIP_TRAINING:
                 + lambda_psi * (e_psi / EPSI_MAX) ** 2
             )
             jerk_cost = (kappa_cmd - prev_kappa_cmd) ** 2
-            reward = alive_reward - 10*norm_error - lambda_jerk * jerk_cost
+            reward = alive_reward - norm_error - lambda_jerk * jerk_cost
 
             Q[s][a_idx] += alpha * (
                 reward + gamma * np.max(Q[s_next]) - Q[s][a_idx]
@@ -543,7 +543,7 @@ print("=" * 60)
 EVAL_EPISODES = 200
 EVAL_SEED = 9999  # different from training seeds
 
-eval_env = gym.make("randomized-racetrack-v0", config=config, render_mode=None)
+eval_env = gym.make("randomized-racetrack-v0", config=config, render_mode='human')
 
 eval_errors = []
 eval_steps = []
