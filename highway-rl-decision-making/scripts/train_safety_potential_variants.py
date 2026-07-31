@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import faulthandler
+import hashlib
 import json
 import os
 import time
@@ -125,6 +126,24 @@ SAFETY_REWARD_TRIAL = {
     "wf": 0.0,
     "w_safe": 0.80,
     "lambda_bc": 0.03,
+}
+
+# Historical reward formulation retained for controlled ablations.  This is
+# the original Karalakou potential term (``cf``), not the CBF-clearance
+# potential introduced by SAFETY_REWARD_TRIAL.
+OLD_REWARD_TRIAL = {
+    "trial_name": "current_bc003",
+    "use_current_potential": True,
+    "use_safety_potential": False,
+    "wy": 0.65,
+    "wf": 1.0,
+    "w_safe": 0.0,
+    "lambda_bc": 0.03,
+}
+
+REWARD_TRIALS = {
+    "safety": SAFETY_REWARD_TRIAL,
+    "old": OLD_REWARD_TRIAL,
 }
 
 MTM_CONGESTED_UNCERTAIN_UPDATES = {
@@ -563,6 +582,202 @@ def plot_summary(summary: pd.DataFrame, output_path: Path) -> None:
     plt.close(fig)
 
 
+def _sha256_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    with Path(path).open("rb") as stream:
+        for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def write_csv_resilient(frame: pd.DataFrame, output_path: Path, *, index: bool = False) -> None:
+    """Atomically write a CSV while tolerating transient OneDrive reparse races."""
+    output_path = Path(output_path)
+    last_error: OSError | None = None
+    for attempt in range(8):
+        temporary_path = output_path.with_name(
+            f".{output_path.name}.{os.getpid()}.{attempt}.tmp"
+        )
+        try:
+            output_path.parent.mkdir(parents=True, exist_ok=True)
+            frame.to_csv(temporary_path, index=index)
+            os.replace(temporary_path, output_path)
+            return
+        except OSError as exc:
+            last_error = exc
+            try:
+                temporary_path.unlink(missing_ok=True)
+            except OSError:
+                pass
+            if attempt + 1 < 8:
+                delay = min(2.0, 0.25 * (2**attempt))
+                print(
+                    f"[safety-potential-io] retrying CSV write ({attempt + 1}/7) "
+                    f"after {type(exc).__name__}: {output_path}",
+                    flush=True,
+                )
+                time.sleep(delay)
+    raise OSError(f"Could not write CSV after 8 attempts: {output_path}") from last_error
+
+
+def plot_paired_deployment_summary(summary: pd.DataFrame, output_path: Path) -> None:
+    """Plot the same CBF-trained policy with and without deployment shielding."""
+    if summary.empty:
+        return
+    labels = summary["evaluation"].tolist()
+    x = np.arange(len(labels))
+    panels = [
+        ("return_mean", "Return", False),
+        ("completion_rate", "Completion", True),
+        ("mean_abs_speed_error", "Abs Speed Error", False),
+        ("mean_lat_y_error_m", "Lateral y Error", False),
+        ("ego_collisions_mean", "Ego Collisions", False),
+    ]
+    fig, axes = plt.subplots(1, len(panels), figsize=(18, 4.8))
+    colors = ["#0072B2", "#D55E00"]
+    for axis, (column, title, percent) in zip(axes, panels):
+        values = summary[column].to_numpy(dtype=float)
+        axis.bar(x, values, color=colors[: len(values)])
+        axis.set_title(title)
+        axis.set_xticks(x)
+        axis.set_xticklabels(labels, rotation=25, ha="right")
+        axis.grid(True, axis="y", alpha=0.25)
+        if percent:
+            axis.yaxis.set_major_formatter(FuncFormatter(lambda value, _: f"{value:.0%}"))
+    fig.suptitle("Old Reward: CBF-Trained DDPG Deployment Comparison", fontsize=13)
+    fig.tight_layout()
+    fig.savefig(output_path, dpi=180)
+    plt.close(fig)
+
+
+def evaluate_paired_deployments(
+    namespace: dict[str, Any],
+    args: argparse.Namespace,
+    *,
+    model_path: Path,
+    reward_config: dict[str, float],
+    env_config: dict[str, Any],
+    output_dir: Path,
+) -> pd.DataFrame:
+    """Evaluate one CBF-trained model with the shield enabled and disabled.
+
+    Both conditions use the same old reward configuration, seeds, task
+    protocol, and model.  Only the deployment-time CBF wrapper changes.
+    """
+    paired_dir = output_dir / "paired_evaluation"
+    paired_dir.mkdir(parents=True, exist_ok=True)
+    model_sha256 = _sha256_file(model_path)
+    evaluation_seed = int(args.seed) + 200_000
+    conditions = (
+        ("old_reward_no_cbf", "baseline", evaluation_seed),
+        ("old_reward_with_cbf", "event_cbf", evaluation_seed),
+    )
+
+    model = namespace["DDPG"].load(str(model_path), device=args.device)
+    rows: list[dict[str, float | str | bool]] = []
+    for condition, env_kind, seed in conditions:
+        episodes_path = paired_dir / f"{condition}_episodes.csv"
+        summary_path = paired_dir / f"{condition}_summary.csv"
+        if episodes_path.exists() and summary_path.exists() and not args.no_resume:
+            cached_summary = pd.read_csv(summary_path)
+            cached_row = cached_summary.iloc[0] if not cached_summary.empty else None
+            cached_hash = str(cached_row.get("model_sha256", "")) if cached_row is not None else ""
+            cached_protocol_matches = (
+                cached_row is not None
+                and int(float(cached_row.get("episodes", -1))) == int(args.final_eval_episodes)
+                and int(float(cached_row.get("seed", -1))) == int(seed)
+                and abs(float(cached_row.get("task_distance_m", np.nan)) - float(args.task_distance_m)) < 1e-9
+                and int(float(cached_row.get("task_max_steps", -1))) == int(args.task_max_steps)
+                and str(cached_row.get("reward_term", "")) == str(args.reward_term)
+            )
+            if cached_hash == model_sha256 and cached_protocol_matches:
+                print(f"[paired-eval] {condition} already complete; loading summary", flush=True)
+                rows.append(cached_row.to_dict())
+                continue
+            print(f"[paired-eval] {condition} cache is stale; refreshing", flush=True)
+
+        print(f"[paired-eval] evaluating {condition} env={env_kind}", flush=True)
+        metrics = evaluate_model(
+            namespace,
+            model,
+            env_kind=env_kind,
+            episodes=args.final_eval_episodes,
+            seed=seed,
+            reward_config=reward_config,
+            env_config=env_config,
+            event_threshold=args.event_threshold,
+            k0=args.k0,
+            k1=args.k1,
+            eps_side=args.eps_side,
+            use_distance_task=not args.legacy_fixed_step_eval,
+            task_distance_m=args.task_distance_m,
+            task_max_steps=args.task_max_steps,
+        )
+        write_csv_resilient(metrics, episodes_path)
+        summary: dict[str, float | str | bool] = {
+            "evaluation": condition,
+            "env_kind": env_kind,
+            "reward_term": str(args.reward_term),
+            "model_path": str(model_path),
+            "model_sha256": model_sha256,
+            "seed": float(seed),
+            "k0": float(args.k0),
+            "k1": float(args.k1),
+            "eps_side": float(args.eps_side),
+            "event_threshold": float(args.event_threshold),
+            "use_distance_task_eval": bool(not args.legacy_fixed_step_eval),
+            "task_distance_m": float(args.task_distance_m),
+            "task_max_steps": float(args.task_max_steps),
+            "wf": float(reward_config["wf"]),
+            "w_safe": float(reward_config["w_safe"]),
+            "use_current_potential": bool(reward_config["use_current_potential"]),
+            "use_safety_potential": bool(reward_config["use_safety_potential"]),
+            **summarize(metrics),
+        }
+        summary["behavior_score"] = behavior_score(summary)
+        write_csv_resilient(pd.DataFrame([summary]), summary_path)
+        rows.append(summary)
+
+    summary_frame = pd.DataFrame(rows)
+    write_csv_resilient(summary_frame, paired_dir / "comparison.csv")
+    if len(summary_frame) == 2:
+        no_cbf = summary_frame.iloc[0]
+        with_cbf = summary_frame.iloc[1]
+        delta: dict[str, float | str] = {
+            "comparison": "with_cbf_minus_no_cbf",
+            "from_evaluation": str(no_cbf["evaluation"]),
+            "to_evaluation": str(with_cbf["evaluation"]),
+        }
+        for column in summary_frame.columns:
+            if column in {"evaluation", "env_kind", "model_path", "model_sha256", "from_evaluation", "to_evaluation"}:
+                continue
+            if pd.api.types.is_number(no_cbf[column]) and pd.api.types.is_number(with_cbf[column]):
+                delta[column] = float(with_cbf[column]) - float(no_cbf[column])
+        write_csv_resilient(pd.DataFrame([delta]), paired_dir / "delta_with_cbf_minus_no_cbf.csv")
+    plot_paired_deployment_summary(summary_frame, paired_dir / "comparison.png")
+    manifest = {
+        "schema_version": 1,
+        "complete": len(summary_frame) == len(conditions),
+        "reward_term": str(args.reward_term),
+        "model_path": str(model_path),
+        "model_sha256": model_sha256,
+        "env_config": env_config,
+        "reward_config": reward_config,
+        "conditions": [
+            {"evaluation": condition, "env_kind": env_kind, "seed": seed}
+            for condition, env_kind, seed in conditions
+        ],
+        "episodes": int(args.final_eval_episodes),
+        "task_distance_m": float(args.task_distance_m),
+        "task_max_steps": int(args.task_max_steps),
+    }
+    temporary_manifest = paired_dir / "manifest.json.tmp"
+    temporary_manifest.write_text(json.dumps(manifest, indent=2, default=str), encoding="utf-8")
+    temporary_manifest.replace(paired_dir / "manifest.json")
+    print(f"[paired-eval] wrote {paired_dir / 'comparison.csv'}", flush=True)
+    return summary_frame
+
+
 def latest_checkpoint(variant_dir: Path) -> Path | None:
     checkpoints = sorted([*variant_dir.glob("ckpt_*.zip"), *variant_dir.glob("checkpoint_*.zip")])
     return checkpoints[-1] if checkpoints else None
@@ -574,17 +789,13 @@ def make_baseline_reward_config(
     progress_reward_weight: float,
     progress_clip: float,
     eps_side: float,
+    reward_trial: dict[str, float | str | bool] = SAFETY_REWARD_TRIAL,
 ) -> dict[str, float]:
-    # Keep this policy unshielded, but train it with the same CBF-clearance
-    # safety potential as the shielded variants.
-    config = make_reward_config(namespace, SAFETY_REWARD_TRIAL)
+    config = make_reward_config(namespace, reward_trial)
     config.update(
         {
             "progress_reward_weight": float(progress_reward_weight),
             "progress_clip": float(progress_clip),
-            "wf": 0.0,
-            "use_current_potential": 0.0,
-            "use_safety_potential": 1.0,
             "safety_potential_eps_side": float(eps_side),
         }
     )
@@ -594,15 +805,14 @@ def make_baseline_reward_config(
 def make_cbf_reward_config(
     namespace: dict[str, Any],
     args: argparse.Namespace,
+    *,
+    reward_trial: dict[str, float | str | bool] = SAFETY_REWARD_TRIAL,
 ) -> dict[str, float]:
-    config = make_reward_config(namespace, SAFETY_REWARD_TRIAL)
+    config = make_reward_config(namespace, reward_trial)
     config.update(
         {
             "progress_reward_weight": float(args.progress_reward_weight),
             "progress_clip": float(args.progress_clip),
-            "wf": 0.0,
-            "use_current_potential": 0.0,
-            "use_safety_potential": 1.0,
             "safety_potential_eps_side": float(args.eps_side),
         }
     )
@@ -686,31 +896,43 @@ def write_summarywriter_tensorboard_row(
         return None
     run_dir = Path(tb_root) / run_name
     run_dir.mkdir(parents=True, exist_ok=True)
-    writer = writer_cls(log_dir=str(run_dir))
-    kpi_index = namespace.get("TENSORBOARD_KPI_INDEX_MARKDOWN")
-    if kpi_index:
-        writer.add_text("00_kpi_index", str(kpi_index), 0)
-    specs = namespace.get("DEFAULT_TENSORBOARD_INFO_METRICS", {})
-    logged_keys: set[str] = set()
-    for tag, keys in specs.items():
-        scalar = np.nan
-        for key in keys:
-            if key not in row:
-                continue
-            scalar = _tb_scalar(row.get(key))
+    writer = None
+    try:
+        writer = writer_cls(log_dir=str(run_dir))
+        kpi_index = namespace.get("TENSORBOARD_KPI_INDEX_MARKDOWN")
+        if kpi_index:
+            writer.add_text("00_kpi_index", str(kpi_index), 0)
+        specs = namespace.get("DEFAULT_TENSORBOARD_INFO_METRICS", {})
+        logged_keys: set[str] = set()
+        for tag, keys in specs.items():
+            scalar = np.nan
+            for key in keys:
+                if key not in row:
+                    continue
+                scalar = _tb_scalar(row.get(key))
+                if np.isfinite(scalar):
+                    logged_keys.add(key)
+                    break
             if np.isfinite(scalar):
-                logged_keys.add(key)
-                break
-        if np.isfinite(scalar):
-            writer.add_scalar(f"{prefix}/{tag}", scalar, int(step))
-    for key, value in row.items():
-        if key in logged_keys or key in {"variant", "label", "model_path"}:
-            continue
-        scalar = _tb_scalar(value)
-        if np.isfinite(scalar):
-            writer.add_scalar(f"{prefix}/99_raw/{key}", scalar, int(step))
-    writer.flush()
-    writer.close()
+                writer.add_scalar(f"{prefix}/{tag}", scalar, int(step))
+        for key, value in row.items():
+            if key in logged_keys or key in {"variant", "label", "model_path"}:
+                continue
+            scalar = _tb_scalar(value)
+            if np.isfinite(scalar):
+                writer.add_scalar(f"{prefix}/99_raw/{key}", scalar, int(step))
+        writer.flush()
+        writer.close()
+    except Exception as exc:
+        # TensorBoard is auxiliary output. A filesystem/extension failure
+        # must not discard a completed model, evaluation, or CSV summary.
+        if writer is not None:
+            try:
+                writer.close()
+            except Exception:
+                pass
+        print(f"[safety-potential-tb] final-eval write skipped: {exc!r}", flush=True)
+        return None
     return run_dir
 
 
@@ -911,7 +1133,7 @@ def train_variant(
     model.save(str(model_path))
 
     history = pd.DataFrame(callback.records)
-    history.to_csv(history_path, index=False)
+    write_csv_resilient(history, history_path)
     plot_history(history, plot_path, title=variant)
 
     print(f"[safety-potential] evaluating {variant}", flush=True)
@@ -931,10 +1153,12 @@ def train_variant(
         task_distance_m=args.task_distance_m,
         task_max_steps=args.task_max_steps,
     )
-    final_metrics.to_csv(final_episodes_path, index=False)
+    write_csv_resilient(final_metrics, final_episodes_path)
     summary: dict[str, float | str | bool] = {
         "variant": variant,
         "label": str(variant_cfg["label"]),
+        "reward_term": str(args.reward_term),
+        "reward_trial": str(REWARD_TRIALS[str(args.reward_term)]["trial_name"]),
         "model_path": str(model_path),
         "elapsed_sec": float(elapsed_sec),
         "timesteps": float(args.timesteps),
@@ -960,7 +1184,7 @@ def train_variant(
         **summarize(final_metrics),
     }
     summary["behavior_score"] = behavior_score(summary)
-    pd.DataFrame([summary]).to_csv(final_summary_path, index=False)
+    write_csv_resilient(pd.DataFrame([summary]), final_summary_path)
     (variant_dir / "run_config.json").write_text(json.dumps(summary, indent=2, default=str), encoding="utf-8")
     if not args.skip_tensorboard:
         final_tb_dir = write_summarywriter_tensorboard_row(
@@ -1046,13 +1270,13 @@ def export_videos(
                     )
                 )
     summary_path = videos_dir / "video_summary.csv"
-    pd.DataFrame(rows).to_csv(summary_path, index=False)
+    write_csv_resilient(pd.DataFrame(rows), summary_path)
     print(f"[safety-potential-video] wrote {summary_path}", flush=True)
     return summary_path
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Train DDPG variants with the CBF safety-set potential reward.")
+    parser = argparse.ArgumentParser(description="Train DDPG variants with a selectable historical or CBF safety potential reward.")
     parser.add_argument("--project-root", type=Path, default=None)
     parser.add_argument("--output-dir", type=Path, default=None)
     parser.add_argument("--device", default="cpu")
@@ -1080,8 +1304,19 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--legacy-fixed-step-eval", action="store_true")
     parser.add_argument("--progress-reward-weight", type=float, default=0.0)
     parser.add_argument("--progress-clip", type=float, default=1.25)
+    parser.add_argument(
+        "--reward-term",
+        choices=sorted(REWARD_TRIALS),
+        default="safety",
+        help="Reward safety term: 'safety' uses the CBF-clearance potential; 'old' uses the historical Karalakou potential.",
+    )
     parser.add_argument("--no-resume", action="store_true")
     parser.add_argument("--skip-tensorboard", action="store_true")
+    parser.add_argument(
+        "--paired-eval",
+        action="store_true",
+        help="After training ddpg_cbf_reward, evaluate the same model with and without the CBF deployment shield.",
+    )
     parser.add_argument("--tb-write-freq", type=int, default=100)
     parser.add_argument("--tb-flush-freq", type=int, default=500)
     parser.add_argument("--force-mtm-congested", action="store_true", default=True)
@@ -1110,6 +1345,10 @@ def main() -> int:
     set_stable_native_defaults()
     os.environ.setdefault("MPLBACKEND", "Agg")
     args = parse_args()
+    if args.paired_eval and args.reward_term != "old":
+        raise ValueError("--paired-eval is reserved for the old-reward CBF deployment comparison.")
+    if args.paired_eval and args.variants is not None and "ddpg_cbf_reward" not in args.variants:
+        raise ValueError("--paired-eval requires ddpg_cbf_reward in --variants.")
     project_root = find_project_root(args.project_root or Path.cwd())
     notebook_path = project_root / "notebooks" / "lanelessKaralakou.ipynb"
     namespace: dict[str, Any] = {"__name__": "__main__"}
@@ -1136,18 +1375,28 @@ def main() -> int:
         deep_update(env_config, MTM_CONGESTED_UNCERTAIN_UPDATES)
     traffic_model = active_traffic_model(env_config)
 
+    reward_trial = REWARD_TRIALS[str(args.reward_term)]
     baseline_reward_config = make_baseline_reward_config(
         namespace,
         progress_reward_weight=float(args.progress_reward_weight),
         progress_clip=float(args.progress_clip),
         eps_side=float(args.eps_side),
+        reward_trial=reward_trial,
     )
-    cbf_reward_config = make_cbf_reward_config(namespace, args)
+    cbf_reward_config = make_cbf_reward_config(namespace, args, reward_trial=reward_trial)
     eps_tag = str(args.eps_side).replace(".", "p")
     progress_tag = str(args.progress_reward_weight).replace(".", "p").replace("-", "m")
-    output_name = f"sp3_{traffic_model}_e{eps_tag}_p{progress_tag}"
+    reward_tag = "sp3" if args.reward_term == "safety" else "oldsp3"
+    output_name = f"{reward_tag}_{traffic_model}_e{eps_tag}_p{progress_tag}"
     output_dir = args.output_dir or (Path(namespace["ARTIFACT_DIR"]) / output_name)
     output_dir = output_dir.resolve()
+    if os.name == "nt":
+        path_probe = output_dir / "ddpg_cbf_reward" / "train_eval_history.csv"
+        if len(str(path_probe)) >= 248:
+            raise ValueError(
+                "The requested artifact directory is too deep for Windows file creation: "
+                f"{path_probe}. Choose a shorter --output-dir."
+            )
     output_dir.mkdir(parents=True, exist_ok=True)
     selected_variants = [item for item in VARIANTS if str(item["variant"]) in INITIAL_VARIANT_NAMES]
     if args.variants is not None:
@@ -1164,6 +1413,9 @@ def main() -> int:
                 item["lambda_bc"] = float(args.guided_lambda_bc)
 
     run_config = {
+        "reward_term": str(args.reward_term),
+        "reward_trial": reward_trial,
+        "paired_eval": bool(args.paired_eval),
         "timesteps": int(args.timesteps),
         "chunk_timesteps": int(args.chunk_timesteps),
         "traffic_model": traffic_model,
@@ -1228,7 +1480,7 @@ def main() -> int:
     summary_frame = pd.DataFrame(summaries)
     summary_path = output_dir / "summary.csv"
     summary_plot_path = output_dir / "summary.png"
-    summary_frame.to_csv(summary_path, index=False)
+    write_csv_resilient(summary_frame, summary_path)
     plot_summary(summary_frame, summary_plot_path)
     print(f"[safety-potential] wrote {summary_path}", flush=True)
     print(f"[safety-potential] wrote {summary_plot_path}", flush=True)
@@ -1258,6 +1510,35 @@ def main() -> int:
         ]
         display_cols = [column for column in display_cols if column in summary_frame.columns]
         print(summary_frame[display_cols].to_string(index=False), flush=True)
+
+    if args.paired_eval:
+        if str(args.reward_term) != "old":
+            raise ValueError("--paired-eval is reserved for the old-reward CBF deployment comparison.")
+        if "ddpg_cbf_reward" not in model_paths:
+            raise ValueError("--paired-eval requires the ddpg_cbf_reward variant so one CBF-trained model is evaluated twice.")
+        paired_summary = evaluate_paired_deployments(
+            namespace,
+            args,
+            model_path=model_paths["ddpg_cbf_reward"],
+            reward_config=cbf_reward_config,
+            env_config=env_config,
+            output_dir=output_dir,
+        )
+        print(
+            paired_summary[
+                [
+                    "evaluation",
+                    "return_mean",
+                    "completion_rate",
+                    "mean_abs_speed_error",
+                    "mean_lat_y_error_m",
+                    "ego_collisions_mean",
+                    "event_intervention_rate",
+                    "behavior_score",
+                ]
+            ].to_string(index=False),
+            flush=True,
+        )
 
     required_video_models = {"ddpg", "ddpg_cbf_reward", "guided_ddpg_cbf"}
     if not args.skip_videos and required_video_models.issubset(model_paths):

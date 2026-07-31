@@ -31,6 +31,8 @@ Paper: [`docs/paper/highway-rl-decision-making-paper.pdf`](docs/paper/highway-rl
 
 Full notebook list: [`notebooks/README.md`](notebooks/README.md)
 
+CBF reward-by-actor-loss study: [`docs/cbf_factorial_ablation.md`](docs/cbf_factorial_ablation.md)
+
 ## Install
 
 ```powershell

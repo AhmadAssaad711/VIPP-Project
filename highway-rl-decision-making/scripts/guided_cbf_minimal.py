@@ -19,6 +19,117 @@ from stable_baselines3.common.monitor import Monitor
 from stable_baselines3.common.utils import polyak_update
 
 
+def _actor_gradient_diagnostics(
+    actor: th.nn.Module,
+    q_loss: th.Tensor,
+    weighted_cbf_loss: th.Tensor,
+    *,
+    epsilon: float = 1e-12,
+) -> dict[str, float]:
+    """Measure the two actor-gradient components without touching ``.grad``.
+
+    ``weighted_cbf_loss`` is the complete CBF contribution to the optimized
+    objective (including the current lambda), so the reported ratio and cosine
+    describe the gradients that are actually combined by the actor update.
+    ``torch.autograd.grad`` leaves optimizer gradient buffers unchanged; both
+    calls retain the graph for the subsequent, ordinary ``actor_loss.backward``.
+    The norm ratio uses a stabilized denominator and is therefore zero when the
+    weighted CBF gradient is zero.  Cosine alignment is undefined in that case
+    (or when the Q gradient is zero), so it is returned as NaN with validity 0.
+    """
+
+    parameters = tuple(parameter for parameter in actor.parameters() if parameter.requires_grad)
+    if not parameters:
+        return {
+            "g_q_norm": 0.0,
+            "g_cbf_norm": 0.0,
+            "g_cbf_to_g_q_ratio": 0.0,
+            "g_q_g_cbf_cosine": float("nan"),
+            "g_q_g_cbf_cosine_valid": 0.0,
+        }
+
+    def component_gradients(loss: th.Tensor) -> tuple[Optional[th.Tensor], ...]:
+        if not loss.requires_grad:
+            return tuple(None for _ in parameters)
+        return th.autograd.grad(
+            loss,
+            parameters,
+            retain_graph=True,
+            create_graph=False,
+            allow_unused=True,
+        )
+
+    q_gradients = component_gradients(q_loss)
+    cbf_gradients = component_gradients(weighted_cbf_loss)
+    q_squared_norm = q_loss.new_zeros(())
+    cbf_squared_norm = q_loss.new_zeros(())
+    dot_product = q_loss.new_zeros(())
+    for q_gradient, cbf_gradient in zip(q_gradients, cbf_gradients):
+        if q_gradient is not None:
+            q_squared_norm = q_squared_norm + q_gradient.detach().square().sum()
+        if cbf_gradient is not None:
+            cbf_squared_norm = cbf_squared_norm + cbf_gradient.detach().square().sum()
+        if q_gradient is not None and cbf_gradient is not None:
+            dot_product = dot_product + (q_gradient.detach() * cbf_gradient.detach()).sum()
+
+    q_norm = th.sqrt(q_squared_norm)
+    cbf_norm = th.sqrt(cbf_squared_norm)
+    safe_epsilon = max(float(epsilon), th.finfo(q_norm.dtype).tiny)
+    norm_ratio = cbf_norm / q_norm.clamp_min(safe_epsilon)
+    q_norm_value = float(q_norm.cpu().item())
+    cbf_norm_value = float(cbf_norm.cpu().item())
+    cosine_valid = bool(q_norm_value > 0.0 and cbf_norm_value > 0.0)
+    if cosine_valid:
+        cosine = float(dot_product.cpu().item()) / (q_norm_value * cbf_norm_value)
+        cosine = float(np.clip(cosine, -1.0, 1.0))
+    else:
+        cosine = float("nan")
+    return {
+        "g_q_norm": q_norm_value,
+        "g_cbf_norm": cbf_norm_value,
+        "g_cbf_to_g_q_ratio": float(norm_ratio.cpu().item()),
+        "g_q_g_cbf_cosine": cosine,
+        "g_q_g_cbf_cosine_valid": float(cosine_valid),
+    }
+
+
+def _local_projection_target(
+    current_actions: th.Tensor,
+    behavior_actions: th.Tensor,
+    safe_behavior_actions: th.Tensor,
+    projection_jacobians: th.Tensor,
+) -> th.Tensor:
+    """Return a detached local CBF projection target for the current actor.
+
+    Around the replayed behavior action ``a_b``, the recorded CBF projection is
+    approximated as ``F(s, a) = a_safe_b + J_b (a - a_b)``.  Evaluating that
+    affine map at the current actor action cancels historical behavior noise in
+    locally tangential directions (where ``J_b`` acts like the identity), while
+    retaining supervision in constrained normal directions.  A feasible-side
+    gate restores the projection's identity branch once the current actor has
+    moved inward from the recorded boundary.  The result is detached so the
+    actor loss differentiates the prediction, not its target.
+    """
+
+    local_delta = (current_actions - behavior_actions.detach()).unsqueeze(-1)
+    safe_behavior = safe_behavior_actions.detach()
+    behavior = behavior_actions.detach()
+    affine_target = safe_behavior + th.bmm(
+        projection_jacobians.detach(),
+        local_delta,
+    ).squeeze(-1)
+    # The affine active-set map projects onto the recorded boundary even when
+    # the current actor has already moved into the feasible half-space.  Use
+    # the historical outward correction to gate that map; feasible-side
+    # current actions should remain fixed points of F(s, a).
+    outward = behavior - safe_behavior
+    outside_score = ((current_actions - safe_behavior) * outward).sum(dim=1, keepdim=True)
+    has_recorded_correction = outward.norm(dim=1, keepdim=True) > 1e-8
+    use_projection = has_recorded_correction & (outside_score > 0.0)
+    target = th.where(use_projection, affine_target, current_actions)
+    return target.clamp(-1.0, 1.0).detach()
+
+
 class CBFGuidedReplayBufferSamples(NamedTuple):
     observations: th.Tensor
     actions: th.Tensor
@@ -173,6 +284,53 @@ def _projection_from_active_rows(rows: np.ndarray, action_dim: int) -> np.ndarra
     if not np.all(np.isfinite(projection)):
         return identity
     return projection.astype(np.float32)
+
+
+def _positive_kkt_support(
+    rows: np.ndarray,
+    outward_correction: np.ndarray,
+    *,
+    relative_contribution_tolerance: float = 1e-5,
+) -> tuple[np.ndarray, np.ndarray, float]:
+    """Identify tight constraints with a positive contribution to a projection.
+
+    For the Euclidean projection ``safe = argmin ||a - raw||²`` with
+    ``A a <= b``, stationarity gives ``raw - safe = A_active.T @ lambda`` with
+    non-negative multipliers.  Solving that small NNLS system removes merely
+    coincident tight rows (zero multiplier) from the normal-space report.
+    Contribution thresholding uses ``||lambda_i A_i||``, which is invariant to
+    rescaling an individual constraint row.
+    """
+
+    rows_array = np.asarray(rows, dtype=float)
+    if rows_array.size == 0:
+        rows_array = np.zeros((0, 2), dtype=float)
+    rows_array = rows_array.reshape(-1, 2)
+    correction = np.asarray(outward_correction, dtype=float).reshape(-1)[:2]
+    correction_norm = float(np.linalg.norm(correction))
+    if (
+        rows_array.shape[0] == 0
+        or not np.all(np.isfinite(rows_array))
+        or not np.all(np.isfinite(correction))
+        or correction_norm <= 1e-10
+    ):
+        return np.zeros(0, dtype=int), np.zeros(rows_array.shape[0], dtype=float), 0.0
+
+    try:
+        from scipy.optimize import nnls
+
+        multipliers, residual_norm = nnls(rows_array.T, correction)
+    except Exception:
+        # SciPy is already a runtime dependency, but retain a deterministic
+        # numerical fallback for unusual installations.
+        unconstrained, *_ = np.linalg.lstsq(rows_array.T, correction, rcond=1e-10)
+        multipliers = np.maximum(np.asarray(unconstrained, dtype=float), 0.0)
+        residual_norm = float(np.linalg.norm(rows_array.T @ multipliers - correction))
+
+    contribution_norms = np.abs(multipliers) * np.linalg.norm(rows_array, axis=1)
+    threshold = max(1e-8, float(relative_contribution_tolerance) * correction_norm)
+    support = np.flatnonzero(contribution_norms > threshold).astype(int)
+    return support, np.asarray(multipliers, dtype=float), float(residual_norm)
 
 
 def _score_constraint_violation(rows: np.ndarray, bounds: np.ndarray, action: np.ndarray) -> dict[str, float]:
@@ -628,11 +786,13 @@ def _install_cbf_projection_reporting(namespace: dict[str, Any]) -> None:
 
         rows: list[np.ndarray] = []
         bounds: list[float] = []
+        constraint_types: list[str] = []
+        constraint_neighbor_ranks: list[int] = []
         min_h = np.inf
         min_center_distance = np.inf
         min_required_distance = np.inf
         neighbor_constraints = 0
-        for neighbor in active_neighbors:
+        for neighbor_rank, neighbor in enumerate(active_neighbors):
             finite_values = [
                 ego.get("x", 0.0),
                 ego.get("y", 0.0),
@@ -670,6 +830,19 @@ def _install_cbf_projection_reporting(namespace: dict[str, Any]) -> None:
                 continue
             rows.append(np.asarray(row, dtype=float).reshape(-1)[:2])
             bounds.append(float(bound))
+            signed_dx = float(neighbor.get("signed_dx", neighbor.get("x", 0.0) - ego.get("x", 0.0)))
+            lateral_offset = abs(float(neighbor.get("y", 0.0) - ego.get("y", 0.0)))
+            alongside_distance = 0.5 * (
+                float(ego.get("length", 0.0)) + float(neighbor.get("length", 0.0))
+            )
+            if abs(signed_dx) <= max(alongside_distance, 1e-6) and lateral_offset > 0.5:
+                neighbor_type = "neighbor_side"
+            elif signed_dx >= 0.0:
+                neighbor_type = "neighbor_front"
+            else:
+                neighbor_type = "neighbor_rear"
+            constraint_types.append(neighbor_type)
+            constraint_neighbor_ranks.append(int(neighbor_rank))
             min_h = min(min_h, float(h_ij))
             min_center_distance = min(min_center_distance, float(center_distance))
             min_required_distance = min(min_required_distance, float(required_distance))
@@ -682,6 +855,8 @@ def _install_cbf_projection_reporting(namespace: dict[str, Any]) -> None:
         h_right = float(road_width) - ego_half_width - ego_y
         rows.extend([np.asarray([0.0, -1.0], dtype=float), np.asarray([0.0, 1.0], dtype=float)])
         bounds.extend([float(k1 * ego_vy + k0 * h_left), float(-k1 * ego_vy + k0 * h_right)])
+        constraint_types.extend(["road_left", "road_right"])
+        constraint_neighbor_ranks.extend([-1, -1])
 
         low = np.asarray([float(ax_bounds[0]), float(ay_bounds[0])], dtype=np.float32)
         high = np.asarray([float(ax_bounds[1]), float(ay_bounds[1])], dtype=np.float32)
@@ -798,24 +973,59 @@ def _install_cbf_projection_reporting(namespace: dict[str, Any]) -> None:
             min_center_distance = np.nan
         if not np.isfinite(min_required_distance):
             min_required_distance = np.nan
-        values = rows_arr @ safe - bounds_arr
-        active_tol = float(namespace.get("CBF_QP_ACTIVE_TOL", 1e-3))
-        active_rows = [row for row, value in zip(rows_arr, values) if float(value) >= -active_tol]
-
-        if safe[0] <= low[0] + active_tol:
-            active_rows.append(np.asarray([-1.0, 0.0], dtype=np.float32))
-        if safe[0] >= high[0] - active_tol:
-            active_rows.append(np.asarray([1.0, 0.0], dtype=np.float32))
-        if safe[1] <= low[1] + active_tol:
-            active_rows.append(np.asarray([0.0, -1.0], dtype=np.float32))
-        if safe[1] >= high[1] - active_tol:
-            active_rows.append(np.asarray([0.0, 1.0], dtype=np.float32))
+        # Include action-box faces in the active-set audit.  Tightness is
+        # normalized by each row's action-scale magnitude, then a positive-KKT
+        # support test removes coincident zero-multiplier rows.
+        box_rows = np.asarray(
+            [[-1.0, 0.0], [1.0, 0.0], [0.0, -1.0], [0.0, 1.0]],
+            dtype=np.float32,
+        )
+        box_bounds = np.asarray([-low[0], high[0], -low[1], high[1]], dtype=np.float32)
+        candidate_rows = np.vstack([rows_arr, box_rows]).astype(np.float32)
+        candidate_bounds = np.concatenate([bounds_arr, box_bounds]).astype(np.float32)
+        candidate_types = tuple(
+            list(constraint_types)
+            + ["action_ax_min", "action_ax_max", "action_ay_min", "action_ay_max"]
+        )
+        candidate_indices = np.concatenate(
+            [np.arange(rows_arr.shape[0], dtype=np.int32), np.asarray([-1, -2, -3, -4], dtype=np.int32)]
+        )
+        candidate_residuals = candidate_rows @ safe - candidate_bounds
+        action_magnitude_scale = np.sum(
+            np.abs(candidate_rows) * half_range.reshape(1, -1),
+            axis=1,
+        )
+        residual_scales = np.maximum.reduce(
+            [action_magnitude_scale, np.abs(candidate_bounds), np.ones_like(candidate_bounds)]
+        )
+        active_tol = max(float(namespace.get("CBF_QP_ACTIVE_TOL", 1e-3)), 0.0)
+        tight_mask = np.abs(candidate_residuals) <= active_tol * residual_scales
+        tight_rows = candidate_rows[tight_mask]
+        tight_types = tuple(
+            constraint_type
+            for constraint_type, is_tight in zip(candidate_types, tight_mask)
+            if bool(is_tight)
+        )
+        tight_indices = candidate_indices[tight_mask]
 
         fallback_used = bool(not qp_success)
-        if fallback_used or not active_rows:
+        kkt_residual_norm = np.nan
+        reported_multipliers = np.zeros(0, dtype=np.float32)
+        if fallback_used or tight_rows.shape[0] == 0:
             active_scaled = np.zeros((0, 2), dtype=np.float32)
+            active_physical = np.zeros((0, 2), dtype=np.float32)
+            reported_active_types: list[str] = []
+            reported_active_indices = np.zeros(0, dtype=np.int32)
         else:
-            active_scaled = np.asarray(active_rows, dtype=np.float32) * half_range.reshape(1, -1)
+            support, tight_multipliers, kkt_residual_norm = _positive_kkt_support(
+                tight_rows,
+                a_rl.astype(np.float32) - safe,
+            )
+            active_physical = tight_rows[support].astype(np.float32)
+            active_scaled = active_physical * half_range.reshape(1, -1)
+            reported_active_types = [tight_types[index] for index in support]
+            reported_active_indices = tight_indices[support].astype(np.int32)
+            reported_multipliers = tight_multipliers[support].astype(np.float32)
         projection = _projection_from_active_rows(active_scaled, 2)
 
         info = {
@@ -852,6 +1062,19 @@ def _install_cbf_projection_reporting(namespace: dict[str, Any]) -> None:
             "left_boundary_h": float(h_left),
             "right_boundary_h": float(h_right),
             "min_boundary_h": float(min(h_left, h_right)),
+            "constraint_rows_physical": rows_arr.astype(np.float32),
+            "constraint_bounds_physical": bounds_arr.astype(np.float32),
+            "constraint_types": tuple(constraint_types),
+            "constraint_neighbor_ranks": np.asarray(constraint_neighbor_ranks, dtype=np.int32),
+            "tight_constraint_rows_physical": tight_rows.astype(np.float32),
+            "tight_constraint_types": tuple(tight_types),
+            "tight_constraint_indices": tight_indices.astype(np.int32),
+            "active_constraint_rows_physical": active_physical.astype(np.float32),
+            "active_constraint_types": tuple(reported_active_types),
+            "active_constraint_indices": np.asarray(reported_active_indices, dtype=np.int32),
+            "active_constraint_multipliers": reported_multipliers,
+            "active_constraint_kkt_residual_norm": float(kkt_residual_norm),
+            "active_constraint_selection": "positive_kkt_contribution",
             "active_constraint_rows_scaled": active_scaled.astype(np.float32),
             "cbf_active_constraint_rows_scaled": active_scaled.astype(np.float32),
             "projection_jacobian_scaled": projection,
@@ -933,6 +1156,19 @@ def _install_cbf_projection_reporting(namespace: dict[str, Any]) -> None:
             }
         )
         for key in (
+            "constraint_rows_physical",
+            "constraint_bounds_physical",
+            "constraint_types",
+            "constraint_neighbor_ranks",
+            "tight_constraint_rows_physical",
+            "tight_constraint_types",
+            "tight_constraint_indices",
+            "active_constraint_rows_physical",
+            "active_constraint_types",
+            "active_constraint_indices",
+            "active_constraint_multipliers",
+            "active_constraint_kkt_residual_norm",
+            "active_constraint_selection",
             "active_constraint_rows_scaled",
             "cbf_active_constraint_rows_scaled",
             "projection_jacobian_scaled",
@@ -992,9 +1228,10 @@ class GuidedCBFDDPG(DDPG):
             raise ValueError(f"critic_action_mode must be 'raw' or 'safe', got {critic_action_mode!r}")
         if self.actor_action_mode not in {"raw", "diff_cbf"}:
             raise ValueError(f"actor_action_mode must be 'raw' or 'diff_cbf', got {actor_action_mode!r}")
-        if self.bc_loss_mode not in {"weighted_replay", "masked_replay_mse"}:
+        if self.bc_loss_mode not in {"weighted_replay", "masked_replay_mse", "local_projection_mse"}:
             raise ValueError(
-                "bc_loss_mode must be 'weighted_replay' or 'masked_replay_mse', "
+                "bc_loss_mode must be 'weighted_replay', 'masked_replay_mse', "
+                "or 'local_projection_mse', "
                 f"got {bc_loss_mode!r}"
             )
         self.cbf_projection_steps = int(max(cbf_projection_steps, 1))
@@ -1178,6 +1415,9 @@ class GuidedCBFDDPG(DDPG):
         actor_losses, actor_rl_losses, bc_losses, critic_losses = [], [], [], []
         actor_raw_q_losses, actor_projected_q_losses = [], []
         bc_mask_rates, bc_weight_means = [], []
+        actor_g_q_norms, actor_g_cbf_norms = [], []
+        actor_g_cbf_to_g_q_ratios, actor_g_q_g_cbf_cosines = [], []
+        actor_g_q_g_cbf_cosine_validities = []
         projection_trace_means, projection_active_rates, projected_action_gaps = [], [], []
         diff_cbf_corrections, diff_cbf_active_rates, diff_cbf_max_violations = [], [], []
         critic_raw_q_means, critic_safe_q_means = [], []
@@ -1267,13 +1507,30 @@ class GuidedCBFDDPG(DDPG):
                     bc_loss = bc_per_sample.mean()
                 else:
                     correction = th.norm(replay_data.safe_actions - replay_data.actions, dim=1, keepdim=True)
-                    bc_per_sample = ((a_pred - replay_data.safe_actions) ** 2).sum(dim=1, keepdim=True)
-                    if self.bc_loss_mode == "masked_replay_mse":
+                    if self.bc_loss_mode == "local_projection_mse":
+                        if not hasattr(replay_data, "projection_jacobians"):
+                            raise RuntimeError(
+                                "local_projection_mse requires projection_jacobians in the replay buffer"
+                            )
+                        local_target = _local_projection_target(
+                            a_pred,
+                            replay_data.actions,
+                            replay_data.safe_actions,
+                            replay_data.projection_jacobians,
+                        )
+                        bc_per_sample = ((a_pred - local_target) ** 2).sum(dim=1, keepdim=True)
+                        # Preserve the intervention decision recorded at this
+                        # state; do not relabel it using the current actor.
+                        mask_float = (replay_data.interventions > 0.5).float()
+                        weights = th.ones_like(correction)
+                    elif self.bc_loss_mode == "masked_replay_mse":
+                        bc_per_sample = ((a_pred - replay_data.safe_actions) ** 2).sum(dim=1, keepdim=True)
                         # Exact replay-target form of L_corr: only meaningful CBF
                         # corrections supervise the actor, with no extra magnitude weighting.
                         mask_float = (correction > self.bc_delta).float()
                         weights = th.ones_like(correction)
                     else:
+                        bc_per_sample = ((a_pred - replay_data.safe_actions) ** 2).sum(dim=1, keepdim=True)
                         mask_float = (replay_data.interventions > 0.5).float()
                         weights = 1.0 + th.clamp(
                             correction / self.bc_action_scale,
@@ -1282,7 +1539,13 @@ class GuidedCBFDDPG(DDPG):
                         )
                     bc_loss = (mask_float * weights * bc_per_sample).sum() / (mask_float.sum() + 1e-6)
                 lambda_bc_current = self._current_lambda_bc()
-                actor_loss = rl_actor_loss + lambda_bc_current * bc_loss
+                weighted_cbf_loss = lambda_bc_current * bc_loss
+                actor_loss = rl_actor_loss + weighted_cbf_loss
+                gradient_diagnostics = _actor_gradient_diagnostics(
+                    self.actor,
+                    rl_actor_loss,
+                    weighted_cbf_loss,
+                )
 
                 actor_losses.append(actor_loss.item())
                 actor_rl_losses.append(rl_actor_loss.item())
@@ -1290,6 +1553,13 @@ class GuidedCBFDDPG(DDPG):
                 actor_projected_q_losses.append(projected_q_actor_loss.item())
                 bc_losses.append(bc_loss.item())
                 bc_mask_rates.append(mask_float.mean().item())
+                actor_g_q_norms.append(gradient_diagnostics["g_q_norm"])
+                actor_g_cbf_norms.append(gradient_diagnostics["g_cbf_norm"])
+                actor_g_cbf_to_g_q_ratios.append(gradient_diagnostics["g_cbf_to_g_q_ratio"])
+                actor_g_q_g_cbf_cosines.append(gradient_diagnostics["g_q_g_cbf_cosine"])
+                actor_g_q_g_cbf_cosine_validities.append(
+                    gradient_diagnostics["g_q_g_cbf_cosine_valid"]
+                )
                 if mask_float.sum().item() > 0.0:
                     bc_weight_means.append((mask_float * weights).sum().item() / (mask_float.sum().item() + 1e-6))
                 else:
@@ -1317,9 +1587,25 @@ class GuidedCBFDDPG(DDPG):
             self.logger.record("train/cbf_projected_q_weight", self.projected_q_weight)
             self.logger.record("train/cbf_lambda_bc_current", self._current_lambda_bc())
             self.logger.record("train/cbf_bc_loss_mode_masked_replay", float(self.bc_loss_mode == "masked_replay_mse"))
+            self.logger.record(
+                "train/cbf_bc_loss_mode_local_projection",
+                float(self.bc_loss_mode == "local_projection_mse"),
+            )
             self.logger.record("train/cbf_bc_loss", np.mean(bc_losses))
             self.logger.record("train/cbf_bc_mask_rate", np.mean(bc_mask_rates))
             self.logger.record("train/cbf_bc_weight", np.mean(bc_weight_means))
+            self.logger.record("train/actor_g_q_norm", np.mean(actor_g_q_norms))
+            self.logger.record("train/actor_g_cbf_norm", np.mean(actor_g_cbf_norms))
+            self.logger.record("train/actor_g_cbf_to_g_q_ratio", np.mean(actor_g_cbf_to_g_q_ratios))
+            finite_cosines = [value for value in actor_g_q_g_cbf_cosines if np.isfinite(value)]
+            self.logger.record(
+                "train/actor_g_q_g_cbf_cosine",
+                np.mean(finite_cosines) if finite_cosines else np.nan,
+            )
+            self.logger.record(
+                "train/actor_g_q_g_cbf_cosine_valid_rate",
+                np.mean(actor_g_q_g_cbf_cosine_validities),
+            )
             if diff_cbf_corrections:
                 self.logger.record("train/diff_cbf_correction", np.mean(diff_cbf_corrections))
                 self.logger.record("train/diff_cbf_active_rate", np.mean(diff_cbf_active_rates))
