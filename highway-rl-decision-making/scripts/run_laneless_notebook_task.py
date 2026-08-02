@@ -99,7 +99,7 @@ def apply_overrides(namespace: dict[str, Any], args: argparse.Namespace, task: d
         timesteps = int(args.timesteps)
         namespace[str(task["timesteps_key"])] = timesteps
         if args.task == "ppo-train":
-            namespace["PPO_PILOT_TIMESTEPS"] = timesteps
+            namespace["PPO_PROGRESSION_TIMESTEPS"] = timesteps
         if args.task == "guided-ddpg-cbf-train":
             namespace["DDPG_CBF_TOTAL_TIMESTEPS"] = timesteps
     if args.n_envs is not None:
@@ -166,8 +166,8 @@ TASKS = {
     "ppo-train": {
         "deps": [2, 3, 5, 6, 8],
         "cell": 11,
-        "flag": "RUN_PPO_TRAIN",
-        "timesteps_key": "TOTAL_TIMESTEPS",
+        "flag": "RUN_PPO_PROGRESSION",
+        "timesteps_key": "PPO_PROGRESSION_TIMESTEPS",
     },
     "ddpg-train": {
         "deps": [2, 3, 5, 6, 8, 9],
@@ -298,10 +298,10 @@ def main() -> int:
     else:
         exec_notebook_cell(notebook, notebook_path, int(task["cell"]), namespace)
     if args.task == "ppo-train":
-        # Cell 11 delegates to the authoritative standalone PPO pilot.  Do not
-        # inspect or archive the legacy MODEL_PATH, which may contain an older
-        # model unrelated to the just-completed parameter screen.
-        print("[notebook-task] completed ppo-train via nominal PPO pilot runner", flush=True)
+        # Cell 11 delegates to the canonical four-variant PPO progression.
+        # Its runner owns the per-variant manifests and evaluation artifacts,
+        # so the legacy single-model archive path below does not apply.
+        print("[notebook-task] completed ppo-train via PPO-CBF progression runner", flush=True)
         return 0
 
     tensorboard_after = snapshot_tensorboard_events(tensorboard_roots)

@@ -27,6 +27,46 @@ from laneless_evaluation_registry import (
 from laneless_script_config import active_traffic_model, env_config_from_args
 
 
+TEN_KPI_SPECS: tuple[tuple[str, str], ...] = (
+    ("Episode return", "episode_return"),
+    ("Episode length (steps)", "episode_length_steps"),
+    ("Ego collisions / km", "ego_collisions_per_km"),
+    ("Minimum h", "h_min"),
+    ("QP failure rate", "qp_failure_rate"),
+    ("Abs speed error (m/s)", "mean_abs_speed_deviation"),
+    ("Mean lateral tracking error (m)", "mean_lat_y_error_m"),
+    ("Intervention rate", "event_intervention_rate"),
+    ("Correction norm", "mean_correction_norm"),
+    ("Mean jerk norm", "mean_jerk_norm"),
+)
+
+
+def ten_kpi_summary(metrics: pd.DataFrame) -> pd.DataFrame:
+    """Summarise the agreed final-evaluation KPIs as mean and sample SD."""
+
+    rows: list[dict[str, float | str]] = []
+    for label, column in TEN_KPI_SPECS:
+        if column not in metrics:
+            raise KeyError(f"Evaluation metrics are missing required KPI column {column!r}")
+        values = pd.to_numeric(metrics[column], errors="coerce").dropna()
+        rows.append(
+            {
+                "KPI": label,
+                "Mean": float(values.mean()) if len(values) else float("nan"),
+                "SD": float(values.std(ddof=1)) if len(values) > 1 else 0.0,
+            }
+        )
+    return pd.DataFrame(rows)
+
+
+def print_ten_kpi_summary(metrics: pd.DataFrame, *, label: str) -> None:
+    """Emit the standard KPI table directly in every preset final evaluation."""
+
+    table = ten_kpi_summary(metrics)
+    print(f"[eval-runner] 10-KPI final evaluation: {label} (mean +/- sample SD)", flush=True)
+    print(table.to_string(index=False, float_format=lambda value: f"{value:.3f}"), flush=True)
+
+
 def set_stable_native_defaults() -> None:
     for key in [
         "OMP_NUM_THREADS",
@@ -286,7 +326,7 @@ def main() -> int:
                 flush=True,
             )
             print(f"[eval-runner] refreshed {output_path}", flush=True)
-            print(metrics.drop(columns=["episode"], errors="ignore").mean().to_frame("mean"), flush=True)
+            print_ten_kpi_summary(metrics, label=f"{args.variant} (cached)")
             return 0
         print(
             "[eval-runner] no matching evaluation manifest; evaluating the latest saved training now",
@@ -355,7 +395,7 @@ def main() -> int:
     else:
         atomic_write_metrics(metrics, output_path)
     print(f"[eval-runner] wrote {output_path}", flush=True)
-    print(metrics.drop(columns=["episode"]).mean().to_frame("mean"), flush=True)
+    print_ten_kpi_summary(metrics, label=args.variant)
     return 0
 
 
