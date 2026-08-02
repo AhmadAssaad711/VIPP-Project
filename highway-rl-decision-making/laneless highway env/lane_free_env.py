@@ -207,7 +207,9 @@ class LaneFreeTrafficEnv(AbstractEnv):
                 # Formulation experiments can disable only the ego-side assist
                 # while retaining the same traffic and physical road model.
                 "ego_boundary_force": True,
-                "traffic_model": "force",
+                # MTM is the canonical traffic model. The historical force
+                # model remains available only when explicitly selected.
+                "traffic_model": "mtm",
                 "neighbors_count": 5,
                 "ego_dimensions": cls.EGO_DIMENSIONS.tolist(),
                 "vehicle_dimensions": cls.VEHICLE_DIMENSIONS.tolist(),
