@@ -183,8 +183,11 @@ class LaneFreeTrafficEnv(AbstractEnv):
     untouched.
     """
 
+    # Keep the controlled vehicle footprint identical to the surrounding
+    # traffic footprint.  The same dimensions drive collision geometry,
+    # CBF clearances, observations, and the native renderer.
     VEHICLE_DIMENSIONS = np.array([[3.50, 1.80], [3.50, 1.80]], dtype=float)
-    EGO_DIMENSIONS = np.array([3.20, 1.60], dtype=float)
+    EGO_DIMENSIONS = VEHICLE_DIMENSIONS[0].copy()
 
     @classmethod
     def default_config(cls) -> dict[str, Any]:
@@ -296,6 +299,18 @@ class LaneFreeTrafficEnv(AbstractEnv):
     def configure(self, config: dict | None) -> None:
         if config:
             _deep_update(self.config, config)
+        vehicle_dimensions = np.asarray(
+            self.config.get("vehicle_dimensions", self.VEHICLE_DIMENSIONS),
+            dtype=float,
+        )
+        if vehicle_dimensions.ndim != 2 or vehicle_dimensions.shape[1] != 2 or len(vehicle_dimensions) == 0:
+            raise ValueError(
+                "vehicle_dimensions must contain at least one [length, width] pair"
+            )
+        # Enforce one canonical footprint for ego and surrounding traffic even
+        # when a caller passes a legacy ego_dimensions override.
+        self.config["vehicle_dimensions"] = vehicle_dimensions.tolist()
+        self.config["ego_dimensions"] = vehicle_dimensions[0].tolist()
 
     def define_spaces(self) -> None:
         rows = 1 + int(self.config.get("neighbors_count", 5))
