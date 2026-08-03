@@ -147,7 +147,7 @@ def load_notebook_namespace(repo_root: Path) -> dict[str, Any]:
 
 def make_scenarios(road_width: float) -> list[ScenarioSpec]:
     center = 0.5 * road_width
-    ego = VehicleSpec("ego", 0.0, center, 20.0, role="ego", length=3.2, width=1.6, desired_speed=20.0)
+    ego = VehicleSpec("ego", 0.0, center, 20.0, role="ego", length=3.5, width=1.8, desired_speed=20.0)
     return [
         ScenarioSpec(
             name="open_road_no_neighbors",
@@ -205,7 +205,7 @@ def make_scenarios(road_width: float) -> list[ScenarioSpec]:
             expected="Recover inward from the road edge and avoid the slow blocker.",
             bands=[(8.2, 10.2, "#dc2626", "upper boundary squeeze"), (4.6, 6.8, "#16a34a", "inward recovery band")],
             vehicles=[
-                VehicleSpec("ego", 0.0, 8.7, 20.0, role="ego", length=3.2, width=1.6, desired_speed=20.0),
+                VehicleSpec("ego", 0.0, 8.7, 20.0, role="ego", length=3.5, width=1.8, desired_speed=20.0),
                 VehicleSpec("upper blocker", 18.0, 8.8, 13.0, role="blocker"),
                 VehicleSpec("center car", 12.0, 6.2, 18.0, role="hazard"),
                 VehicleSpec("center rear", -16.0, 6.0, 20.0, role="traffic"),
@@ -220,7 +220,7 @@ def make_scenarios(road_width: float) -> list[ScenarioSpec]:
             expected="Recover inward from the opposite road edge and avoid the slow blocker.",
             bands=[(0.0, 2.0, "#dc2626", "road-edge squeeze"), (4.2, 6.6, "#16a34a", "inward recovery band")],
             vehicles=[
-                VehicleSpec("ego", 0.0, 1.45, 20.0, role="ego", length=3.2, width=1.6, desired_speed=20.0),
+                VehicleSpec("ego", 0.0, 1.45, 20.0, role="ego", length=3.5, width=1.8, desired_speed=20.0),
                 VehicleSpec("edge blocker", 17.0, 1.5, 13.0, role="blocker"),
                 VehicleSpec("center car", 12.0, 4.2, 18.0, role="hazard"),
                 VehicleSpec("center rear", -15.0, 4.0, 20.0, role="traffic"),
