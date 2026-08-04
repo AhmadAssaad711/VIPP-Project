@@ -39,6 +39,21 @@ CBF reward-by-actor-loss study: [`docs/cbf_factorial_ablation.md`](docs/cbf_fact
 py -3.12 -m pip install -r requirements.txt
 ```
 
+## Exact PPO/DDPG baseline comparison
+
+To compare the two algorithms before changing the reward or safety design,
+run the frozen nominal P0/Q0 formulation:
+
+```powershell
+python scripts\compare_nominal_ppo_ddpg.py
+```
+
+The runner uses PPO `Q0_current_aligned` and DDPG `P0_current` with the same
+environment, 42-D observation, normalized acceleration action, reciprocal
+reward, collision protocol, training seed, and fixed evaluation seeds. It
+writes `final_comparison.csv`, `checkpoint_comparison.csv`, and the shared
+formulation manifest under `artifacts\ppo_ddpg_exact_p0`.
+
 ## Notes
 
 This public version keeps the notebooks and associated paper. Generated outputs, source scripts, old practice work, and vendor copies are intentionally excluded.
