@@ -1,0 +1,343 @@
+{
+  "schema_version": 3,
+  "variant": "ppo_nominal",
+  "variant_spec": {
+    "label": "PPO without CBF",
+    "level": 1,
+    "execution_mode": "box",
+    "reward_penalty": false,
+    "projected_mean": false
+  },
+  "training_seed": 307,
+  "timesteps": 50000,
+  "ppo_config_name": "Q1_stable",
+  "tensorboard_run_label": "u1",
+  "ppo_config": {
+    "learning_rate": 0.0001,
+    "n_steps": 250,
+    "batch_size": 200,
+    "n_epochs": 10,
+    "gamma": 0.99,
+    "gae_lambda": 0.95,
+    "clip_range": 0.2,
+    "ent_coef": 0.005,
+    "vf_coef": 0.5,
+    "max_grad_norm": 0.5,
+    "log_std_init": -0.5,
+    "global_rollout_steps": 2000,
+    "n_envs": 8
+  },
+  "lambda_delta": 0.0,
+  "lambda_intervention": 0.0,
+  "lambda_mean": 0.0,
+  "lambda_sample": 0.0,
+  "action_rate_penalty": 0.0,
+  "training_signature": {
+    "action_contract": {
+      "buffer_action": "latent Gaussian sample z",
+      "environment_action": "physical action-box projection",
+      "project_inputs_during_collection": false
+    },
+    "cbf": {
+      "CBF_AX_BOUNDS": [
+        -3.0,
+        3.0
+      ],
+      "CBF_AY_BOUNDS": [
+        -3.0,
+        3.0
+      ],
+      "CBF_EPS_SIDE": 0.1,
+      "CBF_K0": 5.29,
+      "CBF_K1": 3.68,
+      "CBF_MAX_NEIGHBOR_CONSTRAINTS": 12,
+      "CBF_NEIGHBOR_RANGE": 90.0,
+      "CBF_QP_FEASIBILITY_TOL": 0.001,
+      "CBF_TARGET_PAIR_DY": 3.0
+    },
+    "collection_topology": {
+      "backend": "subproc",
+      "n_envs": 8,
+      "start_method": "spawn"
+    },
+    "correction_epsilon": 0.03,
+    "effective_training_settings": {
+      "action_rate_penalty": 0.0,
+      "lambda_delta": 0.0,
+      "lambda_intervention": 0.0,
+      "lambda_mean": 0.0,
+      "lambda_sample": 0.0
+    },
+    "env_config": {
+      "bounds": {
+        "ax_max": 3.0,
+        "ax_min": -3.0,
+        "ay_max": 3.0,
+        "ay_min": -3.0
+      },
+      "desired_speed_range": [
+        15.0,
+        25.0
+      ],
+      "dt": 0.05,
+      "duration": 800,
+      "ego_controlled": true,
+      "ego_dimensions": [
+        3.5,
+        1.8
+      ],
+      "episode_steps": 800,
+      "gamma_nudge": 0.0,
+      "initial_speed_fraction_range": [
+        0.55,
+        1.1
+      ],
+      "mtm": {
+        "leader_range": 90.0,
+        "profile_probabilities": {
+          "aggressive": 0.3,
+          "cautious": 0.25,
+          "normal": 0.45
+        }
+      },
+      "neighbors_count": 5,
+      "observation_vmax": 24.0,
+      "observation_vymax": 7.2,
+      "placeholder_neighbor": [
+        80.0,
+        10.2,
+        0.0,
+        0.0
+      ],
+      "policy_frequency": 10,
+      "real_time_rendering": true,
+      "road_length": 380.0,
+      "road_width": 10.2,
+      "screen_height": 260,
+      "screen_width": 900,
+      "sensing_range": 90.0,
+      "show_trajectories": false,
+      "simulation_frequency": 20,
+      "terminate_on_collision": true,
+      "traffic_model": "mtm",
+      "vehicle_dimensions": [
+        [
+          3.5,
+          1.8
+        ],
+        [
+          3.5,
+          1.8
+        ]
+      ],
+      "vehicles_count": 55
+    },
+    "model_contract": {
+      "activation": "torch.nn.Tanh",
+      "algorithm_class": "LatentActionPPO",
+      "base_observation_dim": 42,
+      "max_cbf_constraints": 18,
+      "net_arch": {
+        "pi": [
+          256,
+          128
+        ],
+        "vf": [
+          256,
+          128
+        ]
+      },
+      "policy_class": "MlpPolicy"
+    },
+    "ppo_config": {
+      "batch_size": 200,
+      "clip_range": 0.2,
+      "ent_coef": 0.005,
+      "gae_lambda": 0.95,
+      "gamma": 0.99,
+      "global_rollout_steps": 2000,
+      "learning_rate": 0.0001,
+      "log_std_init": -0.5,
+      "max_grad_norm": 0.5,
+      "n_envs": 8,
+      "n_epochs": 10,
+      "n_steps": 250,
+      "vf_coef": 0.5
+    },
+    "ppo_config_name": "Q1_stable",
+    "reward_config": {
+      "collision_penalty": -100.0,
+      "collision_reward_override": true,
+      "ego_desired_speed": 20.0,
+      "epsilon_r": 0.4,
+      "lateral_reward_sigma": 1.0,
+      "lateral_reward_weight": 0.0,
+      "overtake_bonus": 0.0,
+      "progress_clip": 1.25,
+      "progress_reward_weight": 1.0,
+      "reward_mode": "additive",
+      "risk_penalty_weight": 0.0,
+      "risk_potential_shaping_weight": 0.0,
+      "safety_potential_eps_side": 0.1,
+      "safety_potential_formulation": "compact_quadratic",
+      "safety_potential_warning_h": 4.0,
+      "safety_potential_weight": 1.0,
+      "speed_reward_sigma": 4.0,
+      "speed_reward_weight": 0.0,
+      "timegap": 0.7,
+      "use_current_potential": 1.0,
+      "use_safety_potential": 0.0,
+      "w_safe": 0.0,
+      "way": 0.0,
+      "wf": 1.0,
+      "wx": 1.0,
+      "wy": 0.65
+    },
+    "schema_version": 3,
+    "tensorboard_run_label": "u1",
+    "timesteps": 50000,
+    "training_implementation_version": 6,
+    "training_seed": 307,
+    "variant": "ppo_nominal",
+    "variant_spec": {
+      "execution_mode": "box",
+      "label": "PPO without CBF",
+      "level": 1,
+      "projected_mean": false,
+      "reward_penalty": false
+    }
+  },
+  "training_signature_hash": "c429f4a2f2705c1d1509243a013328dadd8fb8b673e1fa1236b920f52adc054b",
+  "buffer_action": "latent Gaussian sample z",
+  "environment_action": "physical action-box projection",
+  "common_physical_action_bounds": {
+    "ax": [
+      -3.0,
+      3.0
+    ],
+    "ay": [
+      -3.0,
+      3.0
+    ]
+  },
+  "traffic_model": "mtm",
+  "collection_topology": {
+    "n_envs": 8,
+    "backend": "subproc",
+    "start_method": "spawn"
+  },
+  "global_rollout_steps": 2000,
+  "per_env_rollout_steps": 250,
+  "checkpoint_frequency_requested": 10000,
+  "checkpoint_frequency_effective": 10000,
+  "checkpoint_callback_frequency": 1250,
+  "tensorboard": {
+    "schema_version": 3,
+    "variant": "ppo_nominal",
+    "training_seed": 307,
+    "log_dir": "C:\\Users\\aha173\\OneDrive - American University of Beirut\\VIP - AGV - ND - Ahmad Assaad 1\\highway-rl-decision-making\\artifacts\\tb\\ppo\\u1_nom_307",
+    "command": "tensorboard --logdir \"C:\\Users\\aha173\\OneDrive - American University of Beirut\\VIP - AGV - ND - Ahmad Assaad 1\\highway-rl-decision-making\\artifacts\\tb\\ppo\\u1_nom_307\"",
+    "new_event_files": [
+      "C:\\Users\\aha173\\OneDrive - American University of Beirut\\VIP - AGV - ND - Ahmad Assaad 1\\highway-rl-decision-making\\artifacts\\tb\\ppo\\u1_nom_307\\train_1\\events.out.tfevents.1785829756.DSP000107027L.40360.0"
+    ],
+    "all_event_files": [
+      "C:\\Users\\aha173\\OneDrive - American University of Beirut\\VIP - AGV - ND - Ahmad Assaad 1\\highway-rl-decision-making\\artifacts\\tb\\ppo\\u1_nom_307\\train_1\\events.out.tfevents.1785829756.DSP000107027L.40360.0"
+    ],
+    "retrain_note": "Stable-Baselines3 creates a new train_N subdirectory for a fresh forced retrain, so TensorBoard histories remain distinguishable."
+  },
+  "resumed_from": null,
+  "resume_semantics": "rollout-aligned PPO model/optimizer continuation; simulator and process RNG state are re-seeded, so this is crash recovery rather than bit-exact trajectory replay",
+  "env_config": {
+    "road_length": 380.0,
+    "road_width": 10.2,
+    "dt": 0.05,
+    "simulation_frequency": 20,
+    "policy_frequency": 10,
+    "vehicles_count": 55,
+    "neighbors_count": 5,
+    "sensing_range": 90.0,
+    "episode_steps": 800,
+    "duration": 800,
+    "terminate_on_collision": true,
+    "gamma_nudge": 0.0,
+    "traffic_model": "mtm",
+    "mtm": {
+      "leader_range": 90.0,
+      "profile_probabilities": {
+        "normal": 0.45,
+        "aggressive": 0.3,
+        "cautious": 0.25
+      }
+    },
+    "bounds": {
+      "ax_min": -3.0,
+      "ax_max": 3.0,
+      "ay_min": -3.0,
+      "ay_max": 3.0
+    },
+    "ego_controlled": true,
+    "ego_dimensions": [
+      3.5,
+      1.8
+    ],
+    "vehicle_dimensions": [
+      [
+        3.5,
+        1.8
+      ],
+      [
+        3.5,
+        1.8
+      ]
+    ],
+    "placeholder_neighbor": [
+      80.0,
+      10.2,
+      0.0,
+      0.0
+    ],
+    "desired_speed_range": [
+      15.0,
+      25.0
+    ],
+    "initial_speed_fraction_range": [
+      0.55,
+      1.1
+    ],
+    "observation_vmax": 24.0,
+    "observation_vymax": 7.2,
+    "screen_width": 900,
+    "screen_height": 260,
+    "real_time_rendering": true,
+    "show_trajectories": false
+  },
+  "reward_config": {
+    "ego_desired_speed": 20.0,
+    "epsilon_r": 0.4,
+    "wx": 1.0,
+    "wy": 0.65,
+    "wf": 1.0,
+    "collision_penalty": -100.0,
+    "reward_mode": "additive",
+    "way": 0.0,
+    "overtake_bonus": 0.0,
+    "speed_reward_weight": 0.0,
+    "lateral_reward_weight": 0.0,
+    "risk_penalty_weight": 0.0,
+    "speed_reward_sigma": 4.0,
+    "lateral_reward_sigma": 1.0,
+    "timegap": 0.7,
+    "progress_reward_weight": 1.0,
+    "progress_clip": 1.25,
+    "use_current_potential": 1.0,
+    "use_safety_potential": 0.0,
+    "w_safe": 0.0,
+    "collision_reward_override": true,
+    "risk_potential_shaping_weight": 0.0,
+    "safety_potential_weight": 1.0,
+    "safety_potential_formulation": "compact_quadratic",
+    "safety_potential_warning_h": 4.0,
+    "safety_potential_eps_side": 0.1
+  },
+  "elapsed_sec": 82.650616
+}

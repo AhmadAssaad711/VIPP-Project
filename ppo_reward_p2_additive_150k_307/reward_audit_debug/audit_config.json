@@ -1,0 +1,36 @@
+{
+  "model_path": "C:\\Users\\aha173\\OneDrive - American University of Beirut\\VIP - AGV - ND - Ahmad Assaad 1\\highway-rl-decision-making\\ppo_reward_p2_additive_150k_307\\ppo_nominal\\seed_307\\model_final.zip",
+  "run_dir": "C:\\Users\\aha173\\OneDrive - American University of Beirut\\VIP - AGV - ND - Ahmad Assaad 1\\highway-rl-decision-making\\ppo_reward_p2_additive_150k_307\\ppo_nominal\\seed_307",
+  "external_cbf": "OFF",
+  "scenario_seeds": [
+    1300000
+  ],
+  "gamma": 0.99,
+  "constant_action_phys": [
+    0.0,
+    0.0
+  ],
+  "reward_config": {
+    "ego_desired_speed": 20.0,
+    "epsilon_r": 0.4,
+    "wx": 1.0,
+    "wy": 0.65,
+    "wf": 1.0,
+    "collision_penalty": -10.0,
+    "reward_mode": "additive",
+    "way": 0.0,
+    "overtake_bonus": 0.0,
+    "speed_reward_weight": 0.25,
+    "lateral_reward_weight": 0.25,
+    "risk_penalty_weight": 0.5,
+    "speed_reward_sigma": 4.0,
+    "lateral_reward_sigma": 1.0,
+    "timegap": 0.7,
+    "progress_reward_weight": 0.5,
+    "progress_clip": 1.25,
+    "use_current_potential": 1.0,
+    "use_safety_potential": 0.0,
+    "w_safe": 0.0,
+    "collision_reward_override": true
+  }
+}
