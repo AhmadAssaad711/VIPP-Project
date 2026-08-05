@@ -1,0 +1,175 @@
+{
+  "action_contract": {
+    "buffer_action": "latent Gaussian sample z",
+    "environment_action": "physical action-box projection",
+    "project_inputs_during_collection": false
+  },
+  "cbf": {
+    "CBF_AX_BOUNDS": [
+      -3.0,
+      3.0
+    ],
+    "CBF_AY_BOUNDS": [
+      -3.0,
+      3.0
+    ],
+    "CBF_EPS_SIDE": 0.1,
+    "CBF_K0": 5.29,
+    "CBF_K1": 3.68,
+    "CBF_MAX_NEIGHBOR_CONSTRAINTS": 12,
+    "CBF_NEIGHBOR_RANGE": 90.0,
+    "CBF_QP_FEASIBILITY_TOL": 0.001,
+    "CBF_TARGET_PAIR_DY": 3.0
+  },
+  "collection_topology": {
+    "backend": "subproc",
+    "n_envs": 8,
+    "start_method": "spawn"
+  },
+  "correction_epsilon": 0.03,
+  "effective_training_settings": {
+    "action_rate_penalty": 0.0,
+    "lambda_delta": 0.0,
+    "lambda_intervention": 0.0,
+    "lambda_mean": 0.0,
+    "lambda_sample": 0.0
+  },
+  "env_config": {
+    "bounds": {
+      "ax_max": 3.0,
+      "ax_min": -3.0,
+      "ay_max": 3.0,
+      "ay_min": -3.0
+    },
+    "desired_speed_range": [
+      15.0,
+      25.0
+    ],
+    "dt": 0.05,
+    "duration": 800,
+    "ego_controlled": true,
+    "ego_dimensions": [
+      3.5,
+      1.8
+    ],
+    "episode_steps": 800,
+    "gamma_nudge": 0.0,
+    "initial_speed_fraction_range": [
+      0.55,
+      1.1
+    ],
+    "mtm": {
+      "leader_range": 90.0,
+      "profile_probabilities": {
+        "aggressive": 0.3,
+        "cautious": 0.25,
+        "normal": 0.45
+      }
+    },
+    "neighbors_count": 5,
+    "observation_vmax": 24.0,
+    "observation_vymax": 7.2,
+    "placeholder_neighbor": [
+      80.0,
+      10.2,
+      0.0,
+      0.0
+    ],
+    "policy_frequency": 10,
+    "real_time_rendering": true,
+    "road_length": 380.0,
+    "road_width": 10.2,
+    "screen_height": 260,
+    "screen_width": 900,
+    "sensing_range": 90.0,
+    "show_trajectories": false,
+    "simulation_frequency": 20,
+    "terminate_on_collision": true,
+    "traffic_model": "mtm",
+    "vehicle_dimensions": [
+      [
+        3.5,
+        1.8
+      ],
+      [
+        3.5,
+        1.8
+      ]
+    ],
+    "vehicles_count": 55
+  },
+  "model_contract": {
+    "activation": "torch.nn.Tanh",
+    "algorithm_class": "LatentActionPPO",
+    "base_observation_dim": 42,
+    "max_cbf_constraints": 18,
+    "net_arch": {
+      "pi": [
+        256,
+        128
+      ],
+      "vf": [
+        256,
+        128
+      ]
+    },
+    "policy_class": "MlpPolicy"
+  },
+  "ppo_config": {
+    "batch_size": 200,
+    "clip_range": 0.2,
+    "ent_coef": 0.005,
+    "gae_lambda": 0.95,
+    "gamma": 0.99,
+    "global_rollout_steps": 2000,
+    "learning_rate": 0.0001,
+    "log_std_init": -0.5,
+    "max_grad_norm": 0.5,
+    "n_envs": 8,
+    "n_epochs": 10,
+    "n_steps": 250,
+    "vf_coef": 0.5
+  },
+  "ppo_config_name": "Q1_stable",
+  "reward_config": {
+    "collision_penalty": -100.0,
+    "collision_reward_override": true,
+    "ego_desired_speed": 20.0,
+    "epsilon_r": 0.4,
+    "lateral_reward_sigma": 1.0,
+    "lateral_reward_weight": 0.0,
+    "overtake_bonus": 0.0,
+    "progress_clip": 1.25,
+    "progress_reward_weight": 1.0,
+    "reward_mode": "additive",
+    "risk_penalty_weight": 0.0,
+    "risk_potential_shaping_weight": 0.0,
+    "safety_potential_eps_side": 0.1,
+    "safety_potential_formulation": "compact_quadratic",
+    "safety_potential_warning_h": 4.0,
+    "safety_potential_weight": 1.0,
+    "speed_reward_sigma": 4.0,
+    "speed_reward_weight": 0.0,
+    "timegap": 0.7,
+    "use_current_potential": 1.0,
+    "use_safety_potential": 0.0,
+    "w_safe": 0.0,
+    "way": 0.0,
+    "wf": 1.0,
+    "wx": 1.0,
+    "wy": 0.65
+  },
+  "schema_version": 3,
+  "tensorboard_run_label": "u1",
+  "timesteps": 50000,
+  "training_implementation_version": 6,
+  "training_seed": 307,
+  "variant": "ppo_nominal",
+  "variant_spec": {
+    "execution_mode": "box",
+    "label": "PPO without CBF",
+    "level": 1,
+    "projected_mean": false,
+    "reward_penalty": false
+  }
+}

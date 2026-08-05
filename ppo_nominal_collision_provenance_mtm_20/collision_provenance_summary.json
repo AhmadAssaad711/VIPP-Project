@@ -1,0 +1,83 @@
+{
+  "traffic_model": "mtm",
+  "episodes_per_controller": 20,
+  "seed_start": 1300000,
+  "policy_dt_s": 0.1,
+  "controllers": [
+    "zero",
+    "full_brake",
+    "speed_only",
+    "reactive_nominal"
+  ],
+  "causal_note": "MTM detects symmetric collision pairs. The reported closing_direction is inferred from pre-impact relative motion and is not a simulator causal label.",
+  "summary": [
+    {
+      "controller": "zero",
+      "episodes": 20,
+      "initial_overlap_rate": 0.0,
+      "initial_min_rect_separation_mean_m": 3.0902356292485074,
+      "initial_min_ellipse_h_mean": 1.2400897446897206,
+      "collision_episode_rate": 1.0,
+      "mean_collision_time_s": 3.884999999999998,
+      "mean_time_before_collision_s": 3.784999999999999,
+      "mean_distance_before_collision_m": 58.7400735877781,
+      "mean_pre_rect_separation_m": 0.21820659573966453,
+      "mean_pre_ellipse_h": -0.3914093329809792,
+      "mean_pre_range_closing_rate_mps": 3.8933742110754173,
+      "mean_longitudinal_ttc_s_finite": 0.05416505377293451,
+      "direction_counts": "{\"ego_closing_into_front\": 7, \"lateral_closing\": 2, \"traffic_closing_from_rear\": 11}",
+      "partner_profile_counts": "{\"aggressive\": 8, \"cautious\": 7, \"normal\": 5}"
+    },
+    {
+      "controller": "full_brake",
+      "episodes": 20,
+      "initial_overlap_rate": 0.0,
+      "initial_min_rect_separation_mean_m": 3.0902356292485074,
+      "initial_min_ellipse_h_mean": 1.2400897446897206,
+      "collision_episode_rate": 1.0,
+      "mean_collision_time_s": 2.4399999999999977,
+      "mean_time_before_collision_s": 2.3399999999999976,
+      "mean_distance_before_collision_m": 26.956824657127658,
+      "mean_pre_rect_separation_m": 0.5066439954079649,
+      "mean_pre_ellipse_h": -0.2695711337306451,
+      "mean_pre_range_closing_rate_mps": 7.612816657531605,
+      "mean_longitudinal_ttc_s_finite": 0.057621174076032275,
+      "direction_counts": "{\"ego_closing_into_front\": 1, \"lateral_closing\": 2, \"traffic_closing_from_rear\": 17}",
+      "partner_profile_counts": "{\"aggressive\": 7, \"cautious\": 5, \"normal\": 8}"
+    },
+    {
+      "controller": "speed_only",
+      "episodes": 20,
+      "initial_overlap_rate": 0.0,
+      "initial_min_rect_separation_mean_m": 3.0902356292485074,
+      "initial_min_ellipse_h_mean": 1.2400897446897206,
+      "collision_episode_rate": 1.0,
+      "mean_collision_time_s": 3.4049999999999976,
+      "mean_time_before_collision_s": 3.3049999999999975,
+      "mean_distance_before_collision_m": 60.56657221808247,
+      "mean_pre_rect_separation_m": 0.2697822848947679,
+      "mean_pre_ellipse_h": -0.42131555463923914,
+      "mean_pre_range_closing_rate_mps": 5.015071042329948,
+      "mean_longitudinal_ttc_s_finite": 0.04728285844320222,
+      "direction_counts": "{\"ego_closing_into_front\": 17, \"traffic_closing_from_rear\": 3}",
+      "partner_profile_counts": "{\"aggressive\": 5, \"cautious\": 10, \"normal\": 5}"
+    },
+    {
+      "controller": "reactive_nominal",
+      "episodes": 20,
+      "initial_overlap_rate": 0.0,
+      "initial_min_rect_separation_mean_m": 3.0902356292485074,
+      "initial_min_ellipse_h_mean": 1.2400897446897206,
+      "collision_episode_rate": 0.95,
+      "mean_collision_time_s": 6.642105263157911,
+      "mean_time_before_collision_s": 6.542105263157911,
+      "mean_distance_before_collision_m": 103.90875148779874,
+      "mean_pre_rect_separation_m": 0.15299092768702213,
+      "mean_pre_ellipse_h": -0.4421131165887345,
+      "mean_pre_range_closing_rate_mps": 2.4643211772451004,
+      "mean_longitudinal_ttc_s_finite": 0.02938178796186648,
+      "direction_counts": "{\"ego_closing_into_front\": 6, \"lateral_closing\": 4, \"traffic_closing_from_rear\": 9}",
+      "partner_profile_counts": "{\"aggressive\": 7, \"cautious\": 5, \"normal\": 7}"
+    }
+  ]
+}

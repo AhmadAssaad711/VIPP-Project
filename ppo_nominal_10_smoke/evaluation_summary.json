@@ -1,0 +1,13 @@
+{
+  "episodes": 2,
+  "collision_episode_rate": 1.0,
+  "mean_collision_events": 1.0,
+  "collisions_per_km": 7.539272217205459,
+  "mean_episode_return": -59.78088408029787,
+  "mean_steps": 74.5,
+  "mean_distance_m": 132.6387973785969,
+  "mean_first_collision_s": 7.4499999999999815,
+  "mean_min_ellipse_h": -0.4419377089381678,
+  "mean_abs_action": 0.037762326451201894,
+  "mean_action_saturation_rate": 0.0
+}

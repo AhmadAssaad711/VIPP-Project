@@ -1,0 +1,24 @@
+{
+  "schema_version": 3,
+  "evaluation_kind": "post_training_complete_episodes",
+  "model_path": "C:\\Users\\aha173\\OneDrive - American University of Beirut\\VIP - AGV - ND - Ahmad Assaad 1\\highway-rl-decision-making\\ppo_reward_p2_additive_150k_307\\ppo_nominal\\seed_307\\model_final.zip",
+  "model_sha256": "a5b24c8c58e504c696effa764304a51e6ab5b872be31486197d6ac6002709ac9",
+  "episodes_per_mode": 100,
+  "summary_blocks": 10,
+  "episodes_per_summary_block": 10,
+  "modes": [
+    "raw",
+    "cbf"
+  ],
+  "external_cbf": {
+    "raw": "OFF",
+    "cbf": "ON"
+  },
+  "episode_seed_start": 1300000,
+  "episode_metrics_path": "C:\\Users\\aha173\\OneDrive - American University of Beirut\\VIP - AGV - ND - Ahmad Assaad 1\\highway-rl-decision-making\\ppo_reward_p2_additive_150k_307\\ppo_nominal\\seed_307\\pe\\e.csv",
+  "pooled_block_metrics_path": "C:\\Users\\aha173\\OneDrive - American University of Beirut\\VIP - AGV - ND - Ahmad Assaad 1\\highway-rl-decision-making\\ppo_reward_p2_additive_150k_307\\ppo_nominal\\seed_307\\pe\\b.csv",
+  "kpi_table_path": "C:\\Users\\aha173\\OneDrive - American University of Beirut\\VIP - AGV - ND - Ahmad Assaad 1\\highway-rl-decision-making\\ppo_reward_p2_additive_150k_307\\ppo_nominal\\seed_307\\pe\\kpi.csv",
+  "study_kpi_table_path": "C:\\Users\\aha173\\OneDrive - American University of Beirut\\VIP - AGV - ND - Ahmad Assaad 1\\highway-rl-decision-making\\ppo_reward_p2_additive_150k_307\\post_train_200ep_kpis.csv",
+  "kpi_aggregation": "Collision and timestep rates are pooled within equal blocks before Mean/SD is calculated; return and episode length are episode means; h_min is the block minimum.",
+  "complete": true
+}

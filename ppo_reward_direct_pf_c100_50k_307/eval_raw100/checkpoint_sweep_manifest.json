@@ -1,0 +1,59 @@
+{
+  "schema_version": 1,
+  "evaluation_kind": "nominal_ppo_checkpoint_sweep",
+  "mode": "CBF OFF",
+  "run_dir": "C:\\Users\\aha173\\OneDrive - American University of Beirut\\VIP - AGV - ND - Ahmad Assaad 1\\highway-rl-decision-making\\ppo_reward_direct_pf_c100_50k_307\\ppo_nominal\\seed_307",
+  "training_seed": 307,
+  "episodes_per_checkpoint": 100,
+  "scenario_seed_start": 1300000,
+  "scenario_seeds_reused_for_every_checkpoint": true,
+  "checkpoint_stride": 10000,
+  "summary_path": "C:\\Users\\aha173\\OneDrive - American University of Beirut\\VIP - AGV - ND - Ahmad Assaad 1\\highway-rl-decision-making\\ppo_reward_direct_pf_c100_50k_307\\eval_raw100\\checkpoint_sweep_summary.csv",
+  "selections": {
+    "safety_first_lexicographic": {
+      "checkpoint_steps": 50000,
+      "episodes": 100,
+      "mean_return": -95.51704902871444,
+      "sd_return": 14.547986050783608,
+      "mean_episode_length": 46.75,
+      "collision_episode_rate": 1.0,
+      "collision_episodes": 100,
+      "collision_events": 102,
+      "distance_km": 7.725444626443857,
+      "pooled_collisions_per_km": 13.203123565323152,
+      "mean_h_min": -1.0795016575701917,
+      "mean_jerk_norm": 0.493107634198559,
+      "checkpoint_path": "C:\\Users\\aha173\\OneDrive - American University of Beirut\\VIP - AGV - ND - Ahmad Assaad 1\\highway-rl-decision-making\\ppo_reward_direct_pf_c100_50k_307\\ppo_nominal\\seed_307\\checkpoints\\rollout_50000_steps.zip"
+    },
+    "distance_safety_first": {
+      "checkpoint_steps": 50000,
+      "episodes": 100,
+      "mean_return": -95.51704902871444,
+      "sd_return": 14.547986050783608,
+      "mean_episode_length": 46.75,
+      "collision_episode_rate": 1.0,
+      "collision_episodes": 100,
+      "collision_events": 102,
+      "distance_km": 7.725444626443857,
+      "pooled_collisions_per_km": 13.203123565323152,
+      "mean_h_min": -1.0795016575701917,
+      "mean_jerk_norm": 0.493107634198559,
+      "checkpoint_path": "C:\\Users\\aha173\\OneDrive - American University of Beirut\\VIP - AGV - ND - Ahmad Assaad 1\\highway-rl-decision-making\\ppo_reward_direct_pf_c100_50k_307\\ppo_nominal\\seed_307\\checkpoints\\rollout_50000_steps.zip"
+    },
+    "return_first": {
+      "checkpoint_steps": 50000,
+      "episodes": 100,
+      "mean_return": -95.51704902871444,
+      "sd_return": 14.547986050783608,
+      "mean_episode_length": 46.75,
+      "collision_episode_rate": 1.0,
+      "collision_episodes": 100,
+      "collision_events": 102,
+      "distance_km": 7.725444626443857,
+      "pooled_collisions_per_km": 13.203123565323152,
+      "mean_h_min": -1.0795016575701917,
+      "mean_jerk_norm": 0.493107634198559,
+      "checkpoint_path": "C:\\Users\\aha173\\OneDrive - American University of Beirut\\VIP - AGV - ND - Ahmad Assaad 1\\highway-rl-decision-making\\ppo_reward_direct_pf_c100_50k_307\\ppo_nominal\\seed_307\\checkpoints\\rollout_50000_steps.zip"
+    }
+  }
+}

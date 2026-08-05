@@ -1,0 +1,30 @@
+{
+  "traffic_model": "mtm",
+  "ego_controlled": false,
+  "terminate_on_collision": false,
+  "seed_start": 1300000,
+  "summary": {
+    "episodes": 20,
+    "horizon_policy_steps": 400,
+    "horizon_s": 40.0,
+    "policy_dt_s": 0.1,
+    "initial_overlap_rate": 0.0,
+    "initial_min_rect_separation_mean_m": 3.0902356292485074,
+    "initial_min_rect_separation_min_m": 1.0117426864809431,
+    "initial_min_ellipse_h_mean": 1.2400897446897206,
+    "any_collision_episode_rate": 1.0,
+    "ego_collision_episode_rate": 0.85,
+    "mean_total_collision_events": 99.5,
+    "mean_ego_collision_events": 2.4,
+    "mean_background_only_collision_events": 97.1,
+    "total_collisions_per_km": 144.51364697251054,
+    "ego_collisions_per_km": 3.485756308884676,
+    "background_only_collisions_per_km": 141.02789066362584,
+    "mean_first_any_collision_s": 0.17500000000000002,
+    "mean_first_ego_collision_s": 8.811764705882378,
+    "mean_distance_m": 688.5162895302681,
+    "mean_abs_native_ego_ax_mps2": 0.29952975835649814,
+    "mean_abs_native_ego_ay_mps2": 0.13268382288223837,
+    "mean_mtm_leader_gap_m": 35.38706085361871
+  }
+}

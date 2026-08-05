@@ -1,0 +1,29 @@
+{
+  "model_path": "C:\\Users\\aha173\\OneDrive - American University of Beirut\\VIP - AGV - ND - Ahmad Assaad 1\\highway-rl-decision-making\\highway-rl-decision-making\\artifacts\\ppo_nominal_500k_seed307\\ppo_nominal\\seed_307\\model_final.zip",
+  "run_dir": "C:\\Users\\aha173\\OneDrive - American University of Beirut\\VIP - AGV - ND - Ahmad Assaad 1\\highway-rl-decision-making\\highway-rl-decision-making\\artifacts\\ppo_nominal_500k_seed307\\ppo_nominal\\seed_307",
+  "external_cbf": "OFF",
+  "scenario_seeds": [
+    1300000
+  ],
+  "gamma": 0.99,
+  "constant_action_phys": [
+    0.0,
+    0.0
+  ],
+  "reward_config": {
+    "ego_desired_speed": 20.0,
+    "epsilon_r": 0.4,
+    "wx": 1.0,
+    "wy": 0.65,
+    "wf": 1.0,
+    "collision_penalty": -2.5,
+    "way": 0.0,
+    "overtake_bonus": 0.5,
+    "timegap": 0.7,
+    "progress_reward_weight": 0.0,
+    "progress_clip": 1.25,
+    "use_current_potential": 1.0,
+    "use_safety_potential": 0.0,
+    "w_safe": 0.0
+  }
+}

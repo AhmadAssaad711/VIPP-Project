@@ -1,0 +1,14 @@
+{
+  "schema_version": 3,
+  "variant": "ppo_nominal",
+  "training_seed": 307,
+  "log_dir": "C:\\Users\\aha173\\OneDrive - American University of Beirut\\VIP - AGV - ND - Ahmad Assaad 1\\highway-rl-decision-making\\artifacts\\tb\\ppo\\u2_nom_307",
+  "command": "tensorboard --logdir \"C:\\Users\\aha173\\OneDrive - American University of Beirut\\VIP - AGV - ND - Ahmad Assaad 1\\highway-rl-decision-making\\artifacts\\tb\\ppo\\u2_nom_307\"",
+  "new_event_files": [
+    "C:\\Users\\aha173\\OneDrive - American University of Beirut\\VIP - AGV - ND - Ahmad Assaad 1\\highway-rl-decision-making\\artifacts\\tb\\ppo\\u2_nom_307\\train_1\\events.out.tfevents.1785830287.DSP000107027L.6636.0"
+  ],
+  "all_event_files": [
+    "C:\\Users\\aha173\\OneDrive - American University of Beirut\\VIP - AGV - ND - Ahmad Assaad 1\\highway-rl-decision-making\\artifacts\\tb\\ppo\\u2_nom_307\\train_1\\events.out.tfevents.1785830287.DSP000107027L.6636.0"
+  ],
+  "retrain_note": "Stable-Baselines3 creates a new train_N subdirectory for a fresh forced retrain, so TensorBoard histories remain distinguishable."
+}
