@@ -174,6 +174,43 @@ def _finite_min(values: Iterable[float], default: float = np.nan) -> float:
     return float(np.min(array)) if array.size else float(default)
 
 
+def _predict_evaluation_action(
+    model: LatentActionPPO,
+    observation: np.ndarray,
+    *,
+    action_source: str = "policy",
+) -> np.ndarray:
+    """Return a deterministic action for the requested evaluation ablation.
+
+    ``policy`` preserves the normal deployment path.  ``raw_actor_mean`` is
+    an inference-only ablation for projected policies: it bypasses the
+    architectural ``mu_raw -> mu_safe`` CBF projection and retains only the
+    physical action-box bounds.
+    """
+
+    if action_source == "policy":
+        action, _ = model.predict(observation, deterministic=True)
+    elif action_source == "raw_actor_mean":
+        if not hasattr(model, "predict_action_stages"):
+            raise TypeError(
+                "raw_actor_mean evaluation requires the projected-policy "
+                "diagnostic API predict_action_stages()"
+            )
+        stages = model.predict_action_stages(observation, deterministic=True)
+        if "mu_raw" not in stages:
+            raise KeyError("predict_action_stages() did not return mu_raw")
+        action = stages["mu_raw"]
+        low = np.asarray(model.action_space.low, dtype=np.float32).reshape(-1)
+        high = np.asarray(model.action_space.high, dtype=np.float32).reshape(-1)
+        action = np.clip(action, low, high)
+    else:
+        raise ValueError(
+            f"Unknown evaluation action source {action_source!r}; expected "
+            "'policy' or 'raw_actor_mean'."
+        )
+    return np.asarray(action, dtype=np.float32).reshape(-1)[:2]
+
+
 def _variant_dir(output_dir: Path, variant: str, training_seed: int) -> Path:
     return output_dir / variant / f"seed_{int(training_seed)}"
 
@@ -1292,6 +1329,7 @@ def evaluate_scenario(
     env_config: dict[str, Any],
     reward_config: dict[str, float],
     args: argparse.Namespace,
+    action_source: str = "policy",
 ) -> dict[str, Any]:
     env = make_evaluation_env(
         namespace,
@@ -1329,8 +1367,11 @@ def evaluate_scenario(
                 ttc_cap_s=float(args.ttc_cap),
             )
             h_values.append(float(pre_state.get("h_min", np.nan)))
-            action, _ = model.predict(observation, deterministic=True)
-            action = np.asarray(action, dtype=np.float32).reshape(-1)[:2]
+            action = _predict_evaluation_action(
+                model,
+                observation,
+                action_source=action_source,
+            )
             context_wrapper = env.get_wrapper_attr("project_current_action")
             shadow_safe, shadow_record = context_wrapper(action)
             shadow_correction = float(shadow_record["correction_norm_normalized"])
@@ -1404,6 +1445,7 @@ def evaluate_scenario(
             "variant": variant,
             "variant_label": VARIANT_SPECS[variant]["label"],
             "mode": mode,
+            "action_source": action_source,
             "training_seed": int(training_seed),
             "scenario_seed": int(scenario_seed),
             "timesteps": int(len(rewards)),
@@ -1443,6 +1485,7 @@ def evaluate_completed_episode(
     env_config: dict[str, Any],
     reward_config: dict[str, float],
     args: argparse.Namespace,
+    action_source: str = "policy",
 ) -> dict[str, Any]:
     """Evaluate exactly one complete episode for the immediate post-train table."""
 
@@ -1478,8 +1521,11 @@ def evaluate_completed_episode(
                 ttc_cap_s=float(args.ttc_cap),
             )
             h_values.append(float(pre_state.get("h_min", np.nan)))
-            action, _ = model.predict(observation, deterministic=True)
-            action = np.asarray(action, dtype=np.float32).reshape(-1)[:2]
+            action = _predict_evaluation_action(
+                model,
+                observation,
+                action_source=action_source,
+            )
             context_wrapper = env.get_wrapper_attr("project_current_action")
             _shadow_safe, shadow_record = context_wrapper(action)
             shadow_correction = float(shadow_record["correction_norm_normalized"])
@@ -1543,6 +1589,7 @@ def evaluate_completed_episode(
             "variant": variant,
             "variant_label": VARIANT_SPECS[variant]["label"],
             "mode": mode,
+            "action_source": action_source,
             "external_cbf": "ON" if mode == "cbf" else "OFF",
             "training_seed": int(training_seed),
             "episode_index": int(episode_index),
@@ -1885,6 +1932,101 @@ def evaluate_post_training_model(
     return table
 
 
+def evaluate_raw_actor_ablation(
+    namespace: dict[str, Any],
+    *,
+    model_path: Path,
+    training_seed: int,
+    env_config: dict[str, Any],
+    reward_config: dict[str, float],
+    args: argparse.Namespace,
+    output_dir: Path,
+) -> pd.DataFrame:
+    """Evaluate the projected variant with its raw actor mean at deployment.
+
+    This is intentionally separate from the ordinary OFF/ON evaluation.  The
+    ordinary ``raw`` deployment still uses ``mu_safe`` for a projected policy;
+    this ablation executes ``mu_raw`` with only physical action-box clipping.
+    """
+
+    variant = "ppo_cbf_projected"
+    episode_count = int(args.raw_actor_eval_episodes)
+    ablation_dir = (
+        output_dir / "raw_actor_ablation" / variant / f"seed_{int(training_seed)}"
+    )
+    ablation_dir.mkdir(parents=True, exist_ok=True)
+    print(
+        "[ppo-progression] starting raw-actor-mean ablation "
+        f"variant={variant} external_cbf=OFF episodes={episode_count}",
+        flush=True,
+    )
+    model = load_model(variant, model_path, args.device)
+    rows = [
+        evaluate_completed_episode(
+            namespace,
+            model=model,
+            variant=variant,
+            mode="raw",
+            training_seed=training_seed,
+            episode_index=episode_index + 1,
+            episode_seed=int(args.raw_actor_eval_seed_start) + episode_index,
+            env_config=env_config,
+            reward_config=reward_config,
+            args=args,
+            action_source="raw_actor_mean",
+        )
+        for episode_index in range(episode_count)
+    ]
+    metrics = pd.DataFrame(rows)
+    if len(metrics) != episode_count:
+        raise RuntimeError(
+            "Raw-actor ablation produced "
+            f"{len(metrics)} episodes; expected {episode_count}."
+        )
+    episodes_path = ablation_dir / "episodes.csv"
+    blocks_path = ablation_dir / "blocks.csv"
+    kpi_path = ablation_dir / "kpi.csv"
+    manifest_path = ablation_dir / "manifest.json"
+    metrics.to_csv(episodes_path, index=False)
+    block_metrics, table, summary_geometry = summarize_post_training_episodes(metrics)
+    block_metrics.to_csv(blocks_path, index=False)
+    table.to_csv(kpi_path, index=False)
+    manifest = {
+        "schema_version": PROGRESSION_SCHEMA_VERSION,
+        "evaluation_kind": "raw_actor_mean_ablation",
+        "action_source": "raw_actor_mean",
+        "action_semantics": (
+            "Execute the projected policy's neural-network mean mu_raw; "
+            "bypass mu_raw-to-mu_safe CBF projection and retain only physical "
+            "action-box clipping."
+        ),
+        "model_path": str(model_path.resolve()),
+        "model_sha256": protocol.file_sha256(model_path),
+        "variant": variant,
+        "training_seed": int(training_seed),
+        "external_cbf": "OFF",
+        "episode_seed_start": int(args.raw_actor_eval_seed_start),
+        **summary_geometry,
+        "episode_metrics_path": str(episodes_path.resolve()),
+        "pooled_block_metrics_path": str(blocks_path.resolve()),
+        "kpi_table_path": str(kpi_path.resolve()),
+        "complete": True,
+    }
+    manifest_path.write_text(json.dumps(manifest, indent=2), encoding="utf-8")
+    print(
+        "\n[ppo-progression] raw-actor-mean ablation KPI table "
+        f"| {episode_count} episodes | external CBF OFF",
+        flush=True,
+    )
+    print(
+        table[["KPI", "Mean", "SD", "N"]].to_string(
+            index=False, float_format=lambda value: f"{value:.3f}"
+        ),
+        flush=True,
+    )
+    return table
+
+
 def repair_post_training_summaries(output_dir: Path) -> pd.DataFrame:
     """Rebuild valid post-training KPI tables from already saved episode rows.
 
@@ -2178,6 +2320,15 @@ def parse_args() -> argparse.Namespace:
         help="Weight for the bounded additive lateral-tracking term.",
     )
     parser.add_argument(
+        "--lateral-y-weight",
+        type=float,
+        default=None,
+        help=(
+            "Override `wy`, the active lateral target-error cost weight in "
+            "the reciprocal Karalakou reward."
+        ),
+    )
+    parser.add_argument(
         "--risk-penalty-weight",
         type=float,
         default=None,
@@ -2364,6 +2515,33 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument(
+        "--raw-actor-eval",
+        action="store_true",
+        help=(
+            "Run an additional evaluation of ppo_cbf_projected using its "
+            "raw neural-network mean mu_raw, bypassing the architectural "
+            "CBF mean projection while retaining physical action bounds."
+        ),
+    )
+    parser.add_argument(
+        "--raw-actor-eval-episodes",
+        type=int,
+        default=DEFAULT_POST_TRAIN_EVAL_EPISODES,
+        help=(
+            "Complete episodes for the optional raw-actor-mean ablation; "
+            "default=%(default)s."
+        ),
+    )
+    parser.add_argument(
+        "--raw-actor-eval-seed-start",
+        type=int,
+        default=DEFAULT_POST_TRAIN_EVAL_SEED_START,
+        help=(
+            "First episode seed for the optional raw-actor-mean ablation; "
+            "default=%(default)s."
+        ),
+    )
+    parser.add_argument(
         "--repair-post-train-summaries",
         action="store_true",
         help=(
@@ -2408,6 +2586,10 @@ def main() -> int:
     unknown = [variant for variant in args.variants if variant not in VARIANT_SPECS]
     if unknown:
         raise ValueError(f"Unknown PPO progression variants: {unknown}")
+    if args.raw_actor_eval and "ppo_cbf_projected" not in args.variants:
+        raise ValueError(
+            "--raw-actor-eval requires ppo_cbf_projected in --variants"
+        )
     if args.eval_seeds is None:
         args.eval_seeds = [
             int(args.eval_seed_start) + index
@@ -2428,6 +2610,7 @@ def main() -> int:
     for name in (
         "speed_reward_weight",
         "lateral_reward_weight",
+        "lateral_y_weight",
         "risk_penalty_weight",
         "risk_potential_shaping_weight",
         "safety_potential_weight",
@@ -2446,6 +2629,7 @@ def main() -> int:
         "counterfactual_steps",
         "states_per_stratum",
         "stochastic_samples",
+        "raw_actor_eval_episodes",
     ):
         if int(getattr(args, name)) <= 0:
             raise ValueError(f"{name.replace('_', '-')} must be positive")
@@ -2489,6 +2673,8 @@ def main() -> int:
         if not np.isfinite(float(args.overtake_bonus)):
             raise ValueError("--overtake-bonus must be finite")
         reward_config["overtake_bonus"] = float(args.overtake_bonus)
+    if args.lateral_y_weight is not None:
+        reward_config["wy"] = float(args.lateral_y_weight)
     if args.collision_reward_override:
         reward_config["collision_reward_override"] = True
     for name in (
@@ -2555,6 +2741,7 @@ def main() -> int:
             "collision_reward_override": bool(
                 reward_config.get("collision_reward_override", False)
             ),
+            "lateral_y_weight": float(reward_config["wy"]),
             "speed_reward_weight": float(
                 reward_config.get("speed_reward_weight", 0.25)
             ),
@@ -2766,6 +2953,7 @@ def main() -> int:
         "collision_reward_override": bool(
             reward_config.get("collision_reward_override", False)
         ),
+        "lateral_y_weight": float(reward_config["wy"]),
         "speed_reward_weight": float(
             reward_config.get("speed_reward_weight", 0.25)
         ),
@@ -2830,6 +3018,14 @@ def main() -> int:
             "episode_seed_start": int(args.post_train_eval_seed_start),
             "evaluate_reused": bool(args.post_train_evaluate_reused),
         },
+        "raw_actor_mean_ablation": {
+            "enabled": bool(args.raw_actor_eval),
+            "variant": "ppo_cbf_projected",
+            "action_source": "raw_actor_mean",
+            "external_cbf": "OFF",
+            "episodes": int(args.raw_actor_eval_episodes),
+            "episode_seed_start": int(args.raw_actor_eval_seed_start),
+        },
         "counterfactual_enabled": bool(
             not args.skip_evaluation and not args.skip_counterfactual
         ),
@@ -2876,6 +3072,18 @@ def main() -> int:
                 k1=float(namespace["CBF_K1"]),
                 ttc_cap=float(args.ttc_cap),
                 seed=int(args.eval_seed_start) + 777,
+            )
+    if args.raw_actor_eval:
+        for training_seed in [int(seed) for seed in args.seeds]:
+            model_path = model_paths[(training_seed, "ppo_cbf_projected")]
+            evaluate_raw_actor_ablation(
+                namespace,
+                model_path=model_path,
+                training_seed=training_seed,
+                env_config=env_config,
+                reward_config=reward_config,
+                args=args,
+                output_dir=output_dir,
             )
     print(f"[ppo-progression] complete: {output_dir}", flush=True)
     return 0
