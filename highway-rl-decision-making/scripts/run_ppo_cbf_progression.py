@@ -123,14 +123,19 @@ EVALUATION_MODES = ("raw", "cbf")
 POST_TRAIN_EPISODE_MEAN_COLUMNS = {
     "episode_return",
     "episode_length_steps",
+    "full_horizon_survival_rate",
 }
 POST_TRAIN_POOLED_COLUMNS = {
     "ego_collisions_per_km",
     "h_min",
 }
+POST_TRAIN_KPI_SPECS: tuple[tuple[str, str], ...] = (
+    *TEN_KPI_SPECS,
+    ("Full-horizon survival rate", "full_horizon_survival_rate"),
+)
 POST_TRAIN_STEP_WEIGHTED_COLUMNS = tuple(
     column
-    for _label, column in TEN_KPI_SPECS
+    for _label, column in POST_TRAIN_KPI_SPECS
     if column not in POST_TRAIN_EPISODE_MEAN_COLUMNS | POST_TRAIN_POOLED_COLUMNS
 )
 FILTERED_FACTORIAL_VARIANTS = {
@@ -172,6 +177,57 @@ def _finite_min(values: Iterable[float], default: float = np.nan) -> float:
     array = np.asarray(list(values), dtype=float).reshape(-1)
     array = array[np.isfinite(array)]
     return float(np.min(array)) if array.size else float(default)
+
+
+def _evaluation_horizon_steps(env_config: dict[str, Any]) -> int:
+    """Return the episode horizon in policy steps, not simulator frames."""
+
+    configured_steps = float(
+        env_config.get("episode_steps", env_config.get("duration", 2000))
+    )
+    simulation_frequency = float(env_config.get("simulation_frequency", 20.0))
+    policy_frequency = float(env_config.get("policy_frequency", 10.0))
+    frames_per_policy_step = max(
+        1, int(round(simulation_frequency / max(policy_frequency, 1e-9)))
+    )
+    return max(1, int(np.ceil(configured_steps / frames_per_policy_step)))
+
+
+def _full_horizon_survival_flag(
+    *, episode_length_steps: float, collision_events: int, env_config: dict[str, Any]
+) -> float:
+    """Mark an episode that reached the time horizon without an ego collision."""
+
+    return float(
+        float(episode_length_steps) >= _evaluation_horizon_steps(env_config)
+        and int(collision_events) == 0
+    )
+
+
+def _ensure_full_horizon_survival_metric(
+    episode_metrics: pd.DataFrame, *, env_config: dict[str, Any] | None = None
+) -> pd.DataFrame:
+    """Add the metric to legacy saved episode rows when it is not already present."""
+
+    if "full_horizon_survival_rate" in episode_metrics.columns:
+        return episode_metrics
+    env_config = env_config or {}
+    enriched = episode_metrics.copy()
+    lengths = pd.to_numeric(enriched["episode_length_steps"], errors="coerce")
+    collisions = pd.to_numeric(
+        enriched["distinct_ego_collision_events"], errors="coerce"
+    ).fillna(0.0)
+    enriched["full_horizon_survival_rate"] = [
+        _full_horizon_survival_flag(
+            episode_length_steps=length,
+            collision_events=int(collision),
+            env_config=env_config,
+        )
+        if np.isfinite(length)
+        else 0.0
+        for length, collision in zip(lengths, collisions)
+    ]
+    return enriched
 
 
 def _predict_evaluation_action(
@@ -1608,6 +1664,11 @@ def evaluate_completed_episode(
             "event_intervention_rate": _finite_mean(interventions, default=0.0),
             "mean_correction_norm": _finite_mean(corrections, default=0.0),
             "mean_jerk_norm": _finite_mean(jerk_norms, default=0.0),
+            "full_horizon_survival_rate": _full_horizon_survival_flag(
+                episode_length_steps=len(rewards),
+                collision_events=collision_events,
+                env_config=env_config,
+            ),
             "shadow_event_intervention_rate": _finite_mean(
                 shadow_interventions, default=0.0
             ),
@@ -1655,6 +1716,8 @@ def _weighted_episode_metric(group: pd.DataFrame, column: str) -> float:
 
 def summarize_post_training_episodes(
     episode_metrics: pd.DataFrame,
+    *,
+    env_config: dict[str, Any] | None = None,
 ) -> tuple[pd.DataFrame, pd.DataFrame, dict[str, int]]:
     """Pool complete-episode data before calculating the public KPI table.
 
@@ -1665,6 +1728,9 @@ def summarize_post_training_episodes(
     reports mean +/- sample SD across the equal blocks, like the main evaluator.
     """
 
+    episode_metrics = _ensure_full_horizon_survival_metric(
+        episode_metrics, env_config=env_config
+    )
     required = {
         "variant",
         "variant_label",
@@ -1675,7 +1741,7 @@ def summarize_post_training_episodes(
         "timesteps",
         "total_distance_m",
         "distinct_ego_collision_events",
-        *(column for _label, column in TEN_KPI_SPECS),
+        *(column for _label, column in POST_TRAIN_KPI_SPECS),
     }
     missing = sorted(required - set(episode_metrics.columns))
     if missing:
@@ -1742,6 +1808,11 @@ def summarize_post_training_episodes(
                         block["episode_length_steps"], errors="coerce"
                     )
                 ),
+                "full_horizon_survival_rate": _finite_mean(
+                    pd.to_numeric(
+                        block["full_horizon_survival_rate"], errors="coerce"
+                    )
+                ),
                 "ego_collisions_per_km": (
                     1000.0 * float(collision_events) / total_distance_m
                     if total_distance_m > 1e-9
@@ -1766,7 +1837,7 @@ def summarize_post_training_episodes(
                     row[column] = _weighted_episode_metric(block, column)
             block_rows.append(row)
     block_metrics = pd.DataFrame(block_rows)
-    table = ten_kpi_table(block_metrics)
+    table = ten_kpi_table(block_metrics, kpi_specs=POST_TRAIN_KPI_SPECS)
     table.insert(0, "training_seed", int(block_metrics["training_seed"].iloc[0]))
     table.insert(
         3, "external_cbf", table["mode"].map({"raw": "OFF", "cbf": "ON"})
@@ -1902,7 +1973,9 @@ def evaluate_post_training_model(
         run_dir
     )
     metrics.to_csv(episodes_path, index=False)
-    block_metrics, table, summary_geometry = summarize_post_training_episodes(metrics)
+    block_metrics, table, summary_geometry = summarize_post_training_episodes(
+        metrics, env_config=env_config
+    )
     block_metrics.to_csv(blocks_path, index=False)
     table.to_csv(kpi_path, index=False)
     root_summary_path = _upsert_post_training_kpi_summary(output_dir, table)
@@ -1988,7 +2061,9 @@ def evaluate_raw_actor_ablation(
     kpi_path = ablation_dir / "kpi.csv"
     manifest_path = ablation_dir / "manifest.json"
     metrics.to_csv(episodes_path, index=False)
-    block_metrics, table, summary_geometry = summarize_post_training_episodes(metrics)
+    block_metrics, table, summary_geometry = summarize_post_training_episodes(
+        metrics, env_config=env_config
+    )
     block_metrics.to_csv(blocks_path, index=False)
     table.to_csv(kpi_path, index=False)
     manifest = {
@@ -2027,6 +2102,20 @@ def evaluate_raw_actor_ablation(
     return table
 
 
+def _saved_env_config(run_dir: Path, output_dir: Path) -> dict[str, Any]:
+    """Load the environment config associated with a saved post-train run."""
+
+    for config_path in (run_dir / "run_config.json", output_dir / "study_config.json"):
+        try:
+            payload = json.loads(config_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            continue
+        candidate = payload.get("env_config")
+        if isinstance(candidate, dict):
+            return candidate
+    return {}
+
+
 def repair_post_training_summaries(output_dir: Path) -> pd.DataFrame:
     """Rebuild valid post-training KPI tables from already saved episode rows.
 
@@ -2041,8 +2130,13 @@ def repair_post_training_summaries(output_dir: Path) -> pd.DataFrame:
         run_dir = episodes_path.parents[1]
         try:
             episode_metrics = pd.read_csv(episodes_path)
+            env_config = _saved_env_config(run_dir, output_dir)
+            episode_metrics = _ensure_full_horizon_survival_metric(
+                episode_metrics, env_config=env_config
+            )
+            episode_metrics.to_csv(episodes_path, index=False)
             block_metrics, table, summary_geometry = summarize_post_training_episodes(
-                episode_metrics
+                episode_metrics, env_config=env_config
             )
         except (OSError, ValueError, KeyError) as error:
             print(
@@ -2102,10 +2196,14 @@ def repair_post_training_summaries(output_dir: Path) -> pd.DataFrame:
     return pd.DataFrame()
 
 
-def ten_kpi_table(metrics: pd.DataFrame) -> pd.DataFrame:
+def ten_kpi_table(
+    metrics: pd.DataFrame,
+    *,
+    kpi_specs: tuple[tuple[str, str], ...] = TEN_KPI_SPECS,
+) -> pd.DataFrame:
     rows: list[dict[str, Any]] = []
     for (variant, mode), group in metrics.groupby(["variant", "mode"], sort=False):
-        for label, column in TEN_KPI_SPECS:
+        for label, column in kpi_specs:
             values = pd.to_numeric(group[column], errors="coerce").dropna()
             rows.append(
                 {
@@ -2326,6 +2424,14 @@ def parse_args() -> argparse.Namespace:
         help=(
             "Override `wy`, the active lateral target-error cost weight in "
             "the reciprocal Karalakou reward."
+        ),
+    )
+    parser.add_argument(
+        "--expose-target-y",
+        action="store_true",
+        help=(
+            "Expose normalized reward-derived target_y in the unused second ego "
+            "observation slot without changing the 42-D actor input shape."
         ),
     )
     parser.add_argument(
@@ -2675,6 +2781,8 @@ def main() -> int:
         reward_config["overtake_bonus"] = float(args.overtake_bonus)
     if args.lateral_y_weight is not None:
         reward_config["wy"] = float(args.lateral_y_weight)
+    if args.expose_target_y:
+        reward_config["expose_target_y"] = True
     if args.collision_reward_override:
         reward_config["collision_reward_override"] = True
     for name in (
@@ -2742,6 +2850,7 @@ def main() -> int:
                 reward_config.get("collision_reward_override", False)
             ),
             "lateral_y_weight": float(reward_config["wy"]),
+            "expose_target_y": bool(reward_config.get("expose_target_y", False)),
             "speed_reward_weight": float(
                 reward_config.get("speed_reward_weight", 0.25)
             ),
@@ -2954,6 +3063,7 @@ def main() -> int:
             reward_config.get("collision_reward_override", False)
         ),
         "lateral_y_weight": float(reward_config["wy"]),
+        "expose_target_y": bool(reward_config.get("expose_target_y", False)),
         "speed_reward_weight": float(
             reward_config.get("speed_reward_weight", 0.25)
         ),
