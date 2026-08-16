@@ -63,7 +63,7 @@ from train_safety_potential_variants import MTM_CONGESTED_UNCERTAIN_UPDATES, dee
 
 
 PROGRESSION_SCHEMA_VERSION = 3
-PPO_TRAINING_IMPLEMENTATION_VERSION = 6
+PPO_TRAINING_IMPLEMENTATION_VERSION = 7
 TRAINING_SIGNATURE_FILE = "training_signature.json"
 TRAINING_PENDING_SIGNATURE_FILE = "training_signature.pending.json"
 TRAINING_COMPLETION_FILE = "training_complete.json"
@@ -120,10 +120,25 @@ VARIANT_SPECS: dict[str, dict[str, Any]] = {
 }
 DEFAULT_VARIANTS = tuple(VARIANT_SPECS)
 EVALUATION_MODES = ("raw", "cbf")
+
+
+def _base_observation_features(env_config: dict[str, Any]) -> list[str]:
+    features = ["dx", "dy", "vx", "vy"]
+    if bool(env_config.get("observation_include_vehicle_dimensions", True)):
+        features.extend(["vehicle_length", "vehicle_width"])
+    features.append("desired_speed")
+    return features
+
+
+def _base_observation_dim(env_config: dict[str, Any]) -> int:
+    rows = 1 + int(env_config.get("neighbors_count", 5))
+    return rows * len(_base_observation_features(env_config))
+
+
 POST_TRAIN_EPISODE_MEAN_COLUMNS = {
     "episode_return",
     "episode_length_steps",
-    "full_horizon_survival_rate",
+    "distance_completion_rate",
 }
 POST_TRAIN_POOLED_COLUMNS = {
     "ego_collisions_per_km",
@@ -131,7 +146,7 @@ POST_TRAIN_POOLED_COLUMNS = {
 }
 POST_TRAIN_KPI_SPECS: tuple[tuple[str, str], ...] = (
     *TEN_KPI_SPECS,
-    ("Full-horizon survival rate", "full_horizon_survival_rate"),
+    ("Distance-based completion rate", "distance_completion_rate"),
 )
 POST_TRAIN_STEP_WEIGHTED_COLUMNS = tuple(
     column
@@ -196,7 +211,7 @@ def _evaluation_horizon_steps(env_config: dict[str, Any]) -> int:
 def _full_horizon_survival_flag(
     *, episode_length_steps: float, collision_events: int, env_config: dict[str, Any]
 ) -> float:
-    """Mark an episode that reached the time horizon without an ego collision."""
+    """Legacy time-based diagnostic retained in raw episode files."""
 
     return float(
         float(episode_length_steps) >= _evaluation_horizon_steps(env_config)
@@ -226,6 +241,55 @@ def _ensure_full_horizon_survival_metric(
         if np.isfinite(length)
         else 0.0
         for length, collision in zip(lengths, collisions)
+    ]
+    return enriched
+
+
+def _distance_completion_target_m(env_config: dict[str, Any]) -> float:
+    """Return the simulator distance that defines one completed episode."""
+
+    target_distance_m = float(env_config.get("road_length", 0.0))
+    if not np.isfinite(target_distance_m) or target_distance_m <= 0.0:
+        raise ValueError(
+            "Distance-based completion requires a positive finite simulator "
+            "road_length in env_config."
+        )
+    return target_distance_m
+
+
+def _distance_completion_flag(
+    *, total_distance_m: float, collision_events: int, env_config: dict[str, Any]
+) -> float:
+    """Mark a collision-free episode that traversed one simulator road length."""
+
+    distance_m = float(total_distance_m)
+    return float(
+        np.isfinite(distance_m)
+        and distance_m >= _distance_completion_target_m(env_config)
+        and int(collision_events) == 0
+    )
+
+
+def _ensure_distance_completion_metric(
+    episode_metrics: pd.DataFrame, *, env_config: dict[str, Any] | None = None
+) -> pd.DataFrame:
+    """Add distance completion to legacy episode rows using simulator distance."""
+
+    if "distance_completion_rate" in episode_metrics.columns:
+        return episode_metrics
+    env_config = env_config or {}
+    enriched = episode_metrics.copy()
+    distances = pd.to_numeric(enriched["total_distance_m"], errors="coerce")
+    collisions = pd.to_numeric(
+        enriched["distinct_ego_collision_events"], errors="coerce"
+    ).fillna(0.0)
+    enriched["distance_completion_rate"] = [
+        _distance_completion_flag(
+            total_distance_m=distance,
+            collision_events=int(collision),
+            env_config=env_config,
+        )
+        for distance, collision in zip(distances, collisions)
     ]
     return enriched
 
@@ -390,7 +454,8 @@ def training_signature(
             ),
             "net_arch": {"pi": [256, 128], "vf": [256, 128]},
             "activation": "torch.nn.Tanh",
-            "base_observation_dim": 42,
+            "base_observation_dim": _base_observation_dim(env_config),
+            "base_observation_features": _base_observation_features(env_config),
             "max_cbf_constraints": 18,
         },
         "action_contract": {
@@ -762,6 +827,7 @@ def make_ppo_cbf_env(
         k0=float(namespace["CBF_K0"]),
         k1=float(namespace["CBF_K1"]),
         max_neighbor_constraints=int(namespace["CBF_MAX_NEIGHBOR_CONSTRAINTS"]),
+        base_observation_dim=int(np.prod(env.observation_space.shape)),
         project_inputs=bool(project_inputs),
         lambda_delta=float(lambda_delta),
         lambda_intervention=float(lambda_intervention),
@@ -954,6 +1020,7 @@ def build_model(
     training_seed: int,
     args: argparse.Namespace,
     tensorboard_log: Path,
+    base_observation_dim: int,
 ) -> LatentActionPPO:
     spec = VARIANT_SPECS[variant]
     common_policy_kwargs: dict[str, Any] = {
@@ -981,13 +1048,13 @@ def build_model(
         "seed": int(training_seed),
         "device": str(args.device),
         "execution_mode": str(spec["execution_mode"]),
-        "cbf_base_observation_dim": 42,
+        "cbf_base_observation_dim": int(base_observation_dim),
         "cbf_max_constraints": 18,
     }
     if bool(spec["projected_mean"]):
         projected_policy_kwargs = {
             **common_policy_kwargs,
-            "cbf_base_observation_dim": 42,
+            "cbf_base_observation_dim": int(base_observation_dim),
             "cbf_max_constraints": 18,
         }
         return ProjectedCBFPPO(
@@ -1002,6 +1069,7 @@ def build_model(
         "MlpPolicy",
         train_env,
         policy_kwargs=context_ignoring_policy_kwargs(
+            base_observation_dim=int(base_observation_dim),
             policy_kwargs=common_policy_kwargs
         ),
         **common_model_kwargs,
@@ -1140,6 +1208,7 @@ def train_variant(
             training_seed=training_seed,
             args=args,
             tensorboard_log=tensorboard_log_dir,
+            base_observation_dim=_base_observation_dim(env_config),
         )
     else:
         # Supply the vectorized environment while loading so SB3 constructs a
@@ -1200,9 +1269,11 @@ def train_variant(
     checkpoint_save_freq = checkpoint_frequency_effective // int(
         config["n_envs"]
     )
+    checkpoint_dir = run_dir / "checkpoints"
+    checkpoint_dir.mkdir(parents=True, exist_ok=True)
     checkpoint_callback = CheckpointCallback(
         save_freq=checkpoint_save_freq,
-        save_path=str(run_dir / "checkpoints"),
+        save_path=str(checkpoint_dir),
         name_prefix="rollout",
         save_replay_buffer=False,
         save_vecnormalize=False,
@@ -1664,8 +1735,15 @@ def evaluate_completed_episode(
             "event_intervention_rate": _finite_mean(interventions, default=0.0),
             "mean_correction_norm": _finite_mean(corrections, default=0.0),
             "mean_jerk_norm": _finite_mean(jerk_norms, default=0.0),
+            # Retain the former time-based value for backwards-compatible raw
+            # episode files; public completion KPI aggregation is distance-based.
             "full_horizon_survival_rate": _full_horizon_survival_flag(
                 episode_length_steps=len(rewards),
+                collision_events=collision_events,
+                env_config=env_config,
+            ),
+            "distance_completion_rate": _distance_completion_flag(
+                total_distance_m=total_distance_m,
                 collision_events=collision_events,
                 env_config=env_config,
             ),
@@ -1728,7 +1806,7 @@ def summarize_post_training_episodes(
     reports mean +/- sample SD across the equal blocks, like the main evaluator.
     """
 
-    episode_metrics = _ensure_full_horizon_survival_metric(
+    episode_metrics = _ensure_distance_completion_metric(
         episode_metrics, env_config=env_config
     )
     required = {
@@ -1808,9 +1886,9 @@ def summarize_post_training_episodes(
                         block["episode_length_steps"], errors="coerce"
                     )
                 ),
-                "full_horizon_survival_rate": _finite_mean(
+                "distance_completion_rate": _finite_mean(
                     pd.to_numeric(
-                        block["full_horizon_survival_rate"], errors="coerce"
+                        block["distance_completion_rate"], errors="coerce"
                     )
                 ),
                 "ego_collisions_per_km": (
@@ -1997,6 +2075,11 @@ def evaluate_post_training_model(
             "before Mean/SD is calculated; return and episode length are "
             "episode means; h_min is the block minimum."
         ),
+        "completion_definition": (
+            "distance_completion_rate=1 when simulator total_distance_m is at "
+            f"least road_length ({_distance_completion_target_m(env_config):.6g} m) "
+            "and distinct_ego_collision_events is zero."
+        ),
         "complete": True,
     }
     manifest_path.write_text(json.dumps(manifest, indent=2), encoding="utf-8")
@@ -2131,7 +2214,7 @@ def repair_post_training_summaries(output_dir: Path) -> pd.DataFrame:
         try:
             episode_metrics = pd.read_csv(episodes_path)
             env_config = _saved_env_config(run_dir, output_dir)
-            episode_metrics = _ensure_full_horizon_survival_metric(
+            episode_metrics = _ensure_distance_completion_metric(
                 episode_metrics, env_config=env_config
             )
             episode_metrics.to_csv(episodes_path, index=False)
@@ -2177,6 +2260,11 @@ def repair_post_training_summaries(output_dir: Path) -> pd.DataFrame:
                 "Collision and timestep rates are pooled within equal blocks "
                 "before Mean/SD is calculated; return and episode length are "
                 "episode means; h_min is the block minimum."
+            ),
+            "completion_definition": (
+                "distance_completion_rate=1 when simulator total_distance_m is at "
+                f"least road_length ({_distance_completion_target_m(env_config):.6g} m) "
+                "and distinct_ego_collision_events is zero."
             ),
             "complete": True,
         }
@@ -2427,11 +2515,19 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument(
-        "--expose-target-y",
+                "--expose-target-y",
         action="store_true",
         help=(
             "Expose normalized reward-derived target_y in the unused second ego "
             "observation slot without changing the 42-D actor input shape."
+        ),
+    )
+    parser.add_argument(
+        "--remove-vehicle-dimensions",
+        action="store_true",
+        help=(
+            "Omit vehicle length and width from every observed vehicle row; "
+            "reduces the learned base observation from 42 to 30 features."
         ),
     )
     parser.add_argument(
@@ -2762,6 +2858,8 @@ def main() -> int:
     env_config = env_config_from_args(args, namespace["ENV_CONFIG"])
     if active_traffic_model(env_config) == "mtm":
         deep_update(env_config, copy.deepcopy(MTM_CONGESTED_UNCERTAIN_UPDATES))
+    if args.remove_vehicle_dimensions:
+        env_config["observation_include_vehicle_dimensions"] = False
     if not bool(env_config.get("terminate_on_collision", False)):
         raise RuntimeError("PPO progression requires terminate_on_collision=True")
     reward_config = protocol.make_base_reward_config(namespace)
@@ -2851,6 +2949,8 @@ def main() -> int:
             ),
             "lateral_y_weight": float(reward_config["wy"]),
             "expose_target_y": bool(reward_config.get("expose_target_y", False)),
+            "remove_vehicle_dimensions": bool(args.remove_vehicle_dimensions),
+            "base_observation_dim": _base_observation_dim(env_config),
             "speed_reward_weight": float(
                 reward_config.get("speed_reward_weight", 0.25)
             ),
@@ -3062,7 +3162,9 @@ def main() -> int:
         "collision_reward_override": bool(
             reward_config.get("collision_reward_override", False)
         ),
-        "lateral_y_weight": float(reward_config["wy"]),
+            "lateral_y_weight": float(reward_config["wy"]),
+            "remove_vehicle_dimensions": bool(args.remove_vehicle_dimensions),
+            "base_observation_dim": _base_observation_dim(env_config),
         "expose_target_y": bool(reward_config.get("expose_target_y", False)),
         "speed_reward_weight": float(
             reward_config.get("speed_reward_weight", 0.25)
