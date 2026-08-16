@@ -64,7 +64,7 @@ class CBFContextPhysicalActionWrapper(gym.Wrapper):
         k0: float,
         k1: float,
         max_neighbor_constraints: Optional[int],
-        base_observation_dim: int = 42,
+        base_observation_dim: Optional[int] = None,
         max_constraints: int = 18,
         project_inputs: bool = False,
         lambda_delta: float = 0.0,
@@ -85,6 +85,10 @@ class CBFContextPhysicalActionWrapper(gym.Wrapper):
             if max_neighbor_constraints is None
             else int(max_neighbor_constraints)
         )
+        if base_observation_dim is None:
+            if not isinstance(env.observation_space, gym.spaces.Box):
+                raise TypeError("Projected PPO currently requires a flat Box observation")
+            base_observation_dim = int(np.prod(env.observation_space.shape))
         self.layout = CBFContextLayout(
             base_observation_dim=int(base_observation_dim),
             max_constraints=int(max_constraints),

@@ -221,6 +221,7 @@ class LaneFreeTrafficEnv(AbstractEnv):
                 "initial_speed_fraction_range": [0.75, 1.0],
                 "observation_vmax": 24.0,
                 "observation_vymax": 7.2,
+                "observation_include_vehicle_dimensions": True,
                 "force": {
                     "k_target_x": 2.5,
                     "k_target_y": 2.0,
@@ -231,6 +232,32 @@ class LaneFreeTrafficEnv(AbstractEnv):
                     "sigma_y": 1.0,
                     "T_x": 1.2,
                     "T_y": 0.8,
+                },
+                # Generate only collision-free, buffered initial scenes. The
+                # traffic controller still produces genuine
+                # interaction during an episode; this prevents reset from
+                # starting the ego in an already-overlapping configuration.
+                "traffic_safety": {
+                    "safe_spawn": True,
+                    "spawn_max_attempts": 1_000,
+                    # Values below are clearances between vehicle footprints,
+                    # not centre-to-centre distances.
+                    "spawn_longitudinal_clearance": 6.0,
+                    "spawn_lateral_clearance": 0.35,
+                    "spawn_ego_longitudinal_clearance": 18.0,
+                    "spawn_ego_lateral_clearance": 0.75,
+                    "spawn_time_headway": 0.75,
+                    # The guard controls surrounding traffic only. It never
+                    # overwrites the controlled ego action, so an unsafe ego
+                    # action can still cause a meaningful collision.
+                    "dynamics_guard": True,
+                    "guard_horizon_s": 1.5,
+                    "guard_range_m": 120.0,
+                    "guard_longitudinal_clearance": 1.5,
+                    "guard_lateral_clearance": 0.25,
+                    "guard_time_headway": 0.25,
+                    "guard_lateral_conflict_range": 12.0,
+                    "guard_lateral_yield_acceleration": 3.0,
                 },
                 "mtm": {
                     "theta": 0.2,
@@ -314,7 +341,10 @@ class LaneFreeTrafficEnv(AbstractEnv):
 
     def define_spaces(self) -> None:
         rows = 1 + int(self.config.get("neighbors_count", 5))
-        features = rows * 7
+        include_vehicle_dimensions = bool(
+            self.config.get("observation_include_vehicle_dimensions", True)
+        )
+        features = rows * (7 if include_vehicle_dimensions else 5)
         self.action_space = spaces.Box(-1.0, 1.0, shape=(2,), dtype=np.float32)
         self.observation_space = spaces.Box(-np.inf, np.inf, shape=(features,), dtype=np.float32)
         self.action_type = None
@@ -346,6 +376,8 @@ class LaneFreeTrafficEnv(AbstractEnv):
         self._flow_count = 0
         self._last_mtm_diagnostics: dict[str, float] = {}
         self._mtm_profile_counts: dict[str, int] = {}
+        self._last_spawn_diagnostics: dict[str, float] = {}
+        self._last_traffic_safety_diagnostics: dict[str, float] = {}
         self._reset()
         obs = self._observe()
         return obs, self._info(obs, self._last_action)
@@ -370,9 +402,7 @@ class LaneFreeTrafficEnv(AbstractEnv):
         speed_low, speed_high = self.config["initial_speed_fraction_range"]
         mtm_profiles = self.config.get("mtm", {}).get("profiles", {})
 
-        x_slots = np.linspace(0.0, road_length, count, endpoint=False)
-        self.np_random.shuffle(x_slots)
-        vehicles: list[LaneFreeVehicle] = []
+        vehicle_specs: list[tuple[LaneFreeVehicleState, bool]] = []
         profile_counts: dict[str, int] = {}
 
         vehicle_dimensions = np.asarray(self.config.get("vehicle_dimensions", self.VEHICLE_DIMENSIONS), dtype=float)
@@ -391,25 +421,189 @@ class LaneFreeTrafficEnv(AbstractEnv):
             desired_multiplier = float(profile.get("desired_speed_multiplier", 1.0)) if not ego_controlled else 1.0
             desired_speed = float(self.np_random.uniform(desired_low, desired_high)) * desired_multiplier
             speed_fraction = float(self.np_random.uniform(speed_low, speed_high))
-            x = float((x_slots[index] + self.np_random.uniform(-0.35, 0.35) * road_length / count) % road_length)
-            y = float(self.np_random.uniform(vehicle_width / 2.0, road_width - vehicle_width / 2.0))
-            state = LaneFreeVehicleState(
-                x=x,
-                y=y,
-                vx=speed_fraction * desired_speed,
-                vy=0.0,
-                length=float(vehicle_length),
-                width=float(vehicle_width),
-                desired_speed=desired_speed,
-                driver_profile=driver_profile,
+            vehicle_specs.append(
+                (
+                    LaneFreeVehicleState(
+                        x=0.0,
+                        y=0.0,
+                        vx=speed_fraction * desired_speed,
+                        vy=0.0,
+                        length=float(vehicle_length),
+                        width=float(vehicle_width),
+                        desired_speed=desired_speed,
+                        driver_profile=driver_profile,
+                    ),
+                    index == 0,
+                )
             )
-            vehicles.append(LaneFreeVehicle(self.road, state, is_ego=index == 0))
             profile_counts[driver_profile] = profile_counts.get(driver_profile, 0) + 1
+
+        if bool(self._traffic_safety_config().get("safe_spawn", True)):
+            initial_states = self._sample_safe_initial_states(vehicle_specs)
+        else:
+            initial_states = self._sample_legacy_initial_states(vehicle_specs)
+
+        vehicles = [
+            LaneFreeVehicle(self.road, state, is_ego=is_ego)
+            for state, is_ego in initial_states
+        ]
 
         self.road.vehicles = vehicles
         self.vehicle = vehicles[0]
         self.controlled_vehicles = [self.vehicle]
         self._mtm_profile_counts = profile_counts
+
+    def _traffic_safety_config(self) -> dict[str, Any]:
+        """Return the simulator-side traffic safety settings."""
+
+        config = self.config.get("traffic_safety", {})
+        return config if isinstance(config, dict) else {}
+
+    def _sample_legacy_initial_states(
+        self, vehicle_specs: list[tuple[LaneFreeVehicleState, bool]]
+    ) -> list[tuple[LaneFreeVehicleState, bool]]:
+        """Reproduce independent placement for legacy experiments."""
+
+        count = len(vehicle_specs)
+        road_length = float(self.config["road_length"])
+        road_width = float(self.config["road_width"])
+        x_slots = np.linspace(0.0, road_length, count, endpoint=False)
+        self.np_random.shuffle(x_slots)
+        states: list[tuple[LaneFreeVehicleState, bool]] = []
+        for index, (spec, is_ego) in enumerate(vehicle_specs):
+            x = float(
+                (
+                    x_slots[index]
+                    + self.np_random.uniform(-0.35, 0.35)
+                    * road_length
+                    / max(count, 1)
+                )
+                % road_length
+            )
+            y = float(
+                self.np_random.uniform(
+                    spec.width / 2.0, road_width - spec.width / 2.0
+                )
+            )
+            states.append(
+                (
+                    LaneFreeVehicleState(
+                        x=x,
+                        y=y,
+                        vx=spec.vx,
+                        vy=spec.vy,
+                        length=spec.length,
+                        width=spec.width,
+                        desired_speed=spec.desired_speed,
+                        driver_profile=spec.driver_profile,
+                    ),
+                    is_ego,
+                )
+            )
+        self._last_spawn_diagnostics = {"safe_spawn": 0.0, "rejections": 0.0}
+        return states
+
+    def _sample_safe_initial_states(
+        self, vehicle_specs: list[tuple[LaneFreeVehicleState, bool]]
+    ) -> list[tuple[LaneFreeVehicleState, bool]]:
+        """Sample a collision-free reset with an enlarged ego escape buffer."""
+
+        safety = self._traffic_safety_config()
+        road_length = float(self.config["road_length"])
+        road_width = float(self.config["road_width"])
+        max_attempts = max(1, int(safety.get("spawn_max_attempts", 1_000)))
+        placed: list[tuple[LaneFreeVehicleState, bool]] = []
+        rejected = 0
+
+        # The ego is placed first. Every later vehicle must respect its larger
+        # buffer, so reset does not start in an immediately unresponsive state.
+        ordered_specs = sorted(vehicle_specs, key=lambda item: not item[1])
+        for spec, is_ego in ordered_specs:
+            accepted = False
+            for _attempt in range(max_attempts):
+                candidate = LaneFreeVehicleState(
+                    x=float(self.np_random.uniform(0.0, road_length)),
+                    y=float(
+                        self.np_random.uniform(
+                            spec.width / 2.0, road_width - spec.width / 2.0
+                        )
+                    ),
+                    vx=spec.vx,
+                    vy=spec.vy,
+                    length=spec.length,
+                    width=spec.width,
+                    desired_speed=spec.desired_speed,
+                    driver_profile=spec.driver_profile,
+                )
+                if all(
+                    self._spawn_pair_is_safe(candidate, is_ego, other, other_is_ego)
+                    for other, other_is_ego in placed
+                ):
+                    placed.append((candidate, is_ego))
+                    accepted = True
+                    break
+                rejected += 1
+            if not accepted:
+                raise RuntimeError(
+                    "Unable to construct a collision-free initial traffic scene; "
+                    "reduce vehicles_count or relax traffic_safety spawn clearances."
+                )
+
+        # Keep the controlled vehicle at index zero: downstream action,
+        # reward, observation, and CBF code rely on that contract.
+        placed.sort(key=lambda item: not item[1])
+        self._last_spawn_diagnostics = {
+            "safe_spawn": 1.0,
+            "rejections": float(rejected),
+            "placed_vehicles": float(len(placed)),
+        }
+        return placed
+
+    def _spawn_pair_is_safe(
+        self,
+        first: LaneFreeVehicleState,
+        first_is_ego: bool,
+        second: LaneFreeVehicleState,
+        second_is_ego: bool,
+    ) -> bool:
+        """Check footprint and closing-speed clearance for one spawn pair."""
+
+        safety = self._traffic_safety_config()
+        road_length = float(self.config["road_length"])
+        forward_first = float((second.x - first.x) % road_length)
+        forward_second = float((first.x - second.x) % road_length)
+        if forward_first <= forward_second:
+            follower, leader = first, second
+            centre_distance = forward_first
+        else:
+            follower, leader = second, first
+            centre_distance = forward_second
+        longitudinal_clearance = centre_distance - 0.5 * (first.length + second.length)
+        lateral_clearance = abs(first.y - second.y) - 0.5 * (first.width + second.width)
+
+        ego_pair = bool(first_is_ego or second_is_ego)
+        required_lateral = float(
+            safety.get(
+                "spawn_ego_lateral_clearance" if ego_pair else "spawn_lateral_clearance",
+                0.75 if ego_pair else 0.35,
+            )
+        )
+        if lateral_clearance >= required_lateral:
+            return True
+
+        base_longitudinal = float(
+            safety.get(
+                "spawn_ego_longitudinal_clearance"
+                if ego_pair
+                else "spawn_longitudinal_clearance",
+                18.0 if ego_pair else 6.0,
+            )
+        )
+        closing_speed = max(float(follower.vx - leader.vx), 0.0)
+        required_longitudinal = base_longitudinal + float(
+            safety.get("spawn_time_headway", 0.75)
+        ) * closing_speed
+        return bool(longitudinal_clearance >= required_longitudinal)
 
     def _sample_mtm_profile(self) -> str:
         mtm_config = self.config.get("mtm", {})
@@ -443,6 +637,7 @@ class LaneFreeTrafficEnv(AbstractEnv):
                 accelerations[0, 1] = (
                     self._map_action(action_array[1], "lateral") + ego_boundary_force
                 )
+            accelerations = self._apply_traffic_safety_guard(accelerations, dt)
             accelerations = self._clip_accelerations(accelerations)
             self._last_accelerations = accelerations
             self._integrate(accelerations, dt)
@@ -917,6 +1112,201 @@ class LaneFreeTrafficEnv(AbstractEnv):
         right_clearance = max(float(road_width - vehicle.width / 2.0 - vehicle.position[1]), eps)
         return k_boundary * (1.0 / (left_clearance + eps) ** 2 - 1.0 / (right_clearance + eps) ** 2)
 
+    def _apply_traffic_safety_guard(
+        self, accelerations: np.ndarray, dt: float
+    ) -> np.ndarray:
+        """Keep social traffic from creating an unavoidable ego conflict.
+
+        The controlled ego acceleration is deliberately immutable here.  The
+        guard asks surrounding vehicles to brake or yield laterally whenever
+        their proposed motion would consume the ego's emergency-braking
+        envelope, and applies the same rear-end rule to traffic-traffic pairs.
+        This is a simulator traffic rule, not a hidden ego safety filter.
+        """
+
+        safety = self._traffic_safety_config()
+        guarded = np.asarray(accelerations, dtype=float).copy()
+        diagnostics = {
+            "enabled": float(bool(safety.get("dynamics_guard", True))),
+            "constraints": 0.0,
+            "traffic_brakes": 0.0,
+            "ego_leader_yields": 0.0,
+            "lateral_yields": 0.0,
+        }
+        vehicles = self.road.vehicles
+        count = len(vehicles)
+        if not bool(safety.get("dynamics_guard", True)) or count < 2:
+            self._last_traffic_safety_diagnostics = diagnostics
+            return guarded
+
+        road_length = float(self.config["road_length"])
+        bounds = self.config["bounds"]
+        ax_min = float(bounds["ax_min"])
+        ax_max = float(bounds["ax_max"])
+        max_braking = max(abs(ax_min), 1e-6)
+        horizon = max(float(safety.get("guard_horizon_s", 1.5)), float(dt), 1e-3)
+        guard_range = max(float(safety.get("guard_range_m", 120.0)), 0.0)
+        min_longitudinal = max(
+            float(safety.get("guard_longitudinal_clearance", 1.5)), 0.0
+        )
+        min_lateral = max(float(safety.get("guard_lateral_clearance", 0.25)), 0.0)
+        time_headway = max(float(safety.get("guard_time_headway", 0.25)), 0.0)
+        lateral_conflict_range = max(
+            float(safety.get("guard_lateral_conflict_range", 12.0)), 0.0
+        )
+        ego_controlled = bool(self.config.get("ego_controlled", True))
+        controlled = np.asarray(
+            [bool(vehicle.is_ego and ego_controlled) for vehicle in vehicles],
+            dtype=bool,
+        )
+
+        x = np.fromiter(
+            (float(vehicle.position[0]) for vehicle in vehicles),
+            dtype=float,
+            count=count,
+        )
+        y = np.fromiter(
+            (float(vehicle.position[1]) for vehicle in vehicles),
+            dtype=float,
+            count=count,
+        )
+        vx = np.fromiter(
+            (float(vehicle.vx) for vehicle in vehicles), dtype=float, count=count
+        )
+        vy = np.fromiter(
+            (float(vehicle.vy) for vehicle in vehicles), dtype=float, count=count
+        )
+        lengths = np.fromiter(
+            (float(vehicle.length) for vehicle in vehicles),
+            dtype=float,
+            count=count,
+        )
+        widths = np.fromiter(
+            (float(vehicle.width) for vehicle in vehicles),
+            dtype=float,
+            count=count,
+        )
+
+        # Matrix rows are followers and columns are leaders.  Keeping this
+        # calculation vectorized is essential: the 55-vehicle experiment has
+        # 3,000 ordered pairs per physics frame.
+        forward_distance = (x[None, :] - x[:, None]) % road_length
+        longitudinal_gap = forward_distance - 0.5 * (
+            lengths[:, None] + lengths[None, :]
+        )
+        lateral_offset = y[None, :] - y[:, None]
+        lateral_gap_now = np.abs(lateral_offset) - 0.5 * (
+            widths[:, None] + widths[None, :]
+        )
+        predicted_lateral_offset = (
+            lateral_offset
+            + horizon * (vy[None, :] - vy[:, None])
+            + 0.5
+            * horizon
+            * horizon
+            * (guarded[None, :, 1] - guarded[:, None, 1])
+        )
+        lateral_gap_predicted = np.abs(predicted_lateral_offset) - 0.5 * (
+            widths[:, None] + widths[None, :]
+        )
+        valid_pair = (
+            (forward_distance > 1e-9)
+            & (forward_distance <= guard_range)
+            & ~np.eye(count, dtype=bool)
+        )
+        lateral_conflict = np.minimum(
+            lateral_gap_now, lateral_gap_predicted
+        ) < min_lateral
+        stopping_distance_delta = np.maximum(
+            vx[:, None] ** 2 - vx[None, :] ** 2, 0.0
+        ) / (2.0 * max_braking)
+        required_gap = (
+            min_longitudinal
+            + time_headway * np.maximum(vx[:, None], 0.0)
+            + stopping_distance_delta
+        )
+        needs_guard = valid_pair & lateral_conflict & (
+            longitudinal_gap < required_gap
+        )
+        diagnostics["constraints"] = float(np.count_nonzero(needs_guard))
+
+        # Social followers brake for either social traffic or the ego ahead.
+        brake_mask = (~controlled) & np.any(needs_guard, axis=1)
+        changing_brake = brake_mask & (guarded[:, 0] > ax_min + 1e-9)
+        guarded[changing_brake, 0] = ax_min
+        diagnostics["traffic_brakes"] = float(np.count_nonzero(changing_brake))
+
+        # The ego remains fully controlled. If it is the follower, require a
+        # social leader to accelerate/yield instead of rewriting the action.
+        ego_indices = np.flatnonzero(controlled)
+        if ego_indices.size:
+            ego_index = int(ego_indices[0])
+            ego_leader_mask = needs_guard[ego_index] & ~controlled
+            leader_indices = np.flatnonzero(ego_leader_mask)
+            if leader_indices.size:
+                needed_leader_ax = ax_min + 2.0 * (
+                    required_gap[ego_index, leader_indices]
+                    - longitudinal_gap[ego_index, leader_indices]
+                    - horizon
+                    * (vx[leader_indices] - vx[ego_index])
+                ) / (horizon * horizon)
+                leader_targets = np.minimum(needed_leader_ax, ax_max)
+                previous = guarded[leader_indices, 0].copy()
+                guarded[leader_indices, 0] = np.maximum(previous, leader_targets)
+                diagnostics["ego_leader_yields"] = float(
+                    np.count_nonzero(
+                        guarded[leader_indices, 0] > previous + 1e-9
+                    )
+                )
+
+        # Near side-by-side conflicts are resolved by asking only social
+        # vehicles to move away from the pair. Contributions from all active
+        # pairs are summed before one bounded lateral command is applied.
+        lateral_yield_pairs = needs_guard & (
+            longitudinal_gap
+            <= np.maximum(required_gap, lateral_conflict_range)
+        )
+        participant = np.any(lateral_yield_pairs, axis=1) | np.any(
+            lateral_yield_pairs, axis=0
+        )
+        offset_sign = np.sign(lateral_offset)
+        lateral_score = (
+            np.sum(-offset_sign * lateral_yield_pairs, axis=1)
+            + np.sum(offset_sign * lateral_yield_pairs, axis=0)
+        )
+        lateral_direction = np.sign(lateral_score)
+        undecided = participant & (np.abs(lateral_direction) < 1e-9)
+        upper_room = float(self.config["road_width"]) - 0.5 * widths - y
+        lower_room = y - 0.5 * widths
+        lateral_direction[undecided] = np.where(
+            upper_room[undecided] >= lower_room[undecided], 1.0, -1.0
+        )
+        yield_magnitude = min(
+            max(float(safety.get("guard_lateral_yield_acceleration", 3.0)), 0.0),
+            max(abs(float(bounds["ay_min"])), abs(float(bounds["ay_max"]))),
+        )
+        lateral_mask = participant & ~controlled & (
+            np.abs(lateral_direction) > 1e-9
+        )
+        previous_lateral = guarded[:, 1].copy()
+        positive = lateral_mask & (lateral_direction > 0.0)
+        negative = lateral_mask & (lateral_direction < 0.0)
+        guarded[positive, 1] = np.maximum(
+            guarded[positive, 1], yield_magnitude
+        )
+        guarded[negative, 1] = np.minimum(
+            guarded[negative, 1], -yield_magnitude
+        )
+        diagnostics["lateral_yields"] = float(
+            np.count_nonzero(
+                lateral_mask
+                & (np.abs(guarded[:, 1] - previous_lateral) > 1e-9)
+            )
+        )
+
+        self._last_traffic_safety_diagnostics = diagnostics
+        return guarded
+
     def _clip_accelerations(self, accelerations: np.ndarray) -> np.ndarray:
         bounds = self.config["bounds"]
         accelerations[:, 0] = np.clip(accelerations[:, 0], float(bounds["ax_min"]), float(bounds["ax_max"]))
@@ -1008,7 +1398,13 @@ class LaneFreeTrafficEnv(AbstractEnv):
         ego = self.vehicle
         vehicles = self.road.vehicles
         neighbor_count = int(self.config["neighbors_count"])
-        rows = np.zeros((1 + neighbor_count, 7), dtype=np.float32)
+        include_vehicle_dimensions = bool(
+            self.config.get("observation_include_vehicle_dimensions", True)
+        )
+        rows = np.zeros(
+            (1 + neighbor_count, 7 if include_vehicle_dimensions else 5),
+            dtype=np.float32,
+        )
         if not vehicles:
             return rows.reshape(-1)
 
@@ -1017,8 +1413,13 @@ class LaneFreeTrafficEnv(AbstractEnv):
         y = np.fromiter((vehicle.position[1] for vehicle in vehicles), dtype=float, count=count)
         vx = np.fromiter((vehicle.vx for vehicle in vehicles), dtype=float, count=count)
         vy = np.fromiter((vehicle.vy for vehicle in vehicles), dtype=float, count=count)
-        lengths = np.fromiter((vehicle.length for vehicle in vehicles), dtype=float, count=count)
-        widths = np.fromiter((vehicle.width for vehicle in vehicles), dtype=float, count=count)
+        if include_vehicle_dimensions:
+            lengths = np.fromiter(
+                (vehicle.length for vehicle in vehicles), dtype=float, count=count
+            )
+            widths = np.fromiter(
+                (vehicle.width for vehicle in vehicles), dtype=float, count=count
+            )
         desired_speeds = np.fromiter((vehicle.desired_speed for vehicle in vehicles), dtype=float, count=count)
         ego_index = next((index for index, vehicle in enumerate(vehicles) if vehicle is ego), 0)
 
@@ -1043,31 +1444,35 @@ class LaneFreeTrafficEnv(AbstractEnv):
         rows[:selected_count, 1] = np.clip(relative_y[selected] / road_width, -1.0, 1.0)
         rows[:selected_count, 2] = vx[selected] / observation_vmax
         rows[:selected_count, 3] = vy[selected] / observation_vymax
-        rows[:selected_count, 4] = lengths[selected] / 5.15
-        rows[:selected_count, 5] = widths[selected] / 1.84
-        rows[:selected_count, 6] = desired_speeds[selected] / observation_vmax
+        if include_vehicle_dimensions:
+            rows[:selected_count, 4] = lengths[selected] / 5.15
+            rows[:selected_count, 5] = widths[selected] / 1.84
+            rows[:selected_count, 6] = desired_speeds[selected] / observation_vmax
+        else:
+            rows[:selected_count, 4] = desired_speeds[selected] / observation_vmax
         rows[0, :2] = 0.0
         return rows.reshape(-1)
 
     def _observation_row(self, vehicle: LaneFreeVehicle, ego: LaneFreeVehicle) -> np.ndarray:
+        include_vehicle_dimensions = bool(
+            self.config.get("observation_include_vehicle_dimensions", True)
+        )
         road_width = float(self.config["road_width"])
         sensing_range = float(self.config["sensing_range"])
         observation_vmax = max(float(self.config.get("observation_vmax", 24.0)), 1e-6)
         observation_vymax = max(float(self.config.get("observation_vymax", 0.3 * observation_vmax)), 1e-6)
         signed_dx = 0.0 if vehicle is ego else self._signed_distance(ego.position[0], vehicle.position[0])
         dy = 0.0 if vehicle is ego else float(vehicle.position[1] - ego.position[1])
-        return np.array(
-            [
-                np.clip(signed_dx / sensing_range, -1.0, 1.0),
-                np.clip(dy / road_width, -1.0, 1.0),
-                vehicle.vx / observation_vmax,
-                vehicle.vy / observation_vymax,
-                vehicle.length / 5.15,
-                vehicle.width / 1.84,
-                vehicle.desired_speed / observation_vmax,
-            ],
-            dtype=np.float32,
-        )
+        values = [
+            np.clip(signed_dx / sensing_range, -1.0, 1.0),
+            np.clip(dy / road_width, -1.0, 1.0),
+            vehicle.vx / observation_vmax,
+            vehicle.vy / observation_vymax,
+        ]
+        if include_vehicle_dimensions:
+            values.extend([vehicle.length / 5.15, vehicle.width / 1.84])
+        values.append(vehicle.desired_speed / observation_vmax)
+        return np.asarray(values, dtype=np.float32)
 
     def _reward(self, action: np.ndarray) -> float:
         ego = self.vehicle
@@ -1102,6 +1507,26 @@ class LaneFreeTrafficEnv(AbstractEnv):
             "flow_count": int(self._flow_count),
             "flow_per_hour": float(self._flow_count / elapsed_hours),
         }
+        spawn = self._last_spawn_diagnostics or {}
+        traffic_safety = self._last_traffic_safety_diagnostics or {}
+        info.update(
+            {
+                "traffic_safe_spawn": bool(spawn.get("safe_spawn", 0.0)),
+                "traffic_spawn_rejections": int(spawn.get("rejections", 0.0)),
+                "traffic_guard_constraints": int(
+                    traffic_safety.get("constraints", 0.0)
+                ),
+                "traffic_guard_brakes": int(
+                    traffic_safety.get("traffic_brakes", 0.0)
+                ),
+                "traffic_guard_ego_leader_yields": int(
+                    traffic_safety.get("ego_leader_yields", 0.0)
+                ),
+                "traffic_guard_lateral_yields": int(
+                    traffic_safety.get("lateral_yields", 0.0)
+                ),
+            }
+        )
         if str(self.config.get("traffic_model", "force")).strip().lower() == "mtm":
             diagnostics = self._last_mtm_diagnostics or {}
             info.update(
