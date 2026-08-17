@@ -643,8 +643,10 @@ def _tensorboard_log_dir(
 
     Short projects retain the intuitive ``<model>/tensorboard`` location.
     The current OneDrive workspace is too deep for TensorBoard's event names,
-    so it uses the enclosing workspace's short ``artifacts/tb/ppo`` tree
-    instead of the non-persistent Windows TEMP directory.
+    so it first uses the enclosing workspace's ``artifacts/tb/ppo`` tree.
+    If that path is still too long, use a short persistent per-user directory
+    rather than the non-persistent Windows TEMP directory.  A user can set
+    ``HIGHWAY_RL_TENSORBOARD_ROOT`` to provide an explicit persistent root.
     """
 
     preferred = run_dir / "tensorboard"
@@ -654,24 +656,47 @@ def _tensorboard_log_dir(
 
     project_root = Path(namespace["PROJECT_ROOT"]).resolve()
     compact_variant = TENSORBOARD_VARIANT_IDS[variant]
-    durable = (
-        project_root.parent
-        / "artifacts"
-        / "tb"
-        / "ppo"
-        / (
-            f"{str(tensorboard_run_label).strip()}_{compact_variant}_{int(training_seed)}"
-            if tensorboard_run_label and str(tensorboard_run_label).strip()
-            else f"{compact_variant}_{int(training_seed)}"
-        )
+    run_label = (
+        f"{str(tensorboard_run_label).strip()}_{compact_variant}_{int(training_seed)}"
+        if tensorboard_run_label and str(tensorboard_run_label).strip()
+        else f"{compact_variant}_{int(training_seed)}"
     )
-    if not _tensorboard_path_is_safe(durable):
-        raise RuntimeError(
-            "No Windows-safe persistent TensorBoard path is available. "
-            f"Tried {durable}; choose a shorter --project-root or --output-dir."
-        )
-    durable.mkdir(parents=True, exist_ok=True)
-    return durable
+    durable_candidates = [project_root.parent / "artifacts" / "tb" / "ppo" / run_label]
+    project_id = hashlib.sha1(str(project_root).encode("utf-8")).hexdigest()[:10]
+    fallback_run_id = "{}_{}_{}".format(
+        compact_variant,
+        int(training_seed),
+        hashlib.sha1(run_label.encode("utf-8")).hexdigest()[:10],
+    )
+    fallback_roots: list[Path] = []
+    configured_root = os.environ.get("HIGHWAY_RL_TENSORBOARD_ROOT")
+    if configured_root:
+        fallback_roots.append(Path(configured_root))
+    local_app_data = os.environ.get("LOCALAPPDATA")
+    if local_app_data:
+        fallback_roots.append(Path(local_app_data) / "highway_rl_tb")
+    fallback_roots.append(Path.home() / ".highway_rl_tb")
+    for root in fallback_roots:
+        durable = root / project_id / fallback_run_id
+        if durable not in durable_candidates:
+            durable_candidates.append(durable)
+    creation_errors: list[str] = []
+    for durable in durable_candidates:
+        if not _tensorboard_path_is_safe(durable):
+            continue
+        try:
+            durable.mkdir(parents=True, exist_ok=True)
+        except OSError as exc:
+            creation_errors.append(f"{durable} ({exc})")
+        else:
+            return durable
+    tried = "; ".join(str(path) for path in durable_candidates)
+    if creation_errors:
+        tried = f"{tried}; mkdir errors: {'; '.join(creation_errors)}"
+    raise RuntimeError(
+        "No Windows-safe persistent TensorBoard path is available. "
+        f"Tried {tried}; set HIGHWAY_RL_TENSORBOARD_ROOT to a short writable path."
+    )
 
 
 def _existing_tensorboard_log_dir(run_dir: Path) -> Path | None:
@@ -2515,11 +2540,11 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument(
-                "--expose-target-y",
+        "--expose-target-y",
         action="store_true",
         help=(
             "Expose normalized reward-derived target_y in the unused second ego "
-            "observation slot without changing the 42-D actor input shape."
+            "observation slot without changing the base actor input shape."
         ),
     )
     parser.add_argument(

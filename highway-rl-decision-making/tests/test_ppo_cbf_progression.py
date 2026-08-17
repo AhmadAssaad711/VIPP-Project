@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import copy
+import hashlib
 import json
 import sys
 from pathlib import Path
@@ -374,6 +375,34 @@ def test_tensorboard_run_label_isolated_for_new_budget(tmp_path, monkeypatch):
         / "nominal_500k_nom_307"
     )
     assert log_dir.is_dir()
+
+
+def test_very_long_windows_tensorboard_path_falls_back_to_local_app_data(
+    tmp_path, monkeypatch
+):
+    project_root = tmp_path / ("p" * 180) / "project"
+    project_root.mkdir(parents=True)
+    long_run_dir = project_root / "artifacts" / ("x" * 120) / "seed_307"
+    local_app_data = tmp_path / "local_app_data"
+    run_label = "run_" + "x" * 500
+    monkeypatch.setattr(progression.os, "name", "nt")
+    monkeypatch.setenv("LOCALAPPDATA", str(local_app_data))
+
+    log_dir = progression._tensorboard_log_dir(
+        {"PROJECT_ROOT": project_root},
+        long_run_dir,
+        "ppo_nominal",
+        307,
+        tensorboard_run_label=run_label,
+    )
+
+    project_id = hashlib.sha1(
+        str(project_root.resolve()).encode("utf-8")
+    ).hexdigest()[:10]
+    run_id = "nom_307_" + hashlib.sha1(run_label.encode("utf-8")).hexdigest()[:10]
+    assert log_dir == local_app_data / "highway_rl_tb" / project_id / run_id
+    assert log_dir.is_dir()
+    assert progression._tensorboard_path_is_safe(log_dir)
 
 
 def test_legacy_tensorboard_events_are_copied_to_artifacts(tmp_path, monkeypatch):
