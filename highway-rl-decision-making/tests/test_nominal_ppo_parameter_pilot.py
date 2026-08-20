@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import pickle
 import sys
+from argparse import Namespace
 from pathlib import Path
 
 import gymnasium as gym
@@ -57,6 +58,34 @@ def test_old_2048_rollout_is_rejected_for_exact_50k():
             target_timesteps=50_000,
             checkpoint_interval=10_000,
         )
+
+
+def test_parallel_config_keeps_the_same_global_ppo_rollout_size():
+    args = Namespace(n_envs=8, global_rollout_size=1_000)
+    config = pilot.effective_ppo_config("Q1_stable", args)
+
+    assert config["n_steps"] == 125
+    assert pilot.validate_rollout_alignment(
+        config,
+        n_envs=8,
+        target_timesteps=50_000,
+        checkpoint_interval=10_000,
+    ) == 1_000
+
+
+def test_nominal_pilot_evaluates_only_the_final_checkpoint_by_default():
+    assert pilot.evaluation_steps(
+        50_000, 10_000, evaluate_checkpoints=False
+    ) == [50_000]
+    assert pilot.evaluation_steps(
+        50_000, 10_000, evaluate_checkpoints=True
+    ) == [10_000, 20_000, 30_000, 40_000, 50_000]
+    assert not pilot.checkpoint_evaluation_enabled(
+        Namespace(evaluate_checkpoints=False)
+    )
+    # Other runners which reuse the shared PPO machinery retain their legacy
+    # per-checkpoint behavior until they explicitly opt into final-only mode.
+    assert pilot.checkpoint_evaluation_enabled(Namespace())
 
 
 class _FakeLogger:
@@ -246,6 +275,18 @@ def test_final_three_uses_ratio_of_sums_and_discards_early_checkpoint():
     assert result["actor_raw_action_clip_rate"] == pytest.approx(0.2)
     assert result["actor_raw_action_abs_max"] == pytest.approx(3.0)
     assert result["completed_rollouts"] == 40
+
+
+def test_final_window_supports_a_single_final_only_evaluation():
+    checkpoint = pd.DataFrame([_checkpoint_row(50_000, 500.0, 2, 4.0)])
+    result = pilot.final_three_seed_averages(checkpoint).iloc[0]
+
+    assert result["checkpoint_count"] == 1
+    assert result["checkpoint_steps"] == "50000"
+    assert result["total_distance_m"] == pytest.approx(500.0)
+    assert result["distinct_ego_collision_events"] == pytest.approx(2.0)
+    assert result["distance_per_collision_m"] == pytest.approx(250.0)
+    assert result["return_per_timestep"] == pytest.approx(4.0)
 
 
 def test_ppo_checkpoint_validator_requires_no_replay_payload(tmp_path):
