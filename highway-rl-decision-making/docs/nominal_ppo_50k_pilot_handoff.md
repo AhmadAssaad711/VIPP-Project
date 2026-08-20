@@ -14,10 +14,13 @@ fixed-timestep outputs; the legacy in-notebook PPO implementation is removed.
 - Training seed: `307` for every configuration. The environment is seeded once
   when the run starts; normal episode resets are not reseeded.
 - Budget: exactly 50,000 timesteps per configuration.
-- PPO rollout: one environment, 1,000 steps, batch size 100. This gives exact
-  post-update boundaries at 10k, 20k, 30k, 40k, and 50k.
+- PPO rollout: 1,000 global transitions, batch size 100. The CUDA pilot uses
+  eight workers with 125 steps each; it still has exact post-update boundaries
+  at 10k, 20k, 30k, 40k, and 50k.
 - Evaluation: deterministic, fixed seeds `900000` through `900009`, 800
-  timesteps per seed, at every 10k checkpoint.
+  timesteps per seed, once after the final 50k post-update policy. Lightweight
+  model snapshots remain at every 10k boundary. Use `--evaluate-checkpoints`
+  only when a full learning curve is specifically needed.
 - Collision protocol: `terminate_on_collision=True`, reset immediately, and
   continue until the fixed training/evaluation timestep budget is consumed.
 - Collisions are distinct events; collision-active timesteps are separate.
@@ -69,12 +72,12 @@ hashed source/configuration files between interruption and strict resume.
 
 The primary outputs are `evaluation_scenarios.csv`,
 `checkpoint_diagnostics.csv`, `training_episodes.csv`, TensorBoard event files,
-`final_three_seed_averages.csv`, `final_three_across_seeds.csv`, and
-`ranking_final_three.csv`.
+`final_evaluation_seed_averages.csv`, `final_evaluation_across_seeds.csv`, and
+`ranking_final_evaluation.csv`.
 
-Ranking uses the average behavior over 30k, 40k, and 50k: distance per distinct
-collision, return/timestep, speed error, episode length, and deterministic actor
-action saturation. PPO value loss, value-target error/magnitude, KL, entropy,
-clip fraction, policy standard deviation, and raw-action clipping are reported
-as diagnostics. With one screening seed, across-seed variance is intentionally
+Ranking uses the final 50k behavior: distance per distinct collision,
+return/timestep, speed error, episode length, and deterministic actor action
+saturation. PPO value loss, value-target error/magnitude, KL, entropy, clip
+fraction, policy standard deviation, and raw-action clipping are reported as
+diagnostics. With one screening seed, across-seed variance is intentionally
 undefined; finalists should later be confirmed with independent seeds.

@@ -5,8 +5,9 @@ reward, traffic setup, and tuned CBF snapshot fixed, while training without a
 CBF.  Every evaluation uses the corrected fixed-timestep collision protocol.
 
 The default screen trains Q0--Q3 with one common seed for exactly 50,000
-timesteps.  With one environment and 1,000-step rollouts, each 10,000-step
-evaluation/checkpoint is a coherent post-update PPO boundary.
+timesteps.  It retains lightweight 10,000-step model snapshots but evaluates
+only the final post-update policy by default; per-checkpoint evaluation is an
+explicit opt-in because it serializes a large simulator workload into training.
 """
 
 from __future__ import annotations
@@ -18,6 +19,7 @@ import json
 import os
 import pickle
 import shutil
+import tempfile
 import time
 from pathlib import Path
 from typing import Any, Optional
@@ -27,7 +29,7 @@ import pandas as pd
 import torch as th
 from stable_baselines3 import PPO
 from stable_baselines3.common.callbacks import BaseCallback, CallbackList
-from stable_baselines3.common.vec_env import VecNormalize
+from stable_baselines3.common.vec_env import SubprocVecEnv, VecNormalize
 
 import run_cbf_filter_ablation as pipeline
 import run_nominal_ddpg_parameter_pilot as pilot_common
@@ -37,9 +39,11 @@ from laneless_script_config import (
     env_config_from_args,
 )
 from train_safety_potential_variants import MTM_CONGESTED_UNCERTAIN_UPDATES, deep_update
+from ppo_observation_variants import install_previous_action_observation
+from ppo_parallel_worker import make_parallel_subproc_training_env
 
 
-PPO_PILOT_SCHEMA_VERSION = 1
+PPO_PILOT_SCHEMA_VERSION = 3
 PPO_CHECKPOINT_SCHEMA_VERSION = 1
 DEFAULT_TRAINING_SEED = 307
 DEFAULT_EVAL_SEED_START = 900_000
@@ -47,6 +51,63 @@ DEFAULT_EVAL_SCENARIOS = 10
 DEFAULT_TIMESTEPS = 50_000
 DEFAULT_CHECKPOINT_INTERVAL = 10_000
 DEFAULT_EVAL_TIMESTEPS = 800
+DEFAULT_GLOBAL_ROLLOUT_SIZE = 1_000
+
+
+def validate_training_device(device: str) -> str:
+    """Reject a silent CPU fallback when a CUDA run was requested."""
+
+    requested = str(device).strip()
+    if requested.lower().startswith("cuda") and not th.cuda.is_available():
+        raise RuntimeError(
+            f"CUDA was requested ({requested!r}) but torch.cuda.is_available() is False"
+        )
+    return requested
+
+
+def configure_parallel_runtime() -> None:
+    """Avoid CPU-thread oversubscription beside SubprocVecEnv workers."""
+
+    th.set_num_threads(1)
+    try:
+        th.set_num_interop_threads(1)
+    except RuntimeError:
+        # PyTorch permits this only before its first parallel operation.
+        pass
+
+
+def default_tensorboard_root() -> Path:
+    """Keep TensorBoard event files off long OneDrive workspace paths."""
+
+    configured = os.environ.get("NOMINAL_PPO_PILOT_TENSORBOARD_ROOT")
+    if configured:
+        return Path(configured)
+    local_app_data = os.environ.get("LOCALAPPDATA")
+    if local_app_data:
+        return Path(local_app_data) / "agv_ppo_tensorboard"
+    return Path(tempfile.gettempdir()) / "agv_ppo_tensorboard"
+
+
+def effective_ppo_config(pilot_config: str, args: argparse.Namespace) -> dict[str, Any]:
+    """Keep each PPO rollout at a fixed global transition count.
+
+    Eight workers with ``n_steps=125`` still collect 1,000 transitions per
+    PPO update, matching the original one-worker ``n_steps=1000`` protocol.
+    """
+
+    config = copy.deepcopy(PPO_CONFIGS[pilot_config])
+    n_envs = max(1, int(args.n_envs))
+    global_rollout_size = int(
+        getattr(args, "global_rollout_size", DEFAULT_GLOBAL_ROLLOUT_SIZE)
+    )
+    if global_rollout_size <= 0 or global_rollout_size % n_envs != 0:
+        raise ValueError(
+            "global_rollout_size must be positive and divisible by n_envs: "
+            f"{global_rollout_size=} {n_envs=}"
+        )
+    config["n_steps"] = global_rollout_size // n_envs
+    return config
+
 
 PPO_CHECKPOINT_PAYLOADS = {
     "model": "model.zip",
@@ -151,8 +212,6 @@ def validate_rollout_alignment(
     n_steps = int(config_values["n_steps"])
     batch_size = int(config_values["batch_size"])
     rollout_size = n_steps * int(n_envs)
-    if int(n_envs) != 1:
-        raise ValueError("The strict PPO pilot currently requires exactly one environment")
     if rollout_size <= 0 or batch_size <= 1:
         raise ValueError("PPO rollout and batch sizes must be positive, with batch_size > 1")
     if batch_size > rollout_size or rollout_size % batch_size != 0:
@@ -174,6 +233,25 @@ def validate_rollout_alignment(
 
 def expected_checkpoint_steps(target_timesteps: int, checkpoint_interval: int) -> list[int]:
     return pilot_common.expected_checkpoint_steps(target_timesteps, checkpoint_interval)
+
+
+def evaluation_steps(
+    target_timesteps: int,
+    checkpoint_interval: int,
+    *,
+    evaluate_checkpoints: bool,
+) -> list[int]:
+    """Return the model timesteps that receive the full 10-seed evaluation."""
+
+    if bool(evaluate_checkpoints):
+        return expected_checkpoint_steps(target_timesteps, checkpoint_interval)
+    return [int(target_timesteps)]
+
+
+def checkpoint_evaluation_enabled(args: argparse.Namespace) -> bool:
+    """Keep legacy callers opt-in while the nominal pilot defaults final-only."""
+
+    return bool(getattr(args, "evaluate_checkpoints", True))
 
 
 def sb3_resume_learn_target_timesteps(
@@ -423,7 +501,7 @@ def aggregate_checkpoint_scenarios(rows: list[dict[str, Any]]) -> dict[str, floa
 
 
 class PPOEvaluationCallback(BaseCallback):
-    """Evaluate fixed scenarios only after the checkpoint rollout was updated."""
+    """Evaluate fixed scenarios only after the requested post-update rollout."""
 
     def __init__(
         self,
@@ -714,8 +792,6 @@ class PPOStrictCheckpointCallback(BaseCallback):
         step = int(self.model.num_timesteps)
         if step % self.rollout_size != 0 or step % self.checkpoint_interval != 0:
             raise RuntimeError(f"Refusing to save misaligned PPO checkpoint at {step}")
-        if step not in self.evaluation_callback.evaluated_steps:
-            raise RuntimeError("PPO checkpoint attempted before matching evaluation completed")
 
         root = self.run_dir / "ckpt"
         root.mkdir(parents=True, exist_ok=True)
@@ -833,6 +909,84 @@ class PPOStrictCheckpointCallback(BaseCallback):
         print(f"[ppo-pilot] strict checkpoint step={step:,}: {final_dir}", flush=True)
 
 
+class PPOModelSnapshotCallback(BaseCallback):
+    """Post-update model snapshots for parallel SubprocVecEnv training.
+
+    A SubprocVecEnv cannot be serialized into the single-environment strict
+    resume bundle.  We still retain a verified model snapshot at every
+    post-update checkpoint boundary; parallel pilots are intentionally
+    fresh/non-resumable.
+    """
+
+    def __init__(
+        self,
+        *,
+        run_dir: Path,
+        checkpoint_interval: int,
+        rollout_size: int,
+        training_config_hash: str,
+    ) -> None:
+        super().__init__(verbose=0)
+        self.run_dir = Path(run_dir)
+        self.checkpoint_interval = int(checkpoint_interval)
+        self.rollout_size = int(rollout_size)
+        self.training_config_hash = str(training_config_hash)
+        self.next_checkpoint_step = self.checkpoint_interval
+        self.pending = False
+        self.last_saved_step = -1
+
+    def _on_training_start(self) -> None:
+        current = int(self.model.num_timesteps)
+        self.next_checkpoint_step = (
+            (current // self.checkpoint_interval) + 1
+        ) * self.checkpoint_interval
+
+    def _on_step(self) -> bool:
+        if int(self.num_timesteps) >= int(self.next_checkpoint_step):
+            self.pending = True
+        return True
+
+    def _on_rollout_start(self) -> None:
+        if self.pending and int(self.model.num_timesteps) > self.last_saved_step:
+            self._save_snapshot()
+
+    def _on_training_end(self) -> None:
+        if int(self.model.num_timesteps) > self.last_saved_step:
+            self._save_snapshot()
+
+    def _save_snapshot(self) -> None:
+        step = int(self.model.num_timesteps)
+        if step % self.rollout_size != 0 or step % self.checkpoint_interval != 0:
+            raise RuntimeError(f"Refusing to save an unaligned PPO snapshot at {step}")
+        snapshot_dir = self.run_dir / "model_checkpoints"
+        snapshot_dir.mkdir(parents=True, exist_ok=True)
+        snapshot = snapshot_dir / f"{step:09d}.zip"
+        if snapshot.exists():
+            raise RuntimeError(f"Refusing to overwrite PPO model snapshot: {snapshot}")
+        self.model.save(str(snapshot))
+        (snapshot_dir / f"{step:09d}.json").write_text(
+            json.dumps(
+                {
+                    "schema_version": PPO_PILOT_SCHEMA_VERSION,
+                    "phase": "post_update_boundary",
+                    "timestep": step,
+                    "model_sha256": pipeline.file_sha256(snapshot),
+                    "training_config_hash": self.training_config_hash,
+                    "resume_supported": False,
+                    "reason": "parallel_subproc_environment_state_not_serialized",
+                },
+                indent=2,
+            ),
+            encoding="utf-8",
+        )
+        self.last_saved_step = step
+        self.next_checkpoint_step = (
+            (step // self.checkpoint_interval) + 1
+        ) * self.checkpoint_interval
+        self.pending = False
+        print(f"[ppo-pilot] parallel model snapshot step={step:,}: {snapshot}", flush=True)
+
+
 def build_ppo_model(
     *,
     train_env: Any,
@@ -841,7 +995,7 @@ def build_ppo_model(
     device: str,
     tensorboard_log: Path,
 ) -> PPO:
-    return PPO(
+    model = PPO(
         "MlpPolicy",
         train_env,
         learning_rate=float(config_values["learning_rate"]),
@@ -868,6 +1022,11 @@ def build_ppo_model(
         seed=int(training_seed),
         device=device,
     )
+    if str(device).lower().startswith("cuda") and model.device.type != "cuda":
+        raise RuntimeError(
+            f"PPO silently selected {model.device!s} although CUDA was requested"
+        )
+    return model
 
 
 def validate_normalized_action_space(model_or_env: Any) -> None:
@@ -911,13 +1070,23 @@ def ppo_config_payload(
         "schema_version": PPO_PILOT_SCHEMA_VERSION,
         "study": "nominal_ppo_50k_parameter_pilot",
         "pilot_config": pilot_config,
+        "observation_variant": (
+            "target_y_plus_previous_action"
+            if bool(getattr(args, "observation_at1", False))
+            else "target_y_only"
+        ),
         "training_seed": int(training_seed),
         "target_timesteps": int(target_timesteps),
         "parameters": copy.deepcopy(config_values),
         "fixed_training": {
             "algorithm": "stable_baselines3.PPO",
             "filtered_training": False,
-            "n_envs": 1,
+            "n_envs": int(args.n_envs),
+            "vectorized_backend": (
+                "SubprocVecEnv"
+                if int(args.n_envs) > 1 and bool(getattr(args, "use_subproc", False))
+                else "DummyVecEnv"
+            ),
             "rollout_size": int(rollout_size),
             "policy_net_arch": {"pi": [256, 128], "vf": [256, 128]},
             "activation": "torch.nn.Tanh",
@@ -928,12 +1097,22 @@ def ppo_config_payload(
             "terminate_on_collision": True,
             "episode_reset_reseed": False,
             "one_continuous_learn_call": True,
+            "strict_resume_supported": bool(int(args.n_envs) == 1),
         },
         "evaluation": {
             "mode": "raw",
             "scenario_seeds": [int(seed) for seed in args.eval_seeds],
             "timestep_budget": int(args.eval_timesteps),
-            "checkpoint_interval": int(args.checkpoint_interval),
+            "cadence": (
+                "every_checkpoint"
+                if checkpoint_evaluation_enabled(args)
+                else "final_only"
+            ),
+            "model_timesteps": evaluation_steps(
+                target_timesteps,
+                int(args.checkpoint_interval),
+                evaluate_checkpoints=checkpoint_evaluation_enabled(args),
+            ),
             "checkpoint_phase": "post_update_boundary",
             "deterministic": True,
             "terminate_on_collision": True,
@@ -946,6 +1125,10 @@ def ppo_config_payload(
                 "finite_companion": "distance_per_collision_exposure_bound_m",
             },
             "scenario_weighting": "aggregate within training seed before across-seed statistics",
+        },
+        "model_snapshots": {
+            "checkpoint_interval": int(args.checkpoint_interval),
+            "post_update_boundary": True,
         },
         "env_config": copy.deepcopy(env_config),
         "reward_config": copy.deepcopy(reward_config),
@@ -973,13 +1156,15 @@ def preflight_runs(
     reward_config: dict[str, float],
     target_timesteps: int,
 ) -> None:
+    if int(args.n_envs) > 1 and bool(args.resume):
+        raise ValueError("Parallel PPO pilots do not support strict resume; start a fresh output directory")
     if not args.resume and output_dir.exists() and any(output_dir.iterdir()):
         raise RuntimeError(f"Refusing to mix a fresh PPO pilot with existing artifacts: {output_dir}")
     for training_seed, pilot_config in run_specs:
-        config_values = PPO_CONFIGS[pilot_config]
+        config_values = effective_ppo_config(pilot_config, args)
         rollout_size = validate_rollout_alignment(
             config_values,
-            n_envs=1,
+            n_envs=int(args.n_envs),
             target_timesteps=target_timesteps,
             checkpoint_interval=int(args.checkpoint_interval),
         )
@@ -1023,10 +1208,10 @@ def train_one_run(
     reward_config: dict[str, float],
     output_dir: Path,
 ) -> dict[str, Any]:
-    config_values = copy.deepcopy(PPO_CONFIGS[pilot_config])
+    config_values = effective_ppo_config(pilot_config, args)
     rollout_size = validate_rollout_alignment(
         config_values,
-        n_envs=1,
+        n_envs=int(args.n_envs),
         target_timesteps=target_timesteps,
         checkpoint_interval=int(args.checkpoint_interval),
     )
@@ -1080,11 +1265,7 @@ def train_one_run(
         pipeline.seed_everything(training_seed)
 
     output_identity = hashlib.sha256(str(run_dir.resolve()).encode("utf-8")).hexdigest()[:12]
-    tensorboard_root = Path(
-        os.environ.get(
-            "NOMINAL_PPO_PILOT_TENSORBOARD_ROOT", str(output_dir / "tensorboard")
-        )
-    )
+    tensorboard_root = default_tensorboard_root()
     tensorboard_log = tensorboard_root / f"{config_hash[:12]}_{output_identity}"
     parent_step = 0 if resume_manifest is None else int(resume_manifest["timestep"])
     tensorboard_session = (
@@ -1094,17 +1275,32 @@ def train_one_run(
     )
 
     train_args = copy.copy(args)
-    train_args.n_envs = 1
-    train_env = pipeline.make_training_env(
-        namespace,
-        filtered=False,
-        seed=training_seed,
-        env_config=env_config,
-        reward_config=reward_config,
-        args=train_args,
-        monitor_path=monitor_path,
-        append_monitor=resume_this_run,
-    )
+    if int(args.n_envs) > 1:
+        train_env = make_parallel_subproc_training_env(
+            project_root=project_root,
+            seed=training_seed,
+            n_envs=int(args.n_envs),
+            env_config=env_config,
+            reward_config=reward_config,
+            observation_at1=bool(args.observation_at1),
+            monitor_path=monitor_path,
+        )
+    else:
+        train_env = pipeline.make_training_env(
+            namespace,
+            filtered=False,
+            seed=training_seed,
+            env_config=env_config,
+            reward_config=reward_config,
+            args=train_args,
+            monitor_path=monitor_path,
+            append_monitor=resume_this_run,
+        )
+    if int(args.n_envs) > 1 and not isinstance(train_env, SubprocVecEnv):
+        train_env.close()
+        raise RuntimeError(
+            "Parallel PPO requested but training did not create a SubprocVecEnv"
+        )
     validate_normalized_action_space(train_env)
 
     if resume_bundle is not None:
@@ -1166,6 +1362,20 @@ def train_one_run(
         "resumed_from": None if resume_bundle is None else str(resume_bundle),
         "tensorboard_log": str(tensorboard_log),
         "tensorboard_session": tensorboard_session,
+        "n_envs": int(args.n_envs),
+        "vectorized_backend": type(train_env).__name__,
+        "model_device": str(getattr(model, "device", args.device)),
+        "strict_resume_supported": bool(int(args.n_envs) == 1),
+        "evaluation_cadence": (
+            "every_checkpoint"
+            if checkpoint_evaluation_enabled(args)
+            else "final_only"
+        ),
+        "evaluation_model_timesteps": evaluation_steps(
+            target_timesteps,
+            int(args.checkpoint_interval),
+            evaluate_checkpoints=checkpoint_evaluation_enabled(args),
+        ),
     }
     config_path = run_dir / "run_config.json"
     config_path.write_text(json.dumps(metadata, indent=2, default=str), encoding="utf-8")
@@ -1189,7 +1399,11 @@ def train_one_run(
         diagnostics_path=diagnostics_path,
         action_callback=action_callback,
         rollout_diagnostics_cache=rollout_diagnostics_cache,
-        interval=int(args.checkpoint_interval),
+        interval=(
+            int(args.checkpoint_interval)
+            if checkpoint_evaluation_enabled(args)
+            else int(target_timesteps)
+        ),
     )
     if resume_state is not None:
         metrics_callback.load_state_dict(resume_state.get("metrics_callback_state", {}))
@@ -1197,18 +1411,26 @@ def train_one_run(
         evaluation_callback.load_state_dict(
             resume_state.get("evaluation_callback_state", {})
         )
-    checkpoint_callback = PPOStrictCheckpointCallback(
-        run_dir=run_dir,
-        checkpoint_interval=int(args.checkpoint_interval),
-        rollout_size=rollout_size,
-        training_config_hash=config_hash,
-        metrics_callback=metrics_callback,
-        action_callback=action_callback,
-        evaluation_callback=evaluation_callback,
-        tracked_log_paths=tracked_logs,
-        resume_state=resume_state,
-        strict_retention=int(args.strict_checkpoint_retention),
-    )
+    if int(args.n_envs) == 1:
+        checkpoint_callback: BaseCallback = PPOStrictCheckpointCallback(
+            run_dir=run_dir,
+            checkpoint_interval=int(args.checkpoint_interval),
+            rollout_size=rollout_size,
+            training_config_hash=config_hash,
+            metrics_callback=metrics_callback,
+            action_callback=action_callback,
+            evaluation_callback=evaluation_callback,
+            tracked_log_paths=tracked_logs,
+            resume_state=resume_state,
+            strict_retention=int(args.strict_checkpoint_retention),
+        )
+    else:
+        checkpoint_callback = PPOModelSnapshotCallback(
+            run_dir=run_dir,
+            checkpoint_interval=int(args.checkpoint_interval),
+            rollout_size=rollout_size,
+            training_config_hash=config_hash,
+        )
     callbacks = CallbackList(
         [
             metrics_callback,
@@ -1297,10 +1519,17 @@ def collect_run_outputs(
     checkpoint_interval: int,
     eval_seeds: list[int],
     eval_timesteps: int,
+    evaluation_model_timesteps: Optional[list[int]] = None,
 ) -> tuple[pd.DataFrame, pd.DataFrame]:
     scenario_frames: list[pd.DataFrame] = []
     diagnostic_frames: list[pd.DataFrame] = []
-    steps = expected_checkpoint_steps(target_timesteps, checkpoint_interval)
+    steps = (
+        [int(step) for step in evaluation_model_timesteps]
+        if evaluation_model_timesteps is not None
+        else expected_checkpoint_steps(target_timesteps, checkpoint_interval)
+    )
+    if not steps or len(set(steps)) != len(steps):
+        raise ValueError("evaluation_model_timesteps must be non-empty and unique")
     for training_seed, pilot_config in run_specs:
         run_dir = _run_dir(output_dir, training_seed, pilot_config)
         scenario_path = run_dir / "evaluation_scenarios.csv"
@@ -1431,11 +1660,14 @@ def final_three_seed_averages(checkpoint_summary: pd.DataFrame) -> pd.DataFrame:
     ):
         steps = sorted(pd.to_numeric(group["model_timestep"], errors="raise").astype(int).unique())
         step_sets.add(tuple(steps))
-        if len(steps) < 3:
+        if not steps:
             raise RuntimeError(
-                f"{pilot_config} seed={training_seed} has fewer than three PPO checkpoints"
+                f"{pilot_config} seed={training_seed} has no evaluated PPO checkpoint"
             )
-        selected = steps[-3:]
+        # Legacy studies use the final three evaluated checkpoints.  The
+        # default nominal pilot evaluates only the final checkpoint, which
+        # intentionally produces a one-checkpoint trailing window.
+        selected = steps[-min(3, len(steps)):]
         final = group[group["model_timestep"].isin(selected)]
         totals = {
             metric: float(pd.to_numeric(final[metric], errors="coerce").fillna(0).sum())
@@ -1449,7 +1681,7 @@ def final_three_seed_averages(checkpoint_summary: pd.DataFrame) -> pd.DataFrame:
         row: dict[str, Any] = {
             "pilot_config": str(pilot_config),
             "training_seed": int(training_seed),
-            "checkpoint_count": 3,
+            "checkpoint_count": len(selected),
             "checkpoint_steps": ",".join(str(step) for step in selected),
             **totals,
             "total_distance_m": distance,
@@ -1552,18 +1784,34 @@ def write_summaries(
     checkpoint = build_checkpoint_seed_summary(scenarios, diagnostics)
     checkpoint.to_csv(output_dir / "checkpoint_seed_summary.csv", index=False)
     seed_averages = final_three_seed_averages(checkpoint)
-    seed_averages.to_csv(output_dir / "final_three_seed_averages.csv", index=False)
     across_seed = across_seed_final_three(seed_averages)
-    across_seed.to_csv(output_dir / "final_three_across_seeds.csv", index=False)
     ranking = rank_final_three(across_seed)
-    ranking.to_csv(output_dir / "ranking_final_three.csv", index=False)
+    final_only = bool(
+        pd.to_numeric(seed_averages["checkpoint_count"], errors="raise").eq(1).all()
+    )
+    if final_only:
+        seed_output = output_dir / "final_evaluation_seed_averages.csv"
+        across_output = output_dir / "final_evaluation_across_seeds.csv"
+        ranking_output = output_dir / "ranking_final_evaluation.csv"
+        selection_rule = (
+            "Equal-weight rollout rank over the final post-update checkpoint only. "
+            "Scenarios are aggregated within each training seed before across-seed statistics."
+        )
+    else:
+        seed_output = output_dir / "final_three_seed_averages.csv"
+        across_output = output_dir / "final_three_across_seeds.csv"
+        ranking_output = output_dir / "ranking_final_three.csv"
+        selection_rule = (
+            "Equal-weight rollout rank over the final three post-update checkpoints. "
+            "Scenarios are aggregated within each training seed before across-seed statistics."
+        )
+    seed_averages.to_csv(seed_output, index=False)
+    across_seed.to_csv(across_output, index=False)
+    ranking.to_csv(ranking_output, index=False)
     (output_dir / "selected_best_two.json").write_text(
         json.dumps(
             {
-                "selection_rule": (
-                    "Equal-weight rollout rank over the final three post-update checkpoints. "
-                    "Scenarios are aggregated within each training seed before across-seed statistics."
-                ),
+                "selection_rule": selection_rule,
                 "single_seed_screen_warning": (
                     "This 50k screen has one training seed; across-seed variance is undefined. "
                     "Confirm finalists with independent training seeds."
@@ -1592,7 +1840,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--stage", choices=("screen", "summarize"), default="screen")
     parser.add_argument("--project-root", type=Path, default=None)
     parser.add_argument("--output-dir", type=Path, default=None)
-    parser.add_argument("--device", default="cpu")
+    parser.add_argument("--device", default="cuda")
     parser.add_argument("--timesteps", type=int, default=DEFAULT_TIMESTEPS)
     parser.add_argument(
         "--checkpoint-interval", type=int, default=DEFAULT_CHECKPOINT_INTERVAL
@@ -1603,9 +1851,38 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--eval-scenarios", type=int, default=DEFAULT_EVAL_SCENARIOS)
     parser.add_argument("--eval-seeds", type=int, nargs="+", default=None)
     parser.add_argument("--eval-timesteps", type=int, default=DEFAULT_EVAL_TIMESTEPS)
+    parser.add_argument(
+        "--evaluate-checkpoints",
+        action="store_true",
+        help=(
+            "run the full fixed-seed evaluation at every model snapshot; disabled by "
+            "default because it serializes a large simulator workload into training"
+        ),
+    )
+    parser.add_argument(
+        "--n-envs",
+        type=int,
+        default=1,
+        help="number of training environments; use --use-subproc for true parallel workers",
+    )
+    parser.add_argument(
+        "--use-subproc",
+        action="store_true",
+        help="require SubprocVecEnv when --n-envs is greater than one",
+    )
+    parser.add_argument(
+        "--global-rollout-size",
+        type=int,
+        default=DEFAULT_GLOBAL_ROLLOUT_SIZE,
+        help="global transitions collected per PPO update (must divide checkpoint interval)",
+    )
+    parser.add_argument(
+        "--observation-at1",
+        action="store_true",
+        help="append the previous normalized executed action a[t-1] to the y-target observation",
+    )
     parser.add_argument("--strict-checkpoint-retention", type=int, default=2)
     parser.add_argument("--resume", action="store_true")
-    parser.add_argument("--n-envs", type=int, default=1, help=argparse.SUPPRESS)
     parser.add_argument("--eval-episodes", type=int, default=1, help=argparse.SUPPRESS)
     parser.add_argument(
         "--eval-horizon", type=int, default=DEFAULT_EVAL_TIMESTEPS, help=argparse.SUPPRESS
@@ -1637,8 +1914,17 @@ def _main_resolved(
     checkpoint_interval = int(args.checkpoint_interval)
     if target_timesteps <= 0 or checkpoint_interval <= 0:
         raise ValueError("PPO timestep budgets must be positive")
-    if target_timesteps < 3 * checkpoint_interval:
-        raise ValueError("PPO pilot requires at least three evaluation checkpoints")
+    args.device = validate_training_device(args.device)
+    if int(args.n_envs) <= 0:
+        raise ValueError("--n-envs must be positive")
+    if int(args.n_envs) > 1 and not bool(args.use_subproc):
+        raise ValueError(
+            "Parallel PPO requires --use-subproc; DummyVecEnv would not parallelize simulation"
+        )
+    if int(args.n_envs) > 1 and bool(args.resume):
+        raise ValueError(
+            "Parallel PPO does not support strict resume; use a fresh output directory"
+        )
     selected_configs = list(args.configs or PPO_CONFIGS.keys())
     unknown = [name for name in selected_configs if name not in PPO_CONFIGS]
     if unknown:
@@ -1646,8 +1932,6 @@ def _main_resolved(
     training_seeds = [int(seed) for seed in args.seeds]
     if len(training_seeds) != 1 or len(set(training_seeds)) != 1:
         raise ValueError("The quick PPO screening pilot requires one common training seed")
-    if int(args.n_envs) != 1:
-        raise ValueError("The strict PPO pilot requires --n-envs 1")
     if args.eval_seeds is None:
         args.eval_seeds = [
             int(args.eval_seed_start) + index for index in range(int(args.eval_scenarios))
@@ -1677,6 +1961,12 @@ def _main_resolved(
     if not bool(env_config.get("terminate_on_collision", False)):
         raise RuntimeError("PPO pilot requires terminate_on_collision=True")
     reward_config = pipeline.make_base_reward_config(namespace)
+    # Both pilots in this study expose the desired lateral target in the
+    # existing second observation slot.  The optional at-1 variant appends the
+    # previous normalized command for jerk-aware policy conditioning.
+    reward_config["expose_target_y"] = True
+    if bool(args.observation_at1):
+        install_previous_action_observation(namespace)
     run_specs = [
         (training_seed, pilot_config)
         for training_seed in training_seeds
@@ -1684,8 +1974,8 @@ def _main_resolved(
     ]
     for _, pilot_config in run_specs:
         validate_rollout_alignment(
-            PPO_CONFIGS[pilot_config],
-            n_envs=1,
+            effective_ppo_config(pilot_config, args),
+            n_envs=int(args.n_envs),
             target_timesteps=target_timesteps,
             checkpoint_interval=checkpoint_interval,
         )
@@ -1707,10 +1997,30 @@ def _main_resolved(
         "training_seeds": training_seeds,
         "target_timesteps": target_timesteps,
         "checkpoint_interval": checkpoint_interval,
+        "evaluation_cadence": (
+            "every_checkpoint" if bool(args.evaluate_checkpoints) else "final_only"
+        ),
+        "evaluation_model_timesteps": evaluation_steps(
+            target_timesteps,
+            checkpoint_interval,
+            evaluate_checkpoints=bool(args.evaluate_checkpoints),
+        ),
         "eval_seeds": args.eval_seeds,
         "eval_timesteps": int(args.eval_timesteps),
         "environment_and_cbf_tuning_changed": False,
         "filtered_training": False,
+        "n_envs": int(args.n_envs),
+        "vectorized_backend": (
+            "SubprocVecEnv" if int(args.n_envs) > 1 else "DummyVecEnv"
+        ),
+        "global_rollout_size": int(args.global_rollout_size),
+        "device_requested": str(args.device),
+        "cuda_available": bool(th.cuda.is_available()),
+        "cuda_device_name": (
+            th.cuda.get_device_name(0) if th.cuda.is_available() else None
+        ),
+        "torch_num_threads": int(th.get_num_threads()),
+        "strict_resume_supported": bool(int(args.n_envs) == 1),
         "fixed_cbf_snapshot": args.cbf_snapshot,
         "episode_reset_reseed": False,
         "post_update_checkpoints": True,
@@ -1719,9 +2029,17 @@ def _main_resolved(
             "formula": "total_distance_m / distinct_ego_collision_events",
             "zero_collision_value": "infinity (right-censored)",
         },
-        "configurations": {name: PPO_CONFIGS[name] for name in selected_configs},
+        "configurations": {
+            name: effective_ppo_config(name, args) for name in selected_configs
+        },
         "env_config": env_config,
         "reward_config": reward_config,
+        "observation_variant": (
+            "target_y_plus_previous_action"
+            if bool(args.observation_at1)
+            else "target_y_only"
+        ),
+        "observation_dimensions": 32 if bool(args.observation_at1) else 30,
     }
     (output_dir / "run_config.json").write_text(
         json.dumps(root_config, indent=2, default=str), encoding="utf-8"
@@ -1729,14 +2047,17 @@ def _main_resolved(
     print(
         "[ppo-pilot] starting"
         f" configs={selected_configs} seed={training_seeds[0]}"
-        f" timesteps={target_timesteps:,} eval_every={checkpoint_interval:,}"
-        f" eval={len(args.eval_seeds)}x{args.eval_timesteps}",
+        f" timesteps={target_timesteps:,} snapshots_every={checkpoint_interval:,}"
+        f" evaluation={'every_snapshot' if bool(args.evaluate_checkpoints) else 'final_only'}"
+        f" eval={len(args.eval_seeds)}x{args.eval_timesteps}"
+        f" n_envs={int(args.n_envs)} backend={'subproc' if int(args.n_envs) > 1 else 'dummy'}"
+        f" device={args.device}",
         flush=True,
     )
     model_rows: list[dict[str, Any]] = []
     for training_seed, pilot_config in run_specs:
         print(
-            f"[ppo-pilot] train {pilot_config} seed={training_seed} parameters={PPO_CONFIGS[pilot_config]}",
+            f"[ppo-pilot] train {pilot_config} seed={training_seed} parameters={effective_ppo_config(pilot_config, args)}",
             flush=True,
         )
         model_rows.append(
@@ -1759,6 +2080,11 @@ def _main_resolved(
         checkpoint_interval=checkpoint_interval,
         eval_seeds=[int(seed) for seed in args.eval_seeds],
         eval_timesteps=int(args.eval_timesteps),
+        evaluation_model_timesteps=evaluation_steps(
+            target_timesteps,
+            checkpoint_interval,
+            evaluate_checkpoints=bool(args.evaluate_checkpoints),
+        ),
     )
     ranking = write_summaries(
         output_dir=output_dir, scenarios=scenarios, diagnostics=diagnostics
@@ -1783,6 +2109,7 @@ def _main_resolved(
 
 def main() -> int:
     pipeline.set_stable_native_defaults()
+    configure_parallel_runtime()
     os.environ.setdefault("MPLBACKEND", "Agg")
     args = parse_args()
     project_root = pipeline.find_project_root(args.project_root or Path.cwd())

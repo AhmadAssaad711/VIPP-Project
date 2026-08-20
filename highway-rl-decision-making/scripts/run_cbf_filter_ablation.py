@@ -595,6 +595,7 @@ def _capture_wrapper_states(single_env: gym.Env) -> list[dict[str, Any]]:
     states: list[dict[str, Any]] = []
     stateless_names = {
         "KaralakouRewardWrapper",
+        "PreviousActionObservationWrapper",
         "CorrectionRewardSafetyFilteredAccelerationWrapper",
         "SafetyFilteredAccelerationWrapper",
         "LaneFreeObservationNormalizationWrapper",
