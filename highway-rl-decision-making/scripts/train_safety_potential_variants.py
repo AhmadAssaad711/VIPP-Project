@@ -160,7 +160,8 @@ MTM_CONGESTED_UNCERTAIN_UPDATES = {
     "show_trajectories": False,
     "mtm": {
         "leader_range": 90.0,
-        "profile_probabilities": {"normal": 0.45, "aggressive": 0.30, "cautious": 0.25},
+        "continuous_driver_aggressiveness": True,
+        "profile_probabilities": {"normal": 0.25, "aggressive": 0.50, "cautious": 0.25},
     },
 }
 

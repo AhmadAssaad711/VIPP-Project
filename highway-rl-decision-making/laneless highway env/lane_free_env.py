@@ -73,6 +73,9 @@ class LaneFreeVehicleState:
     width: float
     desired_speed: float
     driver_profile: str = "normal"
+    # Persistent MTM personality coordinate: 0=cautious, 0.5=normal,
+    # 1=aggressive.  ``None`` keeps legacy categorical fixtures compatible.
+    driver_aggressiveness: float | None = None
 
 
 class LaneFreeVehicle:
@@ -102,6 +105,13 @@ class LaneFreeVehicle:
         self.diagonal = float(np.sqrt(self.length**2 + self.width**2))
         self.desired_speed = float(state.desired_speed)
         self.driver_profile = str(state.driver_profile)
+        if state.driver_aggressiveness is None:
+            self.driver_aggressiveness = None
+        else:
+            aggressiveness = float(state.driver_aggressiveness)
+            if not np.isfinite(aggressiveness):
+                raise ValueError("driver_aggressiveness must be finite")
+            self.driver_aggressiveness = float(np.clip(aggressiveness, 0.0, 1.0))
         self.is_ego = bool(is_ego)
 
         self.lane_index = None
@@ -155,7 +165,25 @@ class LaneFreeVehicle:
 
     def _profile_color(self) -> tuple[int, int, int]:
         profile = str(getattr(self, "driver_profile", "normal")).strip().lower()
-        return self.PROFILE_COLORS.get(profile, self.PROFILE_COLORS["normal"])
+        if profile == "ego":
+            return self.PROFILE_COLORS["ego"]
+
+        score = getattr(self, "driver_aggressiveness", None)
+        if score is None or not np.isfinite(float(score)):
+            return self.PROFILE_COLORS.get(profile, self.PROFILE_COLORS["normal"])
+
+        # Make the continuous personality visible: yellow -> blue -> red.
+        score = float(np.clip(float(score), 0.0, 1.0))
+        if score <= 0.5:
+            low = np.asarray(self.PROFILE_COLORS["cautious"], dtype=float)
+            high = np.asarray(self.PROFILE_COLORS["normal"], dtype=float)
+            blend = 2.0 * score
+        else:
+            low = np.asarray(self.PROFILE_COLORS["normal"], dtype=float)
+            high = np.asarray(self.PROFILE_COLORS["aggressive"], dtype=float)
+            blend = 2.0 * score - 1.0
+        color = np.rint(low + blend * (high - low)).astype(int)
+        return tuple(int(channel) for channel in color)
 
     @classmethod
     def create_from(cls, vehicle: "LaneFreeVehicle") -> "LaneFreeVehicle":
@@ -168,6 +196,7 @@ class LaneFreeVehicle:
             width=float(vehicle.width),
             desired_speed=float(vehicle.desired_speed),
             driver_profile=str(getattr(vehicle, "driver_profile", "normal")),
+            driver_aggressiveness=getattr(vehicle, "driver_aggressiveness", None),
         )
         copy = cls(vehicle.road, state, is_ego=vehicle.is_ego)
         copy.crashed = vehicle.crashed
@@ -258,6 +287,12 @@ class LaneFreeTrafficEnv(AbstractEnv):
                     "guard_time_headway": 0.25,
                     "guard_lateral_conflict_range": 12.0,
                     "guard_lateral_yield_acceleration": 3.0,
+                    # The side-contact shield is deliberately much narrower
+                    # than the traffic comfort envelope above. It preserves
+                    # aggressive MTM cut-ins and changes only relative lateral
+                    # motion that is predicted to create physical overlap.
+                    "guard_side_contact_margin": 0.05,
+                    "guard_side_prediction_horizon_s": 0.75,
                 },
                 "mtm": {
                     "theta": 0.2,
@@ -272,10 +307,15 @@ class LaneFreeTrafficEnv(AbstractEnv):
                     "time_gap": 1.2,
                     "min_gap": 2.0,
                     "leader_range": 80.0,
+                    # Social MTM drivers live on a persistent continuous
+                    # cautious-to-aggressive scale.  The probabilities below
+                    # shape how much population occupies each diagnostic band;
+                    # they no longer select one of three parameter presets.
+                    "continuous_driver_aggressiveness": True,
                     "profile_probabilities": {
-                        "normal": 0.70,
-                        "aggressive": 0.15,
-                        "cautious": 0.15,
+                        "normal": 0.25,
+                        "aggressive": 0.50,
+                        "cautious": 0.25,
                     },
                     "profiles": {
                         "normal": {
@@ -376,6 +416,7 @@ class LaneFreeTrafficEnv(AbstractEnv):
         self._flow_count = 0
         self._last_mtm_diagnostics: dict[str, float] = {}
         self._mtm_profile_counts: dict[str, int] = {}
+        self._mtm_aggressiveness_stats: dict[str, float] = {}
         self._last_spawn_diagnostics: dict[str, float] = {}
         self._last_traffic_safety_diagnostics: dict[str, float] = {}
         self._reset()
@@ -400,10 +441,15 @@ class LaneFreeTrafficEnv(AbstractEnv):
         road_width = float(self.config["road_width"])
         desired_low, desired_high = self.config["desired_speed_range"]
         speed_low, speed_high = self.config["initial_speed_fraction_range"]
-        mtm_profiles = self.config.get("mtm", {}).get("profiles", {})
+        mtm_config = self.config.get("mtm", {})
+        use_continuous_personality = (
+            str(self.config.get("traffic_model", "force")).strip().lower() == "mtm"
+            and bool(mtm_config.get("continuous_driver_aggressiveness", True))
+        )
 
         vehicle_specs: list[tuple[LaneFreeVehicleState, bool]] = []
         profile_counts: dict[str, int] = {}
+        aggressiveness_scores: list[float] = []
 
         vehicle_dimensions = np.asarray(self.config.get("vehicle_dimensions", self.VEHICLE_DIMENSIONS), dtype=float)
         ego_length, ego_width = np.asarray(self.config.get("ego_dimensions", self.EGO_DIMENSIONS), dtype=float)
@@ -416,9 +462,32 @@ class LaneFreeTrafficEnv(AbstractEnv):
                     self.np_random.integers(0, len(vehicle_dimensions))
                 ]
             ego_controlled = index == 0 and bool(self.config.get("ego_controlled", True))
-            driver_profile = "ego" if ego_controlled else self._sample_mtm_profile()
-            profile = mtm_profiles.get(driver_profile, {}) if isinstance(mtm_profiles, dict) else {}
-            desired_multiplier = float(profile.get("desired_speed_multiplier", 1.0)) if not ego_controlled else 1.0
+            if ego_controlled:
+                driver_profile = "ego"
+                driver_aggressiveness = None
+                desired_multiplier = 1.0
+            elif use_continuous_personality:
+                driver_aggressiveness = self._sample_mtm_aggressiveness()
+                driver_profile = self._mtm_profile_label(driver_aggressiveness)
+                personality = self._interpolate_mtm_personality(
+                    driver_aggressiveness
+                )
+                desired_multiplier = float(
+                    personality.get("desired_speed_multiplier", 1.0)
+                )
+                aggressiveness_scores.append(driver_aggressiveness)
+            else:
+                driver_profile = self._sample_mtm_profile()
+                driver_aggressiveness = None
+                profiles = mtm_config.get("profiles", {})
+                profile = (
+                    profiles.get(driver_profile, {})
+                    if isinstance(profiles, dict)
+                    else {}
+                )
+                desired_multiplier = float(
+                    profile.get("desired_speed_multiplier", 1.0)
+                )
             desired_speed = float(self.np_random.uniform(desired_low, desired_high)) * desired_multiplier
             speed_fraction = float(self.np_random.uniform(speed_low, speed_high))
             vehicle_specs.append(
@@ -432,6 +501,7 @@ class LaneFreeTrafficEnv(AbstractEnv):
                         width=float(vehicle_width),
                         desired_speed=desired_speed,
                         driver_profile=driver_profile,
+                        driver_aggressiveness=driver_aggressiveness,
                     ),
                     index == 0,
                 )
@@ -452,6 +522,17 @@ class LaneFreeTrafficEnv(AbstractEnv):
         self.vehicle = vehicles[0]
         self.controlled_vehicles = [self.vehicle]
         self._mtm_profile_counts = profile_counts
+        if aggressiveness_scores:
+            scores = np.asarray(aggressiveness_scores, dtype=float)
+            self._mtm_aggressiveness_stats = {
+                "mean": float(np.mean(scores)),
+                "std": float(np.std(scores)),
+                "min": float(np.min(scores)),
+                "max": float(np.max(scores)),
+                "unique": float(np.unique(scores).size),
+            }
+        else:
+            self._mtm_aggressiveness_stats = {}
 
     def _traffic_safety_config(self) -> dict[str, Any]:
         """Return the simulator-side traffic safety settings."""
@@ -496,6 +577,7 @@ class LaneFreeTrafficEnv(AbstractEnv):
                         width=spec.width,
                         desired_speed=spec.desired_speed,
                         driver_profile=spec.driver_profile,
+                        driver_aggressiveness=spec.driver_aggressiveness,
                     ),
                     is_ego,
                 )
@@ -534,6 +616,7 @@ class LaneFreeTrafficEnv(AbstractEnv):
                     width=spec.width,
                     desired_speed=spec.desired_speed,
                     driver_profile=spec.driver_profile,
+                    driver_aggressiveness=spec.driver_aggressiveness,
                 )
                 if all(
                     self._spawn_pair_is_safe(candidate, is_ego, other, other_is_ego)
@@ -617,6 +700,91 @@ class LaneFreeTrafficEnv(AbstractEnv):
             return names[0]
         weights /= total
         return str(self.np_random.choice(names, p=weights))
+
+    @staticmethod
+    def _mtm_profile_label(aggressiveness: float) -> str:
+        """Return a compatibility/diagnostic label, not a dynamics selector."""
+
+        score = float(np.clip(float(aggressiveness), 0.0, 1.0))
+        if score < 0.25:
+            return "cautious"
+        if score < 0.75:
+            return "normal"
+        return "aggressive"
+
+    def _sample_mtm_aggressiveness(self) -> float:
+        """Sample one continuous personality while preserving population mix."""
+
+        mtm_config = self.config.get("mtm", {})
+        probabilities = mtm_config.get("profile_probabilities", {})
+        uniform_quantile = float(self.np_random.random())
+        if not isinstance(probabilities, dict) or not probabilities:
+            return uniform_quantile
+
+        bands = (
+            ("cautious", 0.0, 0.25),
+            ("normal", 0.25, 0.75),
+            ("aggressive", 0.75, 1.0),
+        )
+        weights = np.asarray(
+            [max(float(probabilities.get(name, 0.0)), 0.0) for name, _, _ in bands],
+            dtype=float,
+        )
+        total = float(np.sum(weights))
+        if not np.isfinite(total) or total <= 0.0:
+            return uniform_quantile
+        weights /= total
+
+        cumulative = 0.0
+        for index, ((_, low, high), weight) in enumerate(zip(bands, weights)):
+            next_cumulative = cumulative + float(weight)
+            if uniform_quantile < next_cumulative or index == len(bands) - 1:
+                if weight <= 0.0:
+                    cumulative = next_cumulative
+                    continue
+                local_quantile = (uniform_quantile - cumulative) / float(weight)
+                return float(low + np.clip(local_quantile, 0.0, 1.0) * (high - low))
+            cumulative = next_cumulative
+        return uniform_quantile
+
+    def _interpolate_mtm_personality(
+        self, aggressiveness: float
+    ) -> dict[str, float]:
+        """Interpolate the existing profile anchors on a continuous scale."""
+
+        score = float(np.clip(float(aggressiveness), 0.0, 1.0))
+        if score <= 0.5:
+            lower_name, upper_name, blend = "cautious", "normal", 2.0 * score
+        else:
+            lower_name, upper_name, blend = (
+                "normal",
+                "aggressive",
+                2.0 * score - 1.0,
+            )
+
+        mtm_config = self.config.get("mtm", {})
+        profiles = mtm_config.get("profiles", {})
+        profiles = profiles if isinstance(profiles, dict) else {}
+        lower = profiles.get(lower_name, {})
+        upper = profiles.get(upper_name, {})
+        lower = lower if isinstance(lower, dict) else {}
+        upper = upper if isinstance(upper, dict) else {}
+        base_defaults = {
+            "lambda": float(mtm_config.get("lambda", 0.4)),
+            "tau": float(mtm_config.get("tau", 1.0)),
+            "p": float(mtm_config.get("p", 0.2)),
+            "theta": float(mtm_config.get("theta", 0.2)),
+            "desired_speed_multiplier": 1.0,
+            "min_gap_multiplier": 1.0,
+        }
+        personality: dict[str, float] = {}
+        for key, default in base_defaults.items():
+            low_value = float(lower.get(key, default))
+            high_value = float(upper.get(key, default))
+            personality[key] = float(
+                low_value + blend * (high_value - low_value)
+            )
+        return personality
 
     def step(self, action: np.ndarray | list[float] | None) -> tuple[np.ndarray, float, bool, bool, dict[str, Any]]:
         action_array = np.zeros(2, dtype=np.float32) if action is None else np.asarray(action, dtype=np.float32)
@@ -1023,6 +1191,9 @@ class LaneFreeTrafficEnv(AbstractEnv):
         profile_name = str(getattr(vehicle, "driver_profile", "normal"))
         profiles = mtm_config.get("profiles", {}) if isinstance(mtm_config, dict) else {}
         profile = profiles.get(profile_name, {}) if isinstance(profiles, dict) else {}
+        aggressiveness = getattr(vehicle, "driver_aggressiveness", None)
+        if aggressiveness is not None:
+            profile = self._interpolate_mtm_personality(float(aggressiveness))
         params = {
             "theta": float(mtm_config.get("theta", 0.2)),
             "s_y0": float(mtm_config.get("s_y0", 0.15)),
@@ -1132,6 +1303,9 @@ class LaneFreeTrafficEnv(AbstractEnv):
             "traffic_brakes": 0.0,
             "ego_leader_yields": 0.0,
             "lateral_yields": 0.0,
+            "side_constraints": 0.0,
+            "side_infeasible": 0.0,
+            "side_projection_yields": 0.0,
         }
         vehicles = self.road.vehicles
         count = len(vehicles)
@@ -1259,9 +1433,10 @@ class LaneFreeTrafficEnv(AbstractEnv):
                     )
                 )
 
-        # Near side-by-side conflicts are resolved by asking only social
-        # vehicles to move away from the pair. Contributions from all active
-        # pairs are summed before one bounded lateral command is applied.
+        # Restore the original broad lateral interaction drive as the nominal
+        # source of cut-ins and zig-zag motion. It is intentionally applied
+        # before the narrow contact projection below, which is responsible
+        # only for trimming the final inward component that would overlap.
         lateral_yield_pairs = needs_guard & (
             longitudinal_gap
             <= np.maximum(required_gap, lateral_conflict_range)
@@ -1297,15 +1472,275 @@ class LaneFreeTrafficEnv(AbstractEnv):
         guarded[negative, 1] = np.minimum(
             guarded[negative, 1], -yield_magnitude
         )
-        diagnostics["lateral_yields"] = float(
+        lateral_drive_yields = int(
             np.count_nonzero(
                 lateral_mask
                 & (np.abs(guarded[:, 1] - previous_lateral) > 1e-9)
             )
         )
 
+        (
+            guarded,
+            side_constraints,
+            side_projection_yields,
+            side_infeasible,
+        ) = self._project_lateral_contact_accelerations(
+            guarded,
+            x=x,
+            y=y,
+            vx=vx,
+            vy=vy,
+            lengths=lengths,
+            widths=widths,
+            controlled=controlled,
+            dt=dt,
+            safety=safety,
+        )
+        diagnostics["side_constraints"] = float(side_constraints)
+        diagnostics["lateral_yields"] = float(lateral_drive_yields)
+        diagnostics["side_projection_yields"] = float(side_projection_yields)
+        diagnostics["side_infeasible"] = float(side_infeasible)
+
         self._last_traffic_safety_diagnostics = diagnostics
         return guarded
+
+    def _project_lateral_contact_accelerations(
+        self,
+        accelerations: np.ndarray,
+        *,
+        x: np.ndarray,
+        y: np.ndarray,
+        vx: np.ndarray,
+        vy: np.ndarray,
+        lengths: np.ndarray,
+        widths: np.ndarray,
+        controlled: np.ndarray,
+        dt: float,
+        safety: dict[str, Any],
+    ) -> tuple[np.ndarray, int, int, int]:
+        """Minimally remove imminent inward motion at a side contact.
+
+        MTM remains the nominal controller. A constraint is created only when
+        the unaccelerated lateral time-to-contact is short *and* the vehicle
+        footprints are predicted to overlap longitudinally at that time. The
+        projection changes the pair's relative lateral acceleration while
+        preserving its common-mode acceleration whenever both vehicles are
+        social traffic. A controlled ego action is never modified.
+        """
+
+        projected = np.asarray(accelerations, dtype=float).copy()
+        count = len(projected)
+        if count < 2:
+            return projected, 0, 0, 0
+
+        bounds = self.config["bounds"]
+        ay_min = float(bounds["ay_min"])
+        ay_max = float(bounds["ay_max"])
+        road_length = float(self.config["road_length"])
+        contact_margin = max(
+            float(safety.get("guard_side_contact_margin", 0.05)), 0.0
+        )
+        prediction_horizon = max(
+            float(safety.get("guard_side_prediction_horizon_s", 0.75)),
+            float(dt),
+        )
+        constraints: list[tuple[int, int, float, float]] = []
+        infeasible = 0
+
+        for first in range(count - 1):
+            for second in range(first + 1, count):
+                lateral_offset = float(y[second] - y[first])
+                if abs(lateral_offset) > 1e-9:
+                    separation_sign = float(np.sign(lateral_offset))
+                else:
+                    # This tie-break is deterministic and chooses the ordering
+                    # with more combined room before any overlap has occurred.
+                    first_lower_room = float(y[first] - 0.5 * widths[first])
+                    first_upper_room = float(
+                        self.config["road_width"]
+                        - 0.5 * widths[first]
+                        - y[first]
+                    )
+                    second_lower_room = float(y[second] - 0.5 * widths[second])
+                    second_upper_room = float(
+                        self.config["road_width"]
+                        - 0.5 * widths[second]
+                        - y[second]
+                    )
+                    separation_sign = (
+                        1.0
+                        if second_upper_room + first_lower_room
+                        >= second_lower_room + first_upper_room
+                        else -1.0
+                    )
+
+                half_width_sum = 0.5 * float(widths[first] + widths[second])
+                physical_lateral_clearance = (
+                    abs(lateral_offset) - half_width_sum
+                )
+                separation_rate = separation_sign * float(
+                    vy[second] - vy[first]
+                )
+                if separation_rate >= -1e-9:
+                    continue
+
+                closing_speed = -separation_rate
+                physical_time_to_contact = max(
+                    physical_lateral_clearance, 0.0
+                ) / max(closing_speed, 1e-9)
+                if physical_time_to_contact > prediction_horizon:
+                    continue
+
+                # Check longitudinal occupancy at the predicted side-contact
+                # instant. Sampling +/- one physics step makes the gate robust
+                # to discrete integration without creating a comfort buffer.
+                signed_dx = float(
+                    (
+                        x[second]
+                        - x[first]
+                        + 0.5 * road_length
+                    )
+                    % road_length
+                    - 0.5 * road_length
+                )
+                relative_vx = float(vx[second] - vx[first])
+                relative_ax = float(
+                    projected[second, 0] - projected[first, 0]
+                )
+                sample_times = np.unique(
+                    np.clip(
+                        np.asarray(
+                            [
+                                physical_time_to_contact - float(dt),
+                                physical_time_to_contact,
+                                physical_time_to_contact + float(dt),
+                            ],
+                            dtype=float,
+                        ),
+                        0.0,
+                        prediction_horizon,
+                    )
+                )
+                predicted_dx = (
+                    signed_dx
+                    + relative_vx * sample_times
+                    + 0.5 * relative_ax * sample_times**2
+                )
+                predicted_dx = (
+                    predicted_dx + 0.5 * road_length
+                ) % road_length - 0.5 * road_length
+                half_length_sum = 0.5 * float(
+                    lengths[first] + lengths[second]
+                )
+                if float(np.min(np.abs(predicted_dx))) >= half_length_sum:
+                    continue
+
+                usable_clearance = max(
+                    physical_lateral_clearance - contact_margin, 1e-6
+                )
+                required_separation_acceleration = (
+                    closing_speed**2 / (2.0 * usable_clearance)
+                )
+
+                first_controlled = bool(controlled[first])
+                second_controlled = bool(controlled[second])
+                if first_controlled and second_controlled:
+                    infeasible += 1
+                    continue
+                if separation_sign > 0.0:
+                    maximum_first = (
+                        projected[first, 1] if first_controlled else ay_min
+                    )
+                    maximum_second = (
+                        projected[second, 1] if second_controlled else ay_max
+                    )
+                else:
+                    maximum_first = (
+                        projected[first, 1] if first_controlled else ay_max
+                    )
+                    maximum_second = (
+                        projected[second, 1] if second_controlled else ay_min
+                    )
+                maximum_separation_acceleration = separation_sign * float(
+                    maximum_second - maximum_first
+                )
+                if (
+                    required_separation_acceleration
+                    > maximum_separation_acceleration + 1e-9
+                ):
+                    infeasible += 1
+                target = min(
+                    required_separation_acceleration,
+                    max(maximum_separation_acceleration, 0.0),
+                )
+                constraints.append(
+                    (first, second, separation_sign, float(target))
+                )
+
+        original_lateral = projected[:, 1].copy()
+        # Repeated half-space projections resolve vehicles participating in
+        # more than one pair while retaining the smallest practical change.
+        for _ in range(6):
+            any_change = False
+            for first, second, separation_sign, target in constraints:
+                current = separation_sign * float(
+                    projected[second, 1] - projected[first, 1]
+                )
+                deficit = target - current
+                if deficit <= 1e-9:
+                    continue
+
+                first_coefficient = -separation_sign
+                second_coefficient = separation_sign
+
+                def capacity(index: int, coefficient: float) -> float:
+                    if bool(controlled[index]):
+                        return 0.0
+                    if coefficient > 0.0:
+                        return max(ay_max - float(projected[index, 1]), 0.0)
+                    return max(float(projected[index, 1]) - ay_min, 0.0)
+
+                first_capacity = capacity(first, first_coefficient)
+                second_capacity = capacity(second, second_coefficient)
+                correction = min(deficit, first_capacity + second_capacity)
+                if correction <= 1e-12:
+                    continue
+
+                first_share = min(0.5 * correction, first_capacity)
+                second_share = min(0.5 * correction, second_capacity)
+                remainder = correction - first_share - second_share
+                if remainder > 0.0:
+                    first_extra = min(
+                        remainder, first_capacity - first_share
+                    )
+                    first_share += first_extra
+                    remainder -= first_extra
+                if remainder > 0.0:
+                    second_share += min(
+                        remainder, second_capacity - second_share
+                    )
+
+                projected[first, 1] += first_coefficient * first_share
+                projected[second, 1] += second_coefficient * second_share
+                any_change = True
+            if not any_change:
+                break
+
+        projected[:, 1] = np.clip(projected[:, 1], ay_min, ay_max)
+        lateral_yields = int(
+            np.count_nonzero(
+                np.abs(projected[:, 1] - original_lateral) > 1e-9
+            )
+        )
+        unsatisfied = sum(
+            int(
+                separation_sign
+                * float(projected[second, 1] - projected[first, 1])
+                < target - 1e-7
+            )
+            for first, second, separation_sign, target in constraints
+        )
+        return projected, len(constraints), lateral_yields, max(infeasible, unsatisfied)
 
     def _clip_accelerations(self, accelerations: np.ndarray) -> np.ndarray:
         bounds = self.config["bounds"]
@@ -1525,6 +1960,15 @@ class LaneFreeTrafficEnv(AbstractEnv):
                 "traffic_guard_lateral_yields": int(
                     traffic_safety.get("lateral_yields", 0.0)
                 ),
+                "traffic_guard_side_constraints": int(
+                    traffic_safety.get("side_constraints", 0.0)
+                ),
+                "traffic_guard_side_infeasible": int(
+                    traffic_safety.get("side_infeasible", 0.0)
+                ),
+                "traffic_guard_side_projection_yields": int(
+                    traffic_safety.get("side_projection_yields", 0.0)
+                ),
             }
         )
         if str(self.config.get("traffic_model", "force")).strip().lower() == "mtm":
@@ -1540,6 +1984,10 @@ class LaneFreeTrafficEnv(AbstractEnv):
             )
             for profile_name, count in self._mtm_profile_counts.items():
                 info[f"mtm_profile_count_{profile_name}"] = int(count)
+            for statistic, value in self._mtm_aggressiveness_stats.items():
+                info[f"mtm_aggressiveness_{statistic}"] = (
+                    int(value) if statistic == "unique" else float(value)
+                )
         return info
 
     @property
