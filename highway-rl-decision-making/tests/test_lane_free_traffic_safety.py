@@ -140,3 +140,100 @@ def test_guard_makes_social_leader_yield_instead_of_overwriting_ego_action():
         assert env._last_traffic_safety_diagnostics["ego_leader_yields"] == 1.0
     finally:
         env.close()
+
+
+def test_side_contact_projection_preserves_common_mode_lateral_acceleration():
+    env = LaneFreeTrafficEnv(
+        config={
+            "road_length": 380.0,
+            "vehicles_count": 3,
+            "bounds": {
+                "ax_min": -3.0,
+                "ax_max": 3.0,
+                "ay_min": -3.0,
+                "ay_max": 3.0,
+            },
+        }
+    )
+    try:
+        env.reset(seed=4)
+        ego, lower, upper = env.road.vehicles
+        ego.position[:] = [250.0, 1.0]
+        lower.position[:] = [100.0, 4.0]
+        upper.position[:] = [101.0, 6.5]
+        lower.vx = upper.vx = 15.0
+        lower.vy, upper.vy = 1.0, -1.0
+        requested = np.zeros((3, 2), dtype=float)
+
+        guarded = env._apply_traffic_safety_guard(requested, dt=0.05)
+
+        assert guarded[1, 1] < 0.0
+        assert guarded[2, 1] > 0.0
+        assert np.isclose(guarded[1, 1] + guarded[2, 1], 0.0)
+        assert env._last_traffic_safety_diagnostics["side_constraints"] == 1.0
+    finally:
+        env.close()
+
+
+def test_side_contact_projection_does_not_block_nonoverlapping_cut_in():
+    env = LaneFreeTrafficEnv(
+        config={
+            "road_length": 380.0,
+            "vehicles_count": 3,
+            "bounds": {
+                "ax_min": -3.0,
+                "ax_max": 3.0,
+                "ay_min": -3.0,
+                "ay_max": 3.0,
+            },
+        }
+    )
+    try:
+        env.reset(seed=5)
+        ego, lower, upper = env.road.vehicles
+        ego.position[:] = [250.0, 1.0]
+        lower.position[:] = [100.0, 4.0]
+        upper.position[:] = [130.0, 6.5]
+        lower.vx = upper.vx = 15.0
+        lower.vy, upper.vy = 1.0, -1.0
+        requested = np.asarray(
+            [[0.0, 0.0], [0.0, 0.4], [0.0, -0.2]], dtype=float
+        )
+
+        guarded = env._apply_traffic_safety_guard(requested, dt=0.05)
+
+        assert np.allclose(guarded[:, 1], requested[:, 1])
+        assert env._last_traffic_safety_diagnostics["side_constraints"] == 0.0
+    finally:
+        env.close()
+
+
+def test_side_contact_projection_never_overwrites_controlled_ego_action():
+    env = LaneFreeTrafficEnv(
+        config={
+            "road_length": 380.0,
+            "vehicles_count": 2,
+            "bounds": {
+                "ax_min": -3.0,
+                "ax_max": 3.0,
+                "ay_min": -3.0,
+                "ay_max": 3.0,
+            },
+        }
+    )
+    try:
+        env.reset(seed=6)
+        ego, social = env.road.vehicles
+        ego.position[:] = [100.0, 4.0]
+        social.position[:] = [101.0, 6.5]
+        ego.vx = social.vx = 15.0
+        ego.vy, social.vy = 1.0, -1.0
+        requested = np.asarray([[0.4, 0.7], [0.0, 0.0]], dtype=float)
+
+        guarded = env._apply_traffic_safety_guard(requested, dt=0.05)
+
+        assert np.allclose(guarded[0], requested[0])
+        assert guarded[1, 1] > requested[1, 1]
+        assert env._last_traffic_safety_diagnostics["side_constraints"] == 1.0
+    finally:
+        env.close()
