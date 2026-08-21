@@ -1099,6 +1099,10 @@ def ppo_config_payload(
             if bool(getattr(args, "observation_at1", False))
             else "target_y_only"
         ),
+        "observation_target_speed_definition": (
+            "ego_row_v_d_is_dynamic_blocker_aware_target_speed;"
+            "neighbor_rows_keep_nominal_vehicle_desired_speed"
+        ),
         "training_seed": int(training_seed),
         "target_timesteps": int(target_timesteps),
         "parameters": copy.deepcopy(config_values),
@@ -2098,7 +2102,7 @@ def _main_resolved(
             "name": "rmse_target_speed_error",
             "formula": "sqrt(mean((ego_speed - karalakou_target_speed)^2))",
             "target_definition": "the dynamic blocker-aware speed used by the reward",
-            "legacy_comparison_metric": "mean_abs_speed_error",
+            "legacy_comparison_metric": "mean_abs_nominal_speed_error",
         },
         "configurations": {
             name: effective_ppo_config(name, args) for name in selected_configs
@@ -2109,6 +2113,10 @@ def _main_resolved(
             "target_y_plus_previous_action"
             if bool(args.observation_at1)
             else "target_y_only"
+        ),
+        "observation_target_speed_definition": (
+            "ego_row_v_d_is_dynamic_blocker_aware_target_speed;"
+            "neighbor_rows_keep_nominal_vehicle_desired_speed"
         ),
         "observation_dimensions": 32 if bool(args.observation_at1) else 30,
     }

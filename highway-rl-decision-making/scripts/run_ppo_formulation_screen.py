@@ -110,7 +110,7 @@ OBSERVATION_SCHEMA = {
         "vy/7.2",
         "length/5.15",
         "width/1.84",
-        "desired_speed/24",
+        "desired_speed/24 (dynamic target for ego row)",
     ],
     "explicit_features": [
         "target_speed/24",
@@ -265,6 +265,10 @@ def _semantic_observation(wrapper: Any) -> np.ndarray:
             rows[row_index] = base._observation_row(vehicle, ego)
 
     target_y, target_speed, _ = wrapper._lateral_target_and_speed()
+    # Keep the ego row semantically aligned with KaralakouRewardWrapper: the
+    # ego's final speed feature is the blocker-aware target used by the reward.
+    # Neighbor rows retain each vehicle's own nominal desired speed.
+    rows[0, 6] = float(target_speed) / 24.0
     left, right, _ = boundary_state(base)
     previous_acceleration = _current_ego_acceleration(base)
     field_cost = float(np.clip(wrapper._potential_field_cost(), 0.0, 1.0))

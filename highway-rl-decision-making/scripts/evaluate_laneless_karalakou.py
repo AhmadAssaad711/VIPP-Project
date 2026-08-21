@@ -33,7 +33,7 @@ TEN_KPI_SPECS: tuple[tuple[str, str], ...] = (
     ("Ego collisions / km", "ego_collisions_per_km"),
     ("Minimum h", "h_min"),
     ("QP failure rate", "qp_failure_rate"),
-    ("Abs speed error (m/s)", "mean_abs_speed_deviation"),
+    ("RMSE target-speed error (m/s)", "rmse_target_speed_error"),
     ("Mean lateral tracking error (m)", "mean_lat_y_error_m"),
     ("Intervention rate", "event_intervention_rate"),
     ("Correction norm", "mean_correction_norm"),
@@ -44,6 +44,15 @@ TEN_KPI_SPECS: tuple[tuple[str, str], ...] = (
 def ten_kpi_summary(metrics: pd.DataFrame) -> pd.DataFrame:
     """Summarise the agreed final-evaluation KPIs as mean and sample SD."""
 
+    metrics = metrics.copy()
+    # Pre-dynamic-target artifacts only contain the legacy mean absolute speed
+    # deviation. Keep those files readable; new MTM evaluations always write
+    # the exact target-speed RMSE column.
+    if "rmse_target_speed_error" not in metrics:
+        if "mean_abs_speed_deviation" in metrics:
+            metrics["rmse_target_speed_error"] = metrics["mean_abs_speed_deviation"]
+        elif "mean_abs_speed_error" in metrics:
+            metrics["rmse_target_speed_error"] = metrics["mean_abs_speed_error"]
     rows: list[dict[str, float | str]] = []
     for label, column in TEN_KPI_SPECS:
         if column not in metrics:

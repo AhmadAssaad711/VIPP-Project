@@ -1410,6 +1410,16 @@ def train_variant(
             "ay": list(namespace["CBF_AY_BOUNDS"]),
         },
         "traffic_model": active_traffic_model(env_config),
+        "observation_target_speed_definition": (
+            "ego_row_v_d_is_dynamic_blocker_aware_target_speed;"
+            "neighbor_rows_keep_nominal_vehicle_desired_speed"
+        ),
+        "primary_speed_tracking_metric": {
+            "name": "rmse_target_speed_error",
+            "formula": "sqrt(mean((ego_speed - karalakou_target_speed)^2))",
+            "target_definition": "the dynamic blocker-aware speed used by the reward",
+            "legacy_comparison_metric": "mean_abs_nominal_speed_error",
+        },
         "collection_topology": training_topology(args),
         "global_rollout_steps": int(config["global_rollout_steps"]),
         "per_env_rollout_steps": int(config["n_steps"]),
@@ -1495,6 +1505,8 @@ def evaluate_scenario(
         policy_dt = protocol._policy_dt(env)
         rewards: list[float] = []
         speed_errors: list[float] = []
+        target_speed_squared_errors: list[float] = []
+        nominal_speed_errors: list[float] = []
         lateral_errors: list[float] = []
         h_values: list[float] = []
         jerk_norms: list[float] = []
@@ -1540,6 +1552,17 @@ def evaluate_scenario(
             total_distance_m += float(info.get("pipeline_distance_step_m", 0.0))
             collision_events += max(int(info.get("ego_collision_events", 0)), 0)
             base = env.unwrapped
+            nominal_speed_errors.append(
+                abs(float(base.vehicle.vx) - float(base.vehicle.desired_speed))
+            )
+            target_speed = float(
+                info.get("karalakou_target_speed", base.vehicle.desired_speed)
+            )
+            if not np.isfinite(target_speed):
+                target_speed = float(base.vehicle.desired_speed)
+            target_speed_squared_errors.append(
+                float((float(base.vehicle.vx) - target_speed) ** 2)
+            )
             speed_errors.append(
                 float(
                     info.get(
@@ -1607,6 +1630,14 @@ def evaluate_scenario(
             "h_min": _finite_min(h_values),
             "qp_failure_rate": _finite_mean(qp_failures, default=0.0),
             "mean_abs_speed_deviation": _finite_mean(speed_errors, default=0.0),
+            "rmse_target_speed_error": float(
+                np.sqrt(np.mean(target_speed_squared_errors))
+                if target_speed_squared_errors
+                else 0.0
+            ),
+            "mean_abs_nominal_speed_error": _finite_mean(
+                nominal_speed_errors, default=0.0
+            ),
             "mean_lat_y_error_m": _finite_mean(lateral_errors),
             "event_intervention_rate": _finite_mean(interventions, default=0.0),
             "mean_correction_norm": _finite_mean(corrections, default=0.0),
@@ -1653,6 +1684,8 @@ def evaluate_completed_episode(
         policy_dt = protocol._policy_dt(env)
         rewards: list[float] = []
         speed_errors: list[float] = []
+        target_speed_squared_errors: list[float] = []
+        nominal_speed_errors: list[float] = []
         lateral_errors: list[float] = []
         h_values: list[float] = []
         jerk_norms: list[float] = []
@@ -1692,6 +1725,17 @@ def evaluate_completed_episode(
             total_distance_m += float(info.get("pipeline_distance_step_m", 0.0))
             collision_events += max(int(info.get("ego_collision_events", 0)), 0)
             base = env.unwrapped
+            nominal_speed_errors.append(
+                abs(float(base.vehicle.vx) - float(base.vehicle.desired_speed))
+            )
+            target_speed = float(
+                info.get("karalakou_target_speed", base.vehicle.desired_speed)
+            )
+            if not np.isfinite(target_speed):
+                target_speed = float(base.vehicle.desired_speed)
+            target_speed_squared_errors.append(
+                float((float(base.vehicle.vx) - target_speed) ** 2)
+            )
             speed_errors.append(
                 float(
                     info.get(
@@ -1756,6 +1800,14 @@ def evaluate_completed_episode(
             "h_min": _finite_min(h_values),
             "qp_failure_rate": _finite_mean(qp_failures, default=0.0),
             "mean_abs_speed_deviation": _finite_mean(speed_errors, default=0.0),
+            "rmse_target_speed_error": float(
+                np.sqrt(np.mean(target_speed_squared_errors))
+                if target_speed_squared_errors
+                else 0.0
+            ),
+            "mean_abs_nominal_speed_error": _finite_mean(
+                nominal_speed_errors, default=0.0
+            ),
             "mean_lat_y_error_m": _finite_mean(lateral_errors),
             "event_intervention_rate": _finite_mean(interventions, default=0.0),
             "mean_correction_norm": _finite_mean(corrections, default=0.0),
@@ -1815,6 +1867,17 @@ def _weighted_episode_metric(group: pd.DataFrame, column: str) -> float:
     if not np.any(valid):
         return float("nan")
     return float(np.average(values[valid], weights=weights[valid]))
+
+
+def _weighted_episode_rmse(group: pd.DataFrame, column: str) -> float:
+    """Pool per-episode RMSE values without turning RMSE into an arithmetic mean."""
+
+    values = pd.to_numeric(group[column], errors="coerce").to_numpy(dtype=float)
+    weights = pd.to_numeric(group["timesteps"], errors="coerce").to_numpy(dtype=float)
+    valid = np.isfinite(values) & np.isfinite(weights) & (weights > 0.0)
+    if not np.any(valid):
+        return float("nan")
+    return float(np.sqrt(np.average(np.square(values[valid]), weights=weights[valid])))
 
 
 def summarize_post_training_episodes(
@@ -1931,7 +1994,11 @@ def summarize_post_training_episodes(
                 "distinct_ego_collision_events": collision_events,
             }
             for column in POST_TRAIN_STEP_WEIGHTED_COLUMNS:
-                row[column] = _weighted_episode_metric(block, column)
+                row[column] = (
+                    _weighted_episode_rmse(block, column)
+                    if column == "rmse_target_speed_error"
+                    else _weighted_episode_metric(block, column)
+                )
             for column in (
                 "shadow_event_intervention_rate",
                 "shadow_mean_correction_norm",

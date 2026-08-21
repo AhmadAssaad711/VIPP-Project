@@ -587,6 +587,10 @@ def aggregate_checkpoint_scenarios(rows: list[dict[str, Any]]) -> dict[str, floa
         "episode_length_mean": pipeline._ratio(episode_length_sum, episode_segments),
         "nominal_action_saturation_rate": _finite_mean(frame["nominal_action_saturation_rate"]),
     }
+    if "mean_abs_nominal_speed_error" in frame:
+        result["mean_abs_nominal_speed_error"] = _finite_mean(
+            frame["mean_abs_nominal_speed_error"]
+        )
     if "mean_abs_target_speed_error" in frame:
         result["mean_abs_target_speed_error"] = _finite_mean(
             frame["mean_abs_target_speed_error"]
@@ -1996,8 +2000,12 @@ def _main_resolved(args: argparse.Namespace, project_root: Path, output_dir: Pat
             "name": "rmse_target_speed_error",
             "formula": "sqrt(mean((ego_speed - karalakou_target_speed)^2))",
             "target_definition": "the dynamic blocker-aware speed used by the reward",
-            "legacy_comparison_metric": "mean_abs_speed_error",
+            "legacy_comparison_metric": "mean_abs_nominal_speed_error",
         },
+        "observation_target_speed_definition": (
+            "ego_row_v_d_is_dynamic_blocker_aware_target_speed;"
+            "neighbor_rows_keep_nominal_vehicle_desired_speed"
+        ),
         "episode_reset_reseed": False,
         "configurations": {name: PILOT_CONFIGS[name] for name in selected_configs},
         "env_config": env_config,

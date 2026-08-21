@@ -74,6 +74,7 @@ def _summarize(model_id: str, mode: str, frame: pd.DataFrame) -> dict[str, Any]:
     }
     for metric in (
         "mean_abs_speed_error",
+        "mean_abs_nominal_speed_error",
         "mean_abs_target_speed_error",
         "rmse_target_speed_error",
         "mean_jerk_norm",
@@ -318,7 +319,7 @@ def main() -> int:
                     "name": "rmse_target_speed_error",
                     "formula": "sqrt(mean((ego_speed - karalakou_target_speed)^2))",
                     "target_definition": "the dynamic blocker-aware speed used by the reward",
-                    "legacy_comparison_metric": "mean_abs_speed_error",
+                    "legacy_comparison_metric": "mean_abs_nominal_speed_error",
                 },
                 "protocol": "same final snapshots and fixed evaluation reset seeds as the raw 50k pilots",
             },

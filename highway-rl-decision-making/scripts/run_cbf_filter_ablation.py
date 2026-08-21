@@ -2239,7 +2239,10 @@ def evaluate_scenario(
         timestep_budget = evaluation_timestep_budget(args)
         policy_dt = _policy_dt(env)
         rewards: list[float] = []
+        # Primary speed tracking is blocker-aware, matching the target used
+        # by KaralakouRewardWrapper. Keep fixed nominal-speed error separate.
         speed_errors: list[float] = []
+        nominal_speed_errors: list[float] = []
         jerk_norms: list[float] = []
         h_values: list[float] = []
         h_dot_values: list[float] = []
@@ -2462,7 +2465,8 @@ def evaluate_scenario(
             total_distance_m += distance_step_m
             segment_distance_m += distance_step_m
             ego_speed = float(base.vehicle.vx)
-            speed_errors.append(abs(ego_speed - float(base.vehicle.desired_speed)))
+            nominal_desired_speed = float(base.vehicle.desired_speed)
+            nominal_speed_errors.append(abs(ego_speed - nominal_desired_speed))
             common_form1_rewards.append(
                 _as_float(info.get("formulation_common_form1_reward"), default=np.nan)
             )
@@ -2480,6 +2484,10 @@ def evaluate_scenario(
                         info.get("formulation_abs_target_speed_error"), default=np.nan
                     )
                 )
+            primary_speed_error = target_speed_errors[-1]
+            if not np.isfinite(primary_speed_error):
+                primary_speed_error = abs(ego_speed - nominal_desired_speed)
+            speed_errors.append(float(primary_speed_error))
             target_lateral_errors.append(
                 _as_float(info.get("formulation_abs_target_lateral_error_m"), default=np.nan)
             )
@@ -2814,11 +2822,11 @@ def evaluate_scenario(
             "mean_neighbor_count": _mean(neighbor_counts),
             "mean_traffic_density_per_km": _mean(traffic_densities),
             "mean_abs_speed_error": _mean(speed_errors, default=0.0),
+            "mean_abs_nominal_speed_error": _mean(nominal_speed_errors, default=0.0),
             "mean_abs_target_speed_error": _mean(
                 target_speed_errors, default=np.nan
             ),
-            # Unlike mean_abs_speed_error (which is against the fixed
-            # ego.desired_speed=20 m/s), this is the RMSE against the dynamic
+            # Primary speed error and this RMSE both use the dynamic
             # blocker-aware target speed used in the reward denominator.
             "rmse_target_speed_error": _rmse(
                 target_speed_errors, default=np.nan
@@ -3138,6 +3146,7 @@ def summarize_within_training_seed(
         "mean_neighbor_count",
         "mean_traffic_density_per_km",
         "mean_abs_speed_error",
+        "mean_abs_nominal_speed_error",
         "rmse_target_speed_error",
         "mean_jerk_norm",
         "IR",

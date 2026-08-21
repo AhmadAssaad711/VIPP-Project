@@ -139,10 +139,18 @@ def _annotate(
     )
     ego_y = _as_number(info, "ego_y", "karalakou_ego_y", default=float("nan"))
     target_y = _as_number(info, "target_y", "karalakou_target_y", default=float("nan"))
-    desired = _as_number(
+    target_speed = _as_number(
         info,
+        "target_speed",
+        "karalakou_target_speed",
         "desired_speed",
         "karalakou_desired_speed",
+        default=float("nan"),
+    )
+    nominal_speed = _as_number(
+        info,
+        "nominal_desired_speed",
+        "karalakou_nominal_desired_speed",
         "ego_desired_speed",
         default=float("nan"),
     )
@@ -151,7 +159,8 @@ def _annotate(
         f"traffic guard {'ON' if guard_enabled else 'OFF'} | seed {seed}"
     )
     label_2 = (
-        f"t={step * policy_dt:5.1f}s  v={ego_speed:5.2f}  v_des={desired:5.2f}  "
+        f"t={step * policy_dt:5.1f}s  v={ego_speed:5.2f}  v_target={target_speed:5.2f}  "
+        f"v_nom={nominal_speed:5.2f}  "
         f"y={ego_y:5.2f}  y_target={target_y:5.2f}  collisions={collisions}"
     )
     label_3 = (
