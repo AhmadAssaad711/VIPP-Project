@@ -109,6 +109,30 @@ def effective_ppo_config(pilot_config: str, args: argparse.Namespace) -> dict[st
     return config
 
 
+def apply_reward_overrides(
+    reward_config: dict[str, Any], args: argparse.Namespace
+) -> dict[str, Any]:
+    """Return the fixed task reward with explicit pilot-only overrides applied."""
+
+    config = copy.deepcopy(reward_config)
+    progress_reward_weight = getattr(args, "progress_reward_weight", None)
+    if progress_reward_weight is not None:
+        if not np.isfinite(float(progress_reward_weight)):
+            raise ValueError("--progress-reward-weight must be finite")
+        config["progress_reward_weight"] = float(progress_reward_weight)
+    jerk_penalty_weight = getattr(args, "jerk_penalty_weight", None)
+    if jerk_penalty_weight is not None:
+        if not np.isfinite(float(jerk_penalty_weight)) or float(jerk_penalty_weight) < 0.0:
+            raise ValueError("--jerk-penalty-weight must be finite and non-negative")
+        config["jerk_penalty_weight"] = float(jerk_penalty_weight)
+    jerk_scale = getattr(args, "jerk_scale", None)
+    if jerk_scale is not None:
+        if not np.isfinite(float(jerk_scale)) or float(jerk_scale) <= 0.0:
+            raise ValueError("--jerk-scale must be finite and positive")
+        config["jerk_scale"] = float(jerk_scale)
+    return config
+
+
 PPO_CHECKPOINT_PAYLOADS = {
     "model": "model.zip",
     "base_environment": "env.pkl",
@@ -1881,6 +1905,27 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="append the previous normalized executed action a[t-1] to the y-target observation",
     )
+    parser.add_argument(
+        "--progress-reward-weight",
+        type=float,
+        default=None,
+        help=(
+            "override the forward-progress reward weight; normalized progress is "
+            "clipped by the task's fixed progress_clip setting"
+        ),
+    )
+    parser.add_argument(
+        "--jerk-penalty-weight",
+        type=float,
+        default=None,
+        help="override the bounded applied-physical-jerk reward penalty weight",
+    )
+    parser.add_argument(
+        "--jerk-scale",
+        type=float,
+        default=None,
+        help="reference applied jerk magnitude in m/s^3 for the bounded penalty",
+    )
     parser.add_argument("--strict-checkpoint-retention", type=int, default=2)
     parser.add_argument("--resume", action="store_true")
     parser.add_argument("--eval-episodes", type=int, default=1, help=argparse.SUPPRESS)
@@ -1960,7 +2005,9 @@ def _main_resolved(
         deep_update(env_config, copy.deepcopy(MTM_CONGESTED_UNCERTAIN_UPDATES))
     if not bool(env_config.get("terminate_on_collision", False)):
         raise RuntimeError("PPO pilot requires terminate_on_collision=True")
-    reward_config = pipeline.make_base_reward_config(namespace)
+    reward_config = apply_reward_overrides(
+        pipeline.make_base_reward_config(namespace), args
+    )
     # Both pilots in this study expose the desired lateral target in the
     # existing second observation slot.  The optional at-1 variant appends the
     # previous normalized command for jerk-aware policy conditioning.

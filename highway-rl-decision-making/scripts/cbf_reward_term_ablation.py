@@ -136,6 +136,8 @@ def install_safety_set_reward_wrapper(namespace: dict[str, Any]) -> None:
             progress_normalized = self._normalized_forward_progress(progress_m, desired_speed)
             progress_clipped = float(np.clip(progress_normalized, 0.0, float(cfg.get("progress_clip", 1.25))))
             progress_reward = float(cfg.get("progress_reward_weight", 0.0)) * progress_clipped
+            jerk_vector, jerk_norm, jerk_cost = self._jerk_metrics()
+            jerk_penalty = float(cfg.get("jerk_penalty_weight", 0.0)) * jerk_cost
 
             denom = (
                 cfg["epsilon_r"]
@@ -145,7 +147,7 @@ def install_safety_set_reward_wrapper(namespace: dict[str, Any]) -> None:
                 + cfg.get("w_safe", 0.0) * safety_cf
                 + cfg.get("way", 0.0) * cay
             )
-            reward = cfg["epsilon_r"] / max(denom, 1e-9) + progress_reward
+            reward = cfg["epsilon_r"] / max(denom, 1e-9) + progress_reward - jerk_penalty
             if bool(base._last_ego_collision):
                 reward += cfg["collision_penalty"]
             elif overtakes > 0:
@@ -173,6 +175,13 @@ def install_safety_set_reward_wrapper(namespace: dict[str, Any]) -> None:
                 "progress_normalized": float(progress_normalized),
                 "progress_clipped": float(progress_clipped),
                 "progress_reward": float(progress_reward),
+                "applied_ax": float(self._current_applied_acceleration()[0]),
+                "applied_ay": float(self._current_applied_acceleration()[1]),
+                "jerk_ax": float(jerk_vector[0]),
+                "jerk_ay": float(jerk_vector[1]),
+                "jerk_norm": float(jerk_norm),
+                "jerk_cost": float(jerk_cost),
+                "jerk_penalty": float(jerk_penalty),
                 "target_speed": float(target_speed),
                 "zone_found": float(zone_found),
                 "overtakes": float(overtakes),
