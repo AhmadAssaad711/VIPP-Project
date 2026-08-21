@@ -82,7 +82,11 @@ def test_parallel_config_keeps_the_same_global_ppo_rollout_size():
 
 
 def test_progress_reward_override_is_explicit_and_non_mutating():
-    base = {"progress_reward_weight": 0.0, "progress_clip": 1.25}
+    base = {
+        "progress_reward_weight": 0.0,
+        "progress_clip": 1.25,
+        "progress_distance_scale_m": 2.0,
+    }
 
     unchanged = pilot.apply_reward_overrides(base, Namespace())
     enabled = pilot.apply_reward_overrides(
@@ -92,7 +96,103 @@ def test_progress_reward_override_is_explicit_and_non_mutating():
     assert unchanged == base
     assert enabled["progress_reward_weight"] == pytest.approx(0.5)
     assert enabled["progress_clip"] == pytest.approx(1.25)
+    assert enabled["progress_distance_scale_m"] == pytest.approx(2.0)
     assert base["progress_reward_weight"] == pytest.approx(0.0)
+
+
+def test_progress_distance_scale_override_is_explicit_and_validated():
+    base = {"progress_distance_scale_m": 2.0}
+
+    enabled = pilot.apply_reward_overrides(
+        base, Namespace(progress_distance_scale_m=1.5)
+    )
+
+    assert enabled["progress_distance_scale_m"] == pytest.approx(1.5)
+    assert base["progress_distance_scale_m"] == pytest.approx(2.0)
+    with pytest.raises(
+        ValueError, match="progress-distance-scale-m must be finite and positive"
+    ):
+        pilot.apply_reward_overrides(
+            base, Namespace(progress_distance_scale_m=0.0)
+        )
+
+
+def test_notebook_progress_reward_is_distance_based_not_target_speed_based():
+    import run_cbf_filter_ablation as pipeline
+
+    project_root = Path(__file__).resolve().parents[1]
+    namespace = pipeline.bootstrap_notebook_namespace(project_root)
+    pipeline.exec_required_notebook_cells(
+        project_root / "notebooks" / "lanelessKaralakou.ipynb", namespace
+    )
+    wrapper = object.__new__(namespace["KaralakouRewardWrapper"])
+    wrapper.reward_config = {"progress_distance_scale_m": 2.0}
+
+    # The same travelled distance must receive the same progress credit even
+    # when the dynamic target speed changes; less distance must receive less.
+    assert wrapper._normalized_forward_progress(1.0, 5.0) == pytest.approx(0.5)
+    assert wrapper._normalized_forward_progress(1.0, 20.0) == pytest.approx(0.5)
+    assert wrapper._normalized_forward_progress(0.5, 20.0) == pytest.approx(0.25)
+
+
+def test_distance_task_completion_requires_a_collision_free_1000m_episode():
+    import run_cbf_filter_ablation as pipeline
+
+    project_root = Path(__file__).resolve().parents[1]
+    namespace = pipeline.bootstrap_notebook_namespace(project_root)
+    pipeline.exec_required_notebook_cells(
+        project_root / "notebooks" / "lanelessKaralakou.ipynb", namespace
+    )
+
+    class _Vehicle:
+        def __init__(self):
+            self.position = np.zeros(2, dtype=float)
+
+    class _DistanceEnv(gym.Env):
+        observation_space = gym.spaces.Box(-1.0, 1.0, shape=(1,), dtype=np.float32)
+        action_space = gym.spaces.Box(-1.0, 1.0, shape=(1,), dtype=np.float32)
+
+        def __init__(self, collision: bool):
+            self.vehicle = _Vehicle()
+            self.collision = bool(collision)
+
+        def reset(self, *, seed=None, options=None):
+            super().reset(seed=seed)
+            self.vehicle.position[:] = 0.0
+            return np.zeros(1, dtype=np.float32), {}
+
+        def step(self, action):
+            del action
+            self.vehicle.position[0] = 1000.0
+            return (
+                np.zeros(1, dtype=np.float32),
+                0.0,
+                False,
+                False,
+                {
+                    "ego_collision": self.collision,
+                    "ego_collision_events": int(self.collision),
+                },
+            )
+
+    wrapper_cls = namespace["TaskProgressWrapper"]
+
+    safe_env = wrapper_cls(_DistanceEnv(False), task_distance_m=1000.0, max_steps=None)
+    safe_env.reset(seed=1)
+    _obs, _reward, terminated, truncated, info = safe_env.step(np.zeros(1))
+    assert terminated and not truncated
+    assert info["task_completed"] is True
+    assert info["task_collision_free"] is True
+
+    collided_env = wrapper_cls(
+        _DistanceEnv(True), task_distance_m=1000.0, max_steps=None
+    )
+    collided_env.reset(seed=1)
+    _obs, _reward, terminated, truncated, info = collided_env.step(np.zeros(1))
+    assert terminated and not truncated
+    assert info["task_completed"] is False
+    assert info["task_collision_free"] is False
+    assert info["task_collision_events"] == pytest.approx(1.0)
 
 
 def test_progress_reward_override_rejects_nonfinite_weight():

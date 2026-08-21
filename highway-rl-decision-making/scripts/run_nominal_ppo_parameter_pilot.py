@@ -120,6 +120,16 @@ def apply_reward_overrides(
         if not np.isfinite(float(progress_reward_weight)):
             raise ValueError("--progress-reward-weight must be finite")
         config["progress_reward_weight"] = float(progress_reward_weight)
+    progress_distance_scale_m = getattr(args, "progress_distance_scale_m", None)
+    if progress_distance_scale_m is not None:
+        if (
+            not np.isfinite(float(progress_distance_scale_m))
+            or float(progress_distance_scale_m) <= 0.0
+        ):
+            raise ValueError(
+                "--progress-distance-scale-m must be finite and positive"
+            )
+        config["progress_distance_scale_m"] = float(progress_distance_scale_m)
     jerk_penalty_weight = getattr(args, "jerk_penalty_weight", None)
     if jerk_penalty_weight is not None:
         if not np.isfinite(float(jerk_penalty_weight)) or float(jerk_penalty_weight) < 0.0:
@@ -1927,8 +1937,17 @@ def parse_args() -> argparse.Namespace:
         type=float,
         default=None,
         help=(
-            "override the forward-progress reward weight; normalized progress is "
-            "clipped by the task's fixed progress_clip setting"
+            "override the distance-based forward-progress reward weight; "
+            "fixed-distance progress is clipped by progress_clip"
+        ),
+    )
+    parser.add_argument(
+        "--progress-distance-scale-m",
+        type=float,
+        default=None,
+        help=(
+            "metres represented by one unit of normalized progress; this fixed "
+            "distance scale is independent of target speed and elapsed time"
         ),
     )
     parser.add_argument(
