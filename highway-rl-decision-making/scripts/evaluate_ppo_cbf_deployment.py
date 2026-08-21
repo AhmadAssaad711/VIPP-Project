@@ -314,6 +314,12 @@ def main() -> int:
                 "source_models": source_metadata,
                 "deployment_mode": "cbf",
                 "correction_reward": 0.0,
+                "primary_speed_tracking_metric": {
+                    "name": "rmse_target_speed_error",
+                    "formula": "sqrt(mean((ego_speed - karalakou_target_speed)^2))",
+                    "target_definition": "the dynamic blocker-aware speed used by the reward",
+                    "legacy_comparison_metric": "mean_abs_speed_error",
+                },
                 "protocol": "same final snapshots and fixed evaluation reset seeds as the raw 50k pilots",
             },
         )
