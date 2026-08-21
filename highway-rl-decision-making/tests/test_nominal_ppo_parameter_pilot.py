@@ -135,6 +135,98 @@ def test_notebook_progress_reward_is_distance_based_not_target_speed_based():
     assert wrapper._normalized_forward_progress(0.5, 20.0) == pytest.approx(0.25)
 
 
+def _make_target_speed_test_wrapper(*, blocker_dx=None, blocker_y=5.1, blocker_vx=8.0):
+    """Build the smallest fake lane-free state needed by the target helper."""
+
+    import run_cbf_filter_ablation as pipeline
+
+    project_root = Path(__file__).resolve().parents[1]
+    namespace = pipeline.bootstrap_notebook_namespace(project_root)
+    pipeline.exec_required_notebook_cells(
+        project_root / "notebooks" / "lanelessKaralakou.ipynb", namespace
+    )
+
+    class _Vehicle:
+        def __init__(self, x, y, vx, width=1.8, length=3.5):
+            self.position = np.asarray([x, y], dtype=float)
+            self.vx = float(vx)
+            self.vy = 0.0
+            self.width = float(width)
+            self.length = float(length)
+            self.desired_speed = 20.0
+
+    class _Base:
+        def __init__(self):
+            self.config = {"road_width": 10.2, "sensing_range": 90.0}
+            self.vehicle = _Vehicle(0.0, 5.1, 20.0)
+            self.road = type("_Road", (), {})()
+            vehicles = [self.vehicle]
+            if blocker_dx is not None:
+                vehicles.append(_Vehicle(float(blocker_dx), blocker_y, blocker_vx))
+            self.road.vehicles = vehicles
+
+        @staticmethod
+        def _forward_distance(ego_x, vehicle_x):
+            return float(vehicle_x - ego_x)
+
+    wrapper = object.__new__(namespace["KaralakouRewardWrapper"])
+    wrapper.env = Namespace(unwrapped=_Base())
+    wrapper.reward_config = {
+        "ego_desired_speed": 20.0,
+        "timegap": 1.5,
+        "zone_margin": 0.15,
+        "target_speed_transition_m": 8.0,
+        "target_speed_lateral_transition_m": 0.45,
+        "target_speed_blockage_threshold": 0.55,
+        "target_speed_blockage_transition": 0.15,
+    }
+    return wrapper
+
+
+def test_target_speed_is_continuous_at_the_scan_distance_boundary():
+    scan_distance = 20.0 * 1.5
+    before = _make_target_speed_test_wrapper(blocker_dx=scan_distance - 0.1)
+    after = _make_target_speed_test_wrapper(blocker_dx=scan_distance + 0.1)
+
+    before_speed = before._lateral_target_and_speed()[1]
+    after_speed = after._lateral_target_and_speed()[1]
+
+    # The former hard branch changed directly between 20 m/s and the blocker
+    # speed.  The continuous gate should make a 20 cm displacement produce a
+    # small target change instead.
+    assert abs(before_speed - after_speed) < 0.25
+
+
+def test_target_speed_is_continuous_when_a_vehicle_is_overtaken():
+    before = _make_target_speed_test_wrapper(blocker_dx=-0.1)
+    after = _make_target_speed_test_wrapper(blocker_dx=0.1)
+
+    before_speed = before._lateral_target_and_speed()[1]
+    after_speed = after._lateral_target_and_speed()[1]
+
+    # The speed gate keeps a behind-ego vehicle in a short transition band so
+    # crossing dx=0 cannot erase its constraint in one simulator step.
+    assert abs(before_speed - after_speed) < 0.75
+
+
+def test_target_speed_uses_relevant_blockers_and_is_monotone_with_approach():
+    far = _make_target_speed_test_wrapper(blocker_dx=80.0, blocker_vx=8.0)
+    near = _make_target_speed_test_wrapper(blocker_dx=12.0, blocker_vx=8.0)
+    lateral = _make_target_speed_test_wrapper(
+        blocker_dx=12.0, blocker_y=1.0, blocker_vx=8.0
+    )
+    fast = _make_target_speed_test_wrapper(blocker_dx=12.0, blocker_vx=24.0)
+
+    far_speed = far._lateral_target_and_speed()[1]
+    near_speed = near._lateral_target_and_speed()[1]
+    lateral_speed = lateral._lateral_target_and_speed()[1]
+    fast_speed = fast._lateral_target_and_speed()[1]
+
+    assert 0.0 <= near_speed <= far_speed <= 20.0
+    assert lateral_speed > near_speed
+    assert fast_speed == pytest.approx(20.0)
+
+
 def test_distance_task_completion_requires_a_collision_free_1000m_episode():
     import run_cbf_filter_ablation as pipeline
 
