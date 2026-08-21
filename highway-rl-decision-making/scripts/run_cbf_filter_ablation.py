@@ -1026,6 +1026,13 @@ def _mean(values: list[float], default: float = np.nan) -> float:
     return float(np.mean(array)) if array.size else default
 
 
+def _rmse(values: list[float], default: float = np.nan) -> float:
+    """Return the root-mean-square of finite error samples."""
+
+    array = _finite(values)
+    return float(np.sqrt(np.mean(np.square(array)))) if array.size else default
+
+
 def _min(values: list[float], default: float = np.nan) -> float:
     array = _finite(values)
     return float(np.min(array)) if array.size else default
@@ -2454,13 +2461,25 @@ def evaluate_scenario(
             distance_step_m = _as_float(info.get("pipeline_distance_step_m"), default=0.0)
             total_distance_m += distance_step_m
             segment_distance_m += distance_step_m
-            speed_errors.append(abs(float(base.vehicle.vx) - float(base.vehicle.desired_speed)))
+            ego_speed = float(base.vehicle.vx)
+            speed_errors.append(abs(ego_speed - float(base.vehicle.desired_speed)))
             common_form1_rewards.append(
                 _as_float(info.get("formulation_common_form1_reward"), default=np.nan)
             )
-            target_speed_errors.append(
-                _as_float(info.get("formulation_abs_target_speed_error"), default=np.nan)
+            # This is the target used by KaralakouRewardWrapper itself.  The
+            # older formulation key is retained only as a fallback for legacy
+            # evaluators that do not expose the reward diagnostics.
+            reward_target_speed = _as_float(
+                info.get("karalakou_target_speed"), default=np.nan
             )
+            if np.isfinite(reward_target_speed):
+                target_speed_errors.append(abs(ego_speed - reward_target_speed))
+            else:
+                target_speed_errors.append(
+                    _as_float(
+                        info.get("formulation_abs_target_speed_error"), default=np.nan
+                    )
+                )
             target_lateral_errors.append(
                 _as_float(info.get("formulation_abs_target_lateral_error_m"), default=np.nan)
             )
@@ -2798,6 +2817,12 @@ def evaluate_scenario(
             "mean_abs_target_speed_error": _mean(
                 target_speed_errors, default=np.nan
             ),
+            # Unlike mean_abs_speed_error (which is against the fixed
+            # ego.desired_speed=20 m/s), this is the RMSE against the dynamic
+            # blocker-aware target speed used in the reward denominator.
+            "rmse_target_speed_error": _rmse(
+                target_speed_errors, default=np.nan
+            ),
             "mean_abs_target_lateral_error_m": _mean(
                 target_lateral_errors, default=np.nan
             ),
@@ -3113,6 +3138,7 @@ def summarize_within_training_seed(
         "mean_neighbor_count",
         "mean_traffic_density_per_km",
         "mean_abs_speed_error",
+        "rmse_target_speed_error",
         "mean_jerk_norm",
         "IR",
         "mean_delta_a",
@@ -3319,6 +3345,7 @@ def paired_comparisons(seed_summary: pd.DataFrame) -> pd.DataFrame:
         "mean_vehicle_spacing_m",
         "mean_traffic_density_per_km",
         "mean_abs_speed_error",
+        "rmse_target_speed_error",
         "mean_jerk_norm",
         "IR",
         "mean_delta_a",
@@ -3414,6 +3441,7 @@ def factorial_effects(seed_summary: pd.DataFrame) -> pd.DataFrame:
         "h_violation_rate",
         "near_boundary_rate",
         "mean_abs_speed_error",
+        "rmse_target_speed_error",
         "mean_jerk_norm",
         "IR",
         "mean_delta_a",

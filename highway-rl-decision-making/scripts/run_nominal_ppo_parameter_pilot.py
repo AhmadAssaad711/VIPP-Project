@@ -1770,10 +1770,15 @@ def across_seed_final_three(seed_averages: pd.DataFrame) -> pd.DataFrame:
 
 def rank_final_three(across_seed: pd.DataFrame) -> pd.DataFrame:
     ranked = across_seed.copy()
+    speed_metric = (
+        "rmse_target_speed_error_seed_mean"
+        if "rmse_target_speed_error_seed_mean" in ranked
+        else "mean_abs_speed_error_seed_mean"
+    )
     criteria = {
         "distance_per_collision_exposure_bound_m_seed_mean": False,
         "return_per_timestep_seed_mean": False,
-        "mean_abs_speed_error_seed_mean": True,
+        speed_metric: True,
         "episode_length_mean_seed_mean": False,
         "nominal_action_saturation_rate_seed_mean": True,
     }
@@ -2076,6 +2081,12 @@ def _main_resolved(
             "formula": "total_distance_m / distinct_ego_collision_events",
             "zero_collision_value": "infinity (right-censored)",
         },
+        "primary_speed_tracking_metric": {
+            "name": "rmse_target_speed_error",
+            "formula": "sqrt(mean((ego_speed - karalakou_target_speed)^2))",
+            "target_definition": "the dynamic blocker-aware speed used by the reward",
+            "legacy_comparison_metric": "mean_abs_speed_error",
+        },
         "configurations": {
             name: effective_ppo_config(name, args) for name in selected_configs
         },
@@ -2149,6 +2160,11 @@ def _main_resolved(
         "latest_train_value_loss_seed_mean",
         "latest_train_approx_kl_seed_mean",
     ]
+    if "rmse_target_speed_error_seed_mean" in ranking.columns:
+        report_columns.insert(
+            report_columns.index("mean_abs_speed_error_seed_mean") + 1,
+            "rmse_target_speed_error_seed_mean",
+        )
     print(ranking[report_columns].to_string(index=False), flush=True)
     print(f"[ppo-pilot] complete: {output_dir}", flush=True)
     return 0
