@@ -1051,6 +1051,32 @@ def _as_float(value: Any, default: float = np.nan) -> float:
     return scalar if np.isfinite(scalar) else default
 
 
+def _wrapper_target_speed(env: gym.Env) -> float:
+    """Read the canonical target speed at the current *pre-action* state.
+
+    The reward wrapper publishes ``karalakou_target_speed`` in the info after
+    a transition. That value is useful for executed-state diagnostics, but
+    comparing it with the post-transition speed mixes two different policy
+    timestamps. Walking the wrapper chain and calling the canonical helper
+    keeps the actor metric aligned with the observation on which the action
+    was chosen.
+    """
+
+    current: Any = env
+    visited: set[int] = set()
+    while current is not None and id(current) not in visited:
+        visited.add(id(current))
+        target_fn = getattr(current, "_lateral_target_and_speed", None)
+        if callable(target_fn):
+            try:
+                _target_y, target_speed, _zone_found = target_fn()
+                return float(target_speed)
+            except (TypeError, ValueError, AttributeError, FloatingPointError):
+                return np.nan
+        current = getattr(current, "env", None)
+    return np.nan
+
+
 def seed_everything(seed: int) -> None:
     """Reset all learner-side RNGs before every paired training replicate."""
 
@@ -2266,7 +2292,13 @@ def evaluate_scenario(
         safe_saturations: list[float] = []
         executed_saturations: list[float] = []
         common_form1_rewards: list[float] = []
+        # Actor-state tracking is sampled before the action is applied. The
+        # existing target_speed_errors list remains the post-transition,
+        # executed-state diagnostic for backward compatibility.
+        policy_target_speed_errors: list[float] = []
+        policy_target_speed_signed_errors: list[float] = []
         target_speed_errors: list[float] = []
+        executed_target_speed_signed_errors: list[float] = []
         target_lateral_errors: list[float] = []
         formulation_cf_values: list[float] = []
         boundary_costs: list[float] = []
@@ -2317,6 +2349,13 @@ def evaluate_scenario(
         evaluation_action_hook = namespace.get("ppo_formulation_evaluation_action")
 
         for step in range(timestep_budget):
+            pre_base = env.unwrapped
+            pre_ego_speed = _as_float(getattr(pre_base.vehicle, "vx", np.nan))
+            pre_target_speed = _wrapper_target_speed(env)
+            if np.isfinite(pre_ego_speed) and np.isfinite(pre_target_speed):
+                pre_error = float(pre_ego_speed - pre_target_speed)
+                policy_target_speed_signed_errors.append(pre_error)
+                policy_target_speed_errors.append(abs(pre_error))
             calibration_anchor = bool(
                 calibration_enabled and segment_steps % int(critic_calibration_stride) == 0
             )
@@ -2477,13 +2516,16 @@ def evaluate_scenario(
                 info.get("karalakou_target_speed"), default=np.nan
             )
             if np.isfinite(reward_target_speed):
-                target_speed_errors.append(abs(ego_speed - reward_target_speed))
+                executed_error = float(ego_speed - reward_target_speed)
+                executed_target_speed_signed_errors.append(executed_error)
+                target_speed_errors.append(abs(executed_error))
             else:
-                target_speed_errors.append(
-                    _as_float(
-                        info.get("formulation_abs_target_speed_error"), default=np.nan
-                    )
+                fallback_error = _as_float(
+                    info.get("formulation_abs_target_speed_error"), default=np.nan
                 )
+                target_speed_errors.append(fallback_error)
+                if np.isfinite(fallback_error):
+                    executed_target_speed_signed_errors.append(float(fallback_error))
             primary_speed_error = target_speed_errors[-1]
             if not np.isfinite(primary_speed_error):
                 primary_speed_error = abs(ego_speed - nominal_desired_speed)
@@ -2826,10 +2868,29 @@ def evaluate_scenario(
             "mean_abs_target_speed_error": _mean(
                 target_speed_errors, default=np.nan
             ),
-            # Primary speed error and this RMSE both use the dynamic
-            # blocker-aware target speed used in the reward denominator.
+            # Backward-compatible executed-state diagnostics. These compare
+            # the post-transition speed with the target recomputed in the
+            # transition's info record.
             "rmse_target_speed_error": _rmse(
                 target_speed_errors, default=np.nan
+            ),
+            "mean_abs_executed_target_speed_error": _mean(
+                target_speed_errors, default=np.nan
+            ),
+            "executed_target_speed_bias_mps": _mean(
+                executed_target_speed_signed_errors, default=np.nan
+            ),
+            # Policy-state diagnostics use the target and speed from the
+            # observation state on which the actor chose its action. CBF
+            # filtering cannot retroactively change this quantity.
+            "mean_abs_policy_target_speed_error": _mean(
+                policy_target_speed_errors, default=np.nan
+            ),
+            "policy_target_speed_bias_mps": _mean(
+                policy_target_speed_signed_errors, default=np.nan
+            ),
+            "rmse_policy_target_speed_error": _rmse(
+                policy_target_speed_signed_errors, default=np.nan
             ),
             "mean_abs_target_lateral_error_m": _mean(
                 target_lateral_errors, default=np.nan
@@ -3165,6 +3226,11 @@ def summarize_within_training_seed(
         "executed_action_saturation_rate",
         "common_form1_return_per_timestep",
         "mean_abs_target_speed_error",
+        "mean_abs_policy_target_speed_error",
+        "rmse_policy_target_speed_error",
+        "policy_target_speed_bias_mps",
+        "mean_abs_executed_target_speed_error",
+        "executed_target_speed_bias_mps",
         "mean_abs_target_lateral_error_m",
         "mean_formulation_cf",
         "mean_boundary_cost",

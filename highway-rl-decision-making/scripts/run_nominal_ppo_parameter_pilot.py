@@ -1785,9 +1785,13 @@ def across_seed_final_three(seed_averages: pd.DataFrame) -> pd.DataFrame:
 def rank_final_three(across_seed: pd.DataFrame) -> pd.DataFrame:
     ranked = across_seed.copy()
     speed_metric = (
-        "rmse_target_speed_error_seed_mean"
-        if "rmse_target_speed_error_seed_mean" in ranked
-        else "mean_abs_speed_error_seed_mean"
+        "rmse_policy_target_speed_error_seed_mean"
+        if "rmse_policy_target_speed_error_seed_mean" in ranked
+        else (
+            "rmse_target_speed_error_seed_mean"
+            if "rmse_target_speed_error_seed_mean" in ranked
+            else "mean_abs_speed_error_seed_mean"
+        )
     )
     criteria = {
         "distance_per_collision_exposure_bound_m_seed_mean": False,
@@ -2200,7 +2204,13 @@ def _main_resolved(
         "latest_train_value_loss_seed_mean",
         "latest_train_approx_kl_seed_mean",
     ]
-    if "rmse_target_speed_error_seed_mean" in ranking.columns:
+    policy_rmse_column = "rmse_policy_target_speed_error_seed_mean"
+    if policy_rmse_column in ranking.columns:
+        report_columns.insert(
+            report_columns.index("mean_abs_speed_error_seed_mean") + 1,
+            policy_rmse_column,
+        )
+    elif "rmse_target_speed_error_seed_mean" in ranking.columns:
         report_columns.insert(
             report_columns.index("mean_abs_speed_error_seed_mean") + 1,
             "rmse_target_speed_error_seed_mean",

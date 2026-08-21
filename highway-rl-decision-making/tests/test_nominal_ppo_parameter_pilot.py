@@ -255,7 +255,10 @@ def test_distance_task_completion_requires_a_collision_free_1000m_episode():
 
         def step(self, action):
             del action
-            self.vehicle.position[0] = 1000.0
+            # Deliberately cross the target in one simulator step.  The task
+            # wrapper must report the capped target distance, not this raw
+            # overshoot.
+            self.vehicle.position[0] = 1200.0
             return (
                 np.zeros(1, dtype=np.float32),
                 0.0,
@@ -275,6 +278,9 @@ def test_distance_task_completion_requires_a_collision_free_1000m_episode():
     assert terminated and not truncated
     assert info["task_completed"] is True
     assert info["task_collision_free"] is True
+    assert info["task_distance_traveled_m"] == pytest.approx(1000.0)
+    assert info["task_step_progress_m"] == pytest.approx(1000.0)
+    assert info["task_progress_ratio"] == pytest.approx(1.0)
 
     collided_env = wrapper_cls(
         _DistanceEnv(True), task_distance_m=1000.0, max_steps=None
@@ -285,6 +291,7 @@ def test_distance_task_completion_requires_a_collision_free_1000m_episode():
     assert info["task_completed"] is False
     assert info["task_collision_free"] is False
     assert info["task_collision_events"] == pytest.approx(1.0)
+    assert info["task_distance_traveled_m"] == pytest.approx(1000.0)
 
 
 def test_progress_reward_override_rejects_nonfinite_weight():
