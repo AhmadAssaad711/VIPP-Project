@@ -574,7 +574,7 @@ def aggregate_checkpoint_scenarios(rows: list[dict[str, Any]]) -> dict[str, floa
     )
     episode_length_sum = float(pd.to_numeric(frame["episode_length_sum"], errors="coerce").sum())
     episode_segments = float(pd.to_numeric(frame["episode_segments"], errors="coerce").sum())
-    return {
+    result = {
         "return_per_timestep": pipeline._ratio(total_return, timesteps),
         "total_distance_m": distance_m,
         "distinct_ego_collision_events": collisions,
@@ -587,6 +587,15 @@ def aggregate_checkpoint_scenarios(rows: list[dict[str, Any]]) -> dict[str, floa
         "episode_length_mean": pipeline._ratio(episode_length_sum, episode_segments),
         "nominal_action_saturation_rate": _finite_mean(frame["nominal_action_saturation_rate"]),
     }
+    if "mean_abs_target_speed_error" in frame:
+        result["mean_abs_target_speed_error"] = _finite_mean(
+            frame["mean_abs_target_speed_error"]
+        )
+    if "rmse_target_speed_error" in frame:
+        result["rmse_target_speed_error"] = _finite_mean(
+            frame["rmse_target_speed_error"]
+        )
+    return result
 
 
 def sb3_resume_learn_target_timesteps(target_timesteps: int, current_timesteps: int) -> tuple[int, int]:
@@ -1404,6 +1413,8 @@ def final_three_seed_averages(checkpoint_summary: pd.DataFrame) -> pd.DataFrame:
     rows: list[dict[str, Any]] = []
     base_mean_metrics = (
         "mean_abs_speed_error",
+        "mean_abs_target_speed_error",
+        "rmse_target_speed_error",
         "nominal_action_saturation_rate",
         "first_collision_observed_rate",
         "time_to_first_collision_observed_mean_s",
@@ -1567,10 +1578,15 @@ def across_seed_final_three(seed_averages: pd.DataFrame) -> pd.DataFrame:
 
 def rank_final_three(across_seed: pd.DataFrame) -> pd.DataFrame:
     ranked = across_seed.copy()
+    speed_metric = (
+        "rmse_target_speed_error_seed_mean"
+        if "rmse_target_speed_error_seed_mean" in ranked
+        else "mean_abs_speed_error_seed_mean"
+    )
     criteria = {
         "distance_per_collision_exposure_bound_m_seed_mean": False,
         "return_per_timestep_seed_mean": False,
-        "mean_abs_speed_error_seed_mean": True,
+        speed_metric: True,
         "episode_length_mean_seed_mean": False,
         "nominal_action_saturation_rate_seed_mean": True,
         "critic_mse_seed_mean": True,
@@ -1611,14 +1627,22 @@ def rank_confirmation_rollout(across_seed: pd.DataFrame) -> pd.DataFrame:
     mean_criteria = {
         "distance_per_collision_exposure_bound_m_seed_mean": False,
         "return_per_timestep_seed_mean": False,
-        "mean_abs_speed_error_seed_mean": True,
+        (
+            "rmse_target_speed_error_seed_mean"
+            if "rmse_target_speed_error_seed_mean" in ranked
+            else "mean_abs_speed_error_seed_mean"
+        ): True,
         "episode_length_mean_seed_mean": False,
         "nominal_action_saturation_rate_seed_mean": True,
     }
     worst_criteria = {
         "distance_per_collision_exposure_bound_m_seed_min": False,
         "return_per_timestep_seed_min": False,
-        "mean_abs_speed_error_seed_max": True,
+        (
+            "rmse_target_speed_error_seed_max"
+            if "rmse_target_speed_error_seed_max" in ranked
+            else "mean_abs_speed_error_seed_max"
+        ): True,
         "episode_length_mean_seed_min": False,
         "nominal_action_saturation_rate_seed_max": True,
     }
@@ -1968,6 +1992,12 @@ def _main_resolved(args: argparse.Namespace, project_root: Path, output_dir: Pat
             "secondary_target": "bootstrapped_sensitivity",
             "low_exact_coverage_warning_threshold": MIN_CRITIC_CALIBRATION_EXACT_COVERAGE,
         },
+        "primary_speed_tracking_metric": {
+            "name": "rmse_target_speed_error",
+            "formula": "sqrt(mean((ego_speed - karalakou_target_speed)^2))",
+            "target_definition": "the dynamic blocker-aware speed used by the reward",
+            "legacy_comparison_metric": "mean_abs_speed_error",
+        },
         "episode_reset_reseed": False,
         "configurations": {name: PILOT_CONFIGS[name] for name in selected_configs},
         "env_config": env_config,
@@ -2044,6 +2074,11 @@ def _main_resolved(args: argparse.Namespace, project_root: Path, output_dir: Pat
         "q_abs_max_seed_mean",
         "q_scale_excess_log10_seed_mean",
     ]
+    if "rmse_target_speed_error_seed_mean" in ranking.columns:
+        report_columns.insert(
+            report_columns.index("mean_abs_speed_error_seed_mean") + 1,
+            "rmse_target_speed_error_seed_mean",
+        )
     if args.stage == "confirm":
         report_columns.extend(
             [
