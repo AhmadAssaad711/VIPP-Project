@@ -130,8 +130,8 @@ def validate_common_formulation(
         raise ValueError("The nominal comparison disables the safety potential")
     if float(reward_config.get("w_safe", 0.0)) != 0.0:
         raise ValueError("The nominal comparison requires w_safe=0")
-    if float(reward_config.get("progress_reward_weight", 0.0)) != 0.0:
-        raise ValueError("The nominal comparison freezes progress shaping at zero")
+    if float(reward_config.get("progress_reward_weight", 0.0)) != 0.05:
+        raise ValueError("The nominal comparison expects progress shaping weight 0.05")
 
 
 def _write_json(path: Path, value: Any) -> None:
