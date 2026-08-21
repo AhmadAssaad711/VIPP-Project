@@ -21,6 +21,14 @@ if str(SCRIPTS_DIR) not in sys.path:
 import run_nominal_ppo_parameter_pilot as pilot
 
 
+def test_at1_observation_is_default_with_legacy_opt_out(monkeypatch):
+    monkeypatch.setattr(sys, "argv", ["ppo-pilot"])
+    assert pilot.parse_args().observation_at1 is True
+
+    monkeypatch.setattr(sys, "argv", ["ppo-pilot", "--no-observation-at1"])
+    assert pilot.parse_args().observation_at1 is False
+
+
 def test_ppo_pilot_table_and_exact_boundaries():
     assert list(pilot.PPO_CONFIGS) == [
         "Q0_current_aligned",

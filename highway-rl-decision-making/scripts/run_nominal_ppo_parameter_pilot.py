@@ -1905,10 +1905,18 @@ def parse_args() -> argparse.Namespace:
         default=DEFAULT_GLOBAL_ROLLOUT_SIZE,
         help="global transitions collected per PPO update (must divide checkpoint interval)",
     )
-    parser.add_argument(
+    observation_group = parser.add_mutually_exclusive_group()
+    observation_group.add_argument(
         "--observation-at1",
+        dest="observation_at1",
         action="store_true",
-        help="append the previous normalized executed action a[t-1] to the y-target observation",
+        help="append the previous normalized executed action a[t-1] (default)",
+    )
+    observation_group.add_argument(
+        "--no-observation-at1",
+        dest="observation_at1",
+        action="store_false",
+        help="use the legacy 30D target-y observation without a[t-1]",
     )
     parser.add_argument(
         "--progress-reward-weight",
@@ -1944,7 +1952,12 @@ def parse_args() -> argparse.Namespace:
         "--correction-epsilon", type=float, default=0.03, help=argparse.SUPPRESS
     )
     add_env_config_args(parser)
-    parser.set_defaults(traffic_model="mtm", env_config_json=None, env_config_file=None)
+    parser.set_defaults(
+        traffic_model="mtm",
+        env_config_json=None,
+        env_config_file=None,
+        observation_at1=True,
+    )
     return parser.parse_args()
 
 
@@ -2013,9 +2026,9 @@ def _main_resolved(
     reward_config = apply_reward_overrides(
         pipeline.make_base_reward_config(namespace), args
     )
-    # Both pilots in this study expose the desired lateral target in the
-    # existing second observation slot.  The optional at-1 variant appends the
-    # previous normalized command for jerk-aware policy conditioning.
+    # The canonical MTM PPO pilot exposes the desired lateral target and the
+    # previous normalized command for jerk-aware policy conditioning.  The
+    # explicit --no-observation-at1 switch preserves the legacy 30D contract.
     reward_config["expose_target_y"] = True
     if bool(args.observation_at1):
         install_previous_action_observation(namespace)
