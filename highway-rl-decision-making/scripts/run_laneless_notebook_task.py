@@ -168,27 +168,28 @@ TASKS = {
         "deps": [2, 3, 5, 6, 8],
         "cell": 11,
         # The canonical notebook setup cell only defines the shared launcher.
-        # These four cells invoke its sequential 1M-per-policy runners.
-        "train_cells": [13, 15, 17, 19],
+        # These eight cells invoke its sequential 1M-per-policy runners.
+        "train_cells": [13, 15, 17, 19, 21, 23, 25, 27],
+        "post_cells": [29, 30],
         "flag": "PPO_1M_RUN_TRAINING",
         "timesteps_key": "PPO_1M_TIMESTEPS_PER_POLICY",
         "n_envs_key": "PPO_1M_NUM_ENVS",
     },
     "ddpg-train": {
         "deps": [2, 3, 5, 6, 8, 9],
-        "cell": 22,
+        "cell": 35,
         "flag": "RUN_DDPG_TRAIN",
         "timesteps_key": "DDPG_TOTAL_TIMESTEPS",
     },
     "ddpg-cbf-train": {
-        "deps": [2, 3, 5, 6, 8, 9, 31, 33, 35, 37, 39, 41],
-        "cell": 43,
+        "deps": [2, 3, 5, 6, 8, 9, 44, 46, 48, 50, 52, 54],
+        "cell": 56,
         "flag": "RUN_DDPG_CBF_TRAIN",
         "timesteps_key": "DDPG_CBF_TOTAL_TIMESTEPS",
     },
     "guided-ddpg-cbf-train": {
-        "deps": [2, 3, 5, 6, 8, 9, 31, 33, 35, 37, 39, 41],
-        "cell": 51,
+        "deps": [2, 3, 5, 6, 8, 9, 44, 46, 48, 50, 52, 54],
+        "cell": 66,
         "flag": "RUN_GUIDED_DDPG_CBF_TRAIN",
         "timesteps_key": "GUIDED_DDPG_CBF_TOTAL_TIMESTEPS",
     },
@@ -236,7 +237,7 @@ def main() -> int:
     notebook = json.loads(notebook_path.read_text(encoding="utf-8"))
     for cell_index in task["deps"]:
         exec_notebook_cell(notebook, notebook_path, cell_index, namespace)
-        if cell_index in {6, 33}:
+        if cell_index in {6, 46}:
             apply_overrides(namespace, args, task)
     apply_overrides(namespace, args, task)
     apply_traffic_artifact_suffix(namespace, args.artifact_suffix)
@@ -282,12 +283,12 @@ def main() -> int:
     )
     if args.task == "ddpg-cbf-train":
         # This process is already the isolated child requested by notebook
-        # cell 43.  Re-enter the cell's in-process branch instead of spawning
+        # cell 56.  Re-enter the cell's in-process branch instead of spawning
         # another copy of this runner recursively.
         namespace["RUN_DDPG_CBF_TRAIN_SUBPROCESS"] = False
     if args.task == "guided-ddpg-cbf-train":
         # This runner is already the isolated training subprocess requested by
-        # notebook cell 51.  Disable that cell's optional subprocess delegate
+        # notebook cell 66.  Disable that cell's optional subprocess delegate
         # here; otherwise each child re-enters the same cell and recursively
         # launches more guided-training children instead of training.
         namespace["RUN_GUIDED_DDPG_CBF_TRAIN_SUBPROCESS"] = False
@@ -304,11 +305,13 @@ def main() -> int:
         exec_notebook_cell(notebook, notebook_path, int(task["cell"]), namespace)
         for followup_cell in task.get("train_cells", []):
             exec_notebook_cell(notebook, notebook_path, int(followup_cell), namespace)
+        for post_cell in task.get("post_cells", []):
+            exec_notebook_cell(notebook, notebook_path, int(post_cell), namespace)
     if args.task == "ppo-train":
-        # Each of the four notebook runners owns its model manifest and paired
+        # Each of the eight notebook runners owns its model manifest and paired
         # 200-OFF/200-ON evaluation artifacts, so the legacy single-model
         # archive path below does not apply.
-        print("[notebook-task] completed canonical four-policy PPO-CBF ladder", flush=True)
+        print("[notebook-task] completed canonical eight-policy PPO-CBF ladder", flush=True)
         return 0
 
     tensorboard_after = snapshot_tensorboard_events(tensorboard_roots)

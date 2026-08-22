@@ -16,6 +16,8 @@ if str(SCRIPTS) not in sys.path:
 from cbf_projection import CBFContextLayout, append_cbf_context  # noqa: E402
 from projected_ppo_cbf import (  # noqa: E402
     CBFSafetyRolloutBuffer,
+    DetachedCBFActorCriticPolicy,
+    DetachedCBFActorPPO,
     LatentActionPPO,
     ProjectedCBFActorCriticPolicy,
     ProjectedCBFPPO,
@@ -207,6 +209,81 @@ class _ProjectionRecordEnv(gym.Env):
         self.raw_actions.append(raw)
         self.executed_actions.append(action.copy())
         return self.observation.copy(), 0.0, False, False, {}
+
+
+def test_detached_actor_target_has_exact_local_gradient_and_no_solver_graph():
+    env = _ProjectionRecordEnv()
+    model = DetachedCBFActorPPO(
+        DetachedCBFActorCriticPolicy,
+        env,
+        execution_mode="cbf",
+        lambda_actor=0.1,
+        learning_rate=0.0,
+        n_steps=2,
+        batch_size=2,
+        n_epochs=1,
+        seed=7,
+        device="cpu",
+        policy_kwargs={
+            "net_arch": {"pi": [8], "vf": [8]},
+            "ortho_init": False,
+            "log_std_init": -20.0,
+        },
+    )
+    with th.no_grad():
+        model.policy.action_net.weight.zero_()
+        model.policy.action_net.bias.copy_(th.tensor([2.0, 0.0]))
+
+    observations = th.tensor(_augmented_observation()[None], dtype=th.float32)
+    evaluation = model.policy.evaluate_actions_with_mean(
+        observations, th.zeros((1, 2), dtype=th.float32)
+    )
+    projection = model.project_actor_mean_detached(
+        observations, evaluation.mu_raw
+    )
+    loss, correction, infeasible_rate = model.detached_actor_loss(
+        evaluation.mu_raw, projection
+    )
+    gradient = th.autograd.grad(loss, model.policy.action_net.bias)[0]
+
+    assert not projection.action.requires_grad
+    th.testing.assert_close(projection.action[0], th.tensor([0.0, 0.0]))
+    # D = ||mu - stopgrad(P(mu))||^2, so dD/dmu_x = 2 * (2 - 0) = 4.
+    th.testing.assert_close(gradient, th.tensor([4.0, 0.0]), atol=1e-6, rtol=0.0)
+    th.testing.assert_close(correction, th.tensor(2.0), atol=1e-6, rtol=0.0)
+    th.testing.assert_close(infeasible_rate, th.tensor(0.0))
+
+
+def test_detached_ppo_save_load_keeps_plain_critic_and_feedback_coefficient(
+    tmp_path,
+):
+    env = _ProjectionRecordEnv()
+    model = DetachedCBFActorPPO(
+        DetachedCBFActorCriticPolicy,
+        env,
+        execution_mode="cbf",
+        lambda_actor=0.17,
+        learning_rate=0.0,
+        n_steps=2,
+        batch_size=2,
+        n_epochs=1,
+        seed=8,
+        device="cpu",
+        policy_kwargs={
+            "net_arch": {"pi": [8], "vf": [8]},
+            "ortho_init": False,
+            "log_std_init": -20.0,
+        },
+    )
+    assert not hasattr(model.policy, "safety_value_net")
+    path = tmp_path / "detached_cbf_actor_ppo"
+    model.save(path)
+
+    loaded = DetachedCBFActorPPO.load(path, device="cpu")
+    assert isinstance(loaded, DetachedCBFActorPPO)
+    assert isinstance(loaded.policy, DetachedCBFActorCriticPolicy)
+    assert not hasattr(loaded.policy, "safety_value_net")
+    assert loaded.lambda_actor == 0.17
 
 
 def test_rollout_buffer_stores_unclipped_z_while_env_receives_projection():

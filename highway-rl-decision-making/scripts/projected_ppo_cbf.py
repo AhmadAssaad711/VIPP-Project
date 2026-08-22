@@ -1,8 +1,9 @@
-"""PPO with a differentiable CBF-projected policy mean.
+"""PPO variants with hard CBF execution and optional actor integration.
 
 Data semantics are intentionally explicit:
 
-* the policy distribution is ``Normal(mu_safe, sigma)``;
+* a detached-feedback policy uses ``Normal(mu_raw, sigma)``;
+* a differentiable projected policy uses ``Normal(mu_safe, sigma)``;
 * the rollout buffer action is the latent Gaussian sample ``z``;
 * its stored log probability is ``log pi(z | s)``;
 * the simulator receives the separate hard projection ``P_s(z)``.
@@ -223,6 +224,87 @@ class ProjectedPolicyEvaluation:
     mu_raw: th.Tensor
     mu_safe: th.Tensor
     projection: TorchProjection2D
+
+
+@dataclass(frozen=True)
+class DetachedPolicyEvaluation:
+    """Standard PPO outputs plus the unprojected actor mean."""
+
+    values: th.Tensor
+    log_prob: th.Tensor
+    entropy: Optional[th.Tensor]
+    distribution: DiagGaussianDistribution
+    mu_raw: th.Tensor
+
+
+class DetachedCBFActorCriticPolicy(ActorCriticPolicy):
+    """Ordinary Gaussian actor that exposes its mean for detached CBF feedback.
+
+    The CBF context is available to the algorithm when it constructs the safe
+    target, but it is deliberately excluded from the learned actor and value
+    features.  Unlike :class:`ProjectedCBFActorCriticPolicy`, this policy never
+    places the projection in its forward graph or changes its distribution.
+    """
+
+    def __init__(
+        self,
+        *args,
+        cbf_base_observation_dim: int = 42,
+        **kwargs,
+    ) -> None:
+        if kwargs.get("use_sde", False):
+            raise ValueError("DetachedCBFActorCriticPolicy does not support gSDE")
+        extractor_class = kwargs.pop(
+            "features_extractor_class", CBFBaseFeaturesExtractor
+        )
+        if extractor_class is not CBFBaseFeaturesExtractor:
+            raise ValueError(
+                "Detached CBF actor feedback requires CBFBaseFeaturesExtractor "
+                "so context cannot leak into the learned state representation"
+            )
+        extractor_kwargs = dict(kwargs.pop("features_extractor_kwargs", {}) or {})
+        extractor_kwargs["base_observation_dim"] = int(cbf_base_observation_dim)
+        kwargs["features_extractor_class"] = CBFBaseFeaturesExtractor
+        kwargs["features_extractor_kwargs"] = extractor_kwargs
+        super().__init__(*args, **kwargs)
+        if not isinstance(self.action_dist, DiagGaussianDistribution):
+            raise TypeError(
+                "Detached CBF actor feedback requires a diagonal Gaussian action distribution"
+            )
+        if not isinstance(self.action_space, spaces.Box) or tuple(
+            self.action_space.shape
+        ) != (2,):
+            raise TypeError(
+                "Detached CBF actor feedback requires a two-dimensional Box action space"
+            )
+
+    def _latents(self, obs: th.Tensor) -> tuple[th.Tensor, th.Tensor]:
+        features = self.extract_features(obs)
+        if self.share_features_extractor:
+            return self.mlp_extractor(features)
+        pi_features, vf_features = features
+        return (
+            self.mlp_extractor.forward_actor(pi_features),
+            self.mlp_extractor.forward_critic(vf_features),
+        )
+
+    def evaluate_actions_with_mean(
+        self, obs: th.Tensor, actions: th.Tensor
+    ) -> DetachedPolicyEvaluation:
+        """Evaluate stored latent actions without projecting the distribution."""
+
+        latent_pi, latent_vf = self._latents(obs)
+        distribution = self._get_action_dist_from_latent(latent_pi)
+        if not isinstance(distribution, DiagGaussianDistribution):
+            raise TypeError("Expected a diagonal Gaussian policy distribution")
+        values = self.value_net(latent_vf)
+        return DetachedPolicyEvaluation(
+            values=values,
+            log_prob=distribution.log_prob(actions),
+            entropy=distribution.entropy(),
+            distribution=distribution,
+            mu_raw=distribution.distribution.mean,
+        )
 
 
 class ProjectedCBFActorCriticPolicy(ActorCriticPolicy):
@@ -738,6 +820,286 @@ def _gradient_pair_diagnostics(
     }
 
 
+class DetachedCBFActorPPO(LatentActionPPO):
+    """Ordinary PPO plus a stopped-gradient hard-CBF actor target.
+
+    The policy distribution remains ``Normal(mu_raw, sigma)``.  At every PPO
+    minibatch update, the current mean is projected with the hard CBF solver
+    under ``no_grad`` and the actor minimizes ``||mu_raw - stopgrad(P(mu_raw))||^2``.
+    PPO still evaluates the original latent rollout action and its original
+    log probability, so the non-differentiable filter remains part of the
+    environment rather than being mistaken for a transformed distribution.
+    """
+
+    policy_aliases = {
+        **PPO.policy_aliases,
+        "DetachedCBFPolicy": DetachedCBFActorCriticPolicy,
+    }
+
+    def __init__(
+        self,
+        *args,
+        lambda_actor: float = 0.10,
+        **kwargs,
+    ) -> None:
+        self.lambda_actor = float(lambda_actor)
+        if not np.isfinite(self.lambda_actor) or self.lambda_actor < 0.0:
+            raise ValueError("lambda_actor must be finite and non-negative")
+        requested_execution_mode = str(
+            kwargs.get("execution_mode", "cbf")
+        ).strip().lower()
+        if requested_execution_mode != "cbf":
+            raise ValueError(
+                "DetachedCBFActorPPO requires execution_mode='cbf' so its "
+                "feedback target matches hard-CBF training execution"
+            )
+        kwargs["execution_mode"] = "cbf"
+        self.cbf_training_diagnostics: list[dict[str, float]] = []
+        super().__init__(*args, **kwargs)
+        # SB3 load() first constructs with _init_setup_model=False and restores
+        # the serialized policy afterward, so only validate an initialized one.
+        if hasattr(self, "policy") and not isinstance(
+            self.policy, DetachedCBFActorCriticPolicy
+        ):
+            raise TypeError(
+                "DetachedCBFActorPPO must use DetachedCBFActorCriticPolicy"
+            )
+
+    def project_actor_mean_detached(
+        self,
+        observations: th.Tensor,
+        mean_actions: th.Tensor,
+    ) -> TorchProjection2D:
+        """Return a current-mean CBF target with no solver gradient path."""
+
+        with th.no_grad():
+            _, rows, bounds, mask = split_cbf_context_torch(
+                observations, layout=self.cbf_layout
+            )
+            return project_polytope_2d_torch(
+                mean_actions.detach(),
+                rows,
+                bounds,
+                mask,
+                feasibility_tol=self.cbf_feasibility_tol,
+                action_low=th.as_tensor(
+                    self.action_space.low,
+                    dtype=observations.dtype,
+                    device=observations.device,
+                ),
+                action_high=th.as_tensor(
+                    self.action_space.high,
+                    dtype=observations.dtype,
+                    device=observations.device,
+                ),
+            )
+
+    @staticmethod
+    def detached_actor_loss(
+        mean_actions: th.Tensor,
+        projection: TorchProjection2D,
+    ) -> tuple[th.Tensor, th.Tensor, th.Tensor]:
+        """Compute the feasible-target loss, correction, and infeasible rate."""
+
+        safe_target = projection.action.detach()
+        delta = mean_actions - safe_target
+        feasible = projection.feasible.to(delta.dtype)
+        denominator = feasible.sum().clamp_min(1.0)
+        loss = (delta.square().sum(dim=1) * feasible).sum() / denominator
+        correction = (
+            th.linalg.vector_norm(delta.detach(), dim=1) * feasible
+        ).sum() / denominator
+        infeasible_rate = (~projection.feasible).float().mean()
+        return loss, correction, infeasible_rate
+
+    def train(self) -> None:
+        """Run standard PPO with one detached, actor-only CBF regularizer."""
+
+        if not isinstance(self.policy, DetachedCBFActorCriticPolicy):
+            raise TypeError(
+                "DetachedCBFActorPPO requires DetachedCBFActorCriticPolicy"
+            )
+        self.policy.set_training_mode(True)
+        self._update_learning_rate(self.policy.optimizer)
+        clip_range = self.clip_range(self._current_progress_remaining)
+        if self.clip_range_vf is not None:
+            clip_range_vf = self.clip_range_vf(self._current_progress_remaining)
+
+        entropy_losses: list[float] = []
+        pg_losses: list[float] = []
+        value_losses: list[float] = []
+        clip_fractions: list[float] = []
+        mean_losses: list[float] = []
+        mean_corrections: list[float] = []
+        mean_infeasible_rates: list[float] = []
+        gradient_rows: list[dict[str, float]] = []
+        all_approx_kl_divs: list[float] = []
+        continue_training = True
+        last_loss = th.zeros((), device=self.device)
+
+        actor_parameters = [
+            parameter
+            for name, parameter in self.policy.named_parameters()
+            if parameter.requires_grad
+            and not name.startswith(("value_net", "mlp_extractor.value_net"))
+        ]
+
+        for epoch in range(self.n_epochs):
+            epoch_approx_kl_divs: list[float] = []
+            for rollout_data in self.rollout_buffer.get(self.batch_size):
+                evaluation = self.policy.evaluate_actions_with_mean(
+                    rollout_data.observations, rollout_data.actions
+                )
+                values = evaluation.values.flatten()
+                advantages = rollout_data.advantages
+                if self.normalize_advantage and len(advantages) > 1:
+                    advantages = (advantages - advantages.mean()) / (
+                        advantages.std() + 1e-8
+                    )
+
+                ratio = th.exp(evaluation.log_prob - rollout_data.old_log_prob)
+                policy_loss_1 = advantages * ratio
+                policy_loss_2 = advantages * th.clamp(
+                    ratio, 1 - clip_range, 1 + clip_range
+                )
+                policy_loss = -th.min(policy_loss_1, policy_loss_2).mean()
+                pg_losses.append(float(policy_loss.detach().cpu().item()))
+                clip_fractions.append(
+                    float(th.mean((th.abs(ratio - 1) > clip_range).float()).item())
+                )
+
+                if self.clip_range_vf is None:
+                    values_pred = values
+                else:
+                    values_pred = rollout_data.old_values + th.clamp(
+                        values - rollout_data.old_values,
+                        -clip_range_vf,
+                        clip_range_vf,
+                    )
+                value_loss = F.mse_loss(rollout_data.returns, values_pred)
+                value_losses.append(float(value_loss.detach().cpu().item()))
+
+                if evaluation.entropy is None:
+                    entropy_loss = -th.mean(-evaluation.log_prob)
+                else:
+                    entropy_loss = -th.mean(evaluation.entropy)
+                entropy_losses.append(float(entropy_loss.detach().cpu().item()))
+
+                projection = self.project_actor_mean_detached(
+                    rollout_data.observations, evaluation.mu_raw
+                )
+                mean_loss, mean_correction, mean_infeasible_rate = (
+                    self.detached_actor_loss(evaluation.mu_raw, projection)
+                )
+                mean_losses.append(float(mean_loss.detach().cpu().item()))
+                mean_corrections.append(
+                    float(mean_correction.detach().cpu().item())
+                )
+                mean_infeasible_rates.append(
+                    float(mean_infeasible_rate.detach().cpu().item())
+                )
+
+                actor_primary_loss = policy_loss + self.ent_coef * entropy_loss
+                actor_auxiliary_loss = self.lambda_actor * mean_loss
+                # One representative gradient comparison per PPO train() call
+                # is enough for diagnostics.  Computing it for every minibatch
+                # would add two extra autograd passes throughout a 1M run.
+                if self.lambda_actor != 0.0 and not gradient_rows:
+                    gradient_rows.append(
+                        _gradient_pair_diagnostics(
+                            actor_parameters,
+                            actor_primary_loss,
+                            actor_auxiliary_loss,
+                        )
+                    )
+                loss = (
+                    actor_primary_loss
+                    + self.vf_coef * value_loss
+                    + actor_auxiliary_loss
+                )
+                last_loss = loss
+
+                with th.no_grad():
+                    log_ratio = evaluation.log_prob - rollout_data.old_log_prob
+                    approx_kl_div = th.mean(
+                        (th.exp(log_ratio) - 1) - log_ratio
+                    ).cpu().item()
+                    epoch_approx_kl_divs.append(float(approx_kl_div))
+                    all_approx_kl_divs.append(float(approx_kl_div))
+                if (
+                    self.target_kl is not None
+                    and approx_kl_div > 1.5 * self.target_kl
+                ):
+                    continue_training = False
+                    if self.verbose >= 1:
+                        print(
+                            f"Early stopping at step {epoch} due to reaching "
+                            f"max kl: {approx_kl_div:.2f}"
+                        )
+                    break
+
+                self.policy.optimizer.zero_grad()
+                loss.backward()
+                th.nn.utils.clip_grad_norm_(
+                    self.policy.parameters(), self.max_grad_norm
+                )
+                self.policy.optimizer.step()
+
+            self._n_updates += 1
+            if not continue_training:
+                break
+
+        explained_var = explained_variance(
+            self.rollout_buffer.values.flatten(),
+            self.rollout_buffer.returns.flatten(),
+        )
+        self.logger.record("train/entropy_loss", np.mean(entropy_losses))
+        self.logger.record("train/policy_gradient_loss", np.mean(pg_losses))
+        self.logger.record("train/value_loss", np.mean(value_losses))
+        self.logger.record("train/approx_kl", np.mean(all_approx_kl_divs))
+        self.logger.record("train/clip_fraction", np.mean(clip_fractions))
+        self.logger.record("train/loss", float(last_loss.detach().cpu().item()))
+        self.logger.record("train/explained_variance", explained_var)
+        self.logger.record("train/cbf_detached_actor_lambda", self.lambda_actor)
+        self.logger.record("train/cbf_mean_loss", np.mean(mean_losses))
+        self.logger.record(
+            "train/cbf_mean_correction", np.mean(mean_corrections)
+        )
+        self.logger.record(
+            "train/cbf_mean_infeasible_rate", np.mean(mean_infeasible_rates)
+        )
+        gradient_summary: dict[str, float] = {}
+        if gradient_rows:
+            for key in gradient_rows[0]:
+                finite = [
+                    row[key] for row in gradient_rows if np.isfinite(row[key])
+                ]
+                gradient_summary[key] = (
+                    float(np.mean(finite)) if finite else np.nan
+                )
+                self.logger.record(f"train/actor_{key}", gradient_summary[key])
+        self.cbf_training_diagnostics.append(
+            {
+                "n_updates": float(self._n_updates),
+                "num_timesteps": float(self.num_timesteps),
+                "mean_loss": float(np.mean(mean_losses)),
+                "mean_correction": float(np.mean(mean_corrections)),
+                "mean_infeasible_rate": float(np.mean(mean_infeasible_rates)),
+                **gradient_summary,
+            }
+        )
+        if hasattr(self.policy, "log_std"):
+            self.logger.record(
+                "train/std", th.exp(self.policy.log_std).mean().item()
+            )
+        self.logger.record(
+            "train/n_updates", self._n_updates, exclude="tensorboard"
+        )
+        self.logger.record("train/clip_range", clip_range)
+        if self.clip_range_vf is not None:
+            self.logger.record("train/clip_range_vf", clip_range_vf)
+
+
 class ProjectedCBFPPO(LatentActionPPO):
     """PPO with actor internalization and an auxiliary CBF safety critic."""
 
@@ -975,7 +1337,10 @@ class ProjectedCBFPPO(LatentActionPPO):
                     + self.lambda_sample * sample_loss
                 )
                 critic_auxiliary_loss = self.lambda_critic * safety_critic_loss
-                if self.lambda_mean != 0.0 or self.lambda_sample != 0.0:
+                if (
+                    (self.lambda_mean != 0.0 or self.lambda_sample != 0.0)
+                    and not gradient_rows
+                ):
                     actor_primary_loss = (
                         policy_loss + self.ent_coef * entropy_loss
                     )

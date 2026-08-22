@@ -46,6 +46,7 @@ def _signature_args(**overrides: object) -> SimpleNamespace:
         "lambda_delta": 0.05,
         "lambda_intervention": 0.10,
         "lambda_mean": 0.10,
+        "lambda_detached_actor": 0.10,
         "lambda_sample": 0.0,
         "lambda_critic": 0.10,
         "safety_critic_gamma": 0.99,
@@ -106,6 +107,9 @@ def test_progression_contains_the_required_causal_controls():
         "ppo_nominal",
         "ppo_cbf_shield_only",
         "ppo_cbf_reward",
+        "ppo_cbf_nd_reward_actor",
+        "ppo_cbf_nd_actor_only",
+        "ppo_cbf_diff_reward_only",
         "ppo_cbf_projected_reward_off",
         "ppo_cbf_projected",
         "ppo_cbf_integrated_actor_critic",
@@ -114,6 +118,13 @@ def test_progression_contains_the_required_causal_controls():
     nominal = progression.VARIANT_SPECS["ppo_nominal"]
     shield_only = progression.VARIANT_SPECS["ppo_cbf_shield_only"]
     reward = progression.VARIANT_SPECS["ppo_cbf_reward"]
+    reward_actor = progression.VARIANT_SPECS["ppo_cbf_nd_reward_actor"]
+    detached_actor_only = progression.VARIANT_SPECS[
+        "ppo_cbf_nd_actor_only"
+    ]
+    differentiable_reward_only = progression.VARIANT_SPECS[
+        "ppo_cbf_diff_reward_only"
+    ]
     projected_reward_off = progression.VARIANT_SPECS[
         "ppo_cbf_projected_reward_off"
     ]
@@ -128,12 +139,28 @@ def test_progression_contains_the_required_causal_controls():
     assert not shield_only["reward_penalty"]
     assert reward["execution_mode"] == "cbf"
     assert reward["reward_penalty"]
+    assert not reward["detached_actor_loss"]
+    assert reward_actor["execution_mode"] == "cbf"
+    assert reward_actor["reward_penalty"]
+    assert reward_actor["detached_actor_loss"]
+    assert not reward_actor["projected_mean"]
+    assert detached_actor_only["execution_mode"] == "cbf"
+    assert not detached_actor_only["reward_penalty"]
+    assert detached_actor_only["detached_actor_loss"]
+    assert not detached_actor_only["projected_mean"]
+    assert differentiable_reward_only["projected_mean"]
+    assert differentiable_reward_only["reward_penalty"]
+    assert not differentiable_reward_only["differentiable_actor_loss"]
     assert projected_reward_off["projected_mean"]
     assert not projected_reward_off["reward_penalty"]
+    assert projected_reward_off["differentiable_actor_loss"]
     assert projected["projected_mean"]
+    assert projected["differentiable_actor_loss"]
     assert actor_critic["projected_mean"]
+    assert actor_critic["differentiable_actor_loss"]
     assert actor_critic["safety_critic"]
     assert actor_only["projected_mean"]
+    assert actor_only["differentiable_actor_loss"]
     assert not actor_only["safety_critic"]
     assert progression.FILTERED_FACTORIAL_VARIANTS == {
         (False, False): "ppo_cbf_shield_only",
@@ -626,6 +653,221 @@ def test_inactive_variant_lambdas_do_not_change_checkpoint_identity():
     assert first == second
 
 
+def test_non_differentiable_actor_variants_have_exact_loss_contracts():
+    reward_actor = _training_signature(
+        variant="ppo_cbf_nd_reward_actor",
+        lambda_delta=0.05,
+        lambda_intervention=0.10,
+        lambda_detached_actor=0.25,
+        lambda_mean=99.0,
+        lambda_critic=88.0,
+    )
+    actor_only = _training_signature(
+        variant="ppo_cbf_nd_actor_only",
+        lambda_delta=77.0,
+        lambda_intervention=66.0,
+        lambda_detached_actor=0.25,
+        lambda_mean=99.0,
+        lambda_critic=88.0,
+    )
+
+    reward_settings = reward_actor["effective_training_settings"]
+    actor_only_settings = actor_only["effective_training_settings"]
+    assert reward_settings["lambda_delta"] == 0.05
+    assert reward_settings["lambda_intervention"] == 0.10
+    assert reward_settings["lambda_detached_actor"] == 0.25
+    assert actor_only_settings["lambda_delta"] == 0.0
+    assert actor_only_settings["lambda_intervention"] == 0.0
+    assert actor_only_settings["lambda_detached_actor"] == 0.25
+    for settings in (reward_settings, actor_only_settings):
+        assert settings["lambda_mean"] == 0.0
+        assert settings["lambda_sample"] == 0.0
+        assert settings["lambda_critic"] == 0.0
+
+    for signature in (reward_actor, actor_only):
+        contract = signature["model_contract"]
+        assert contract["algorithm_class"] == "DetachedCBFActorPPO"
+        assert contract["policy_class"] == "DetachedCBFActorCriticPolicy"
+        assert contract["detached_actor_loss_enabled"]
+        assert contract["actor_cbf_gradient_path"] == (
+            "stop_gradient_hard_projection_target"
+        )
+        assert not contract["safety_critic_loss_enabled"]
+
+
+def test_differentiable_variants_have_exact_reward_actor_critic_contracts():
+    reward_only = _training_signature(
+        variant="ppo_cbf_diff_reward_only",
+        lambda_delta=0.05,
+        lambda_intervention=0.10,
+        lambda_mean=0.25,
+        lambda_sample=0.07,
+        lambda_critic=0.40,
+    )
+    reward_actor = _training_signature(
+        variant="ppo_cbf_integrated_actor_only",
+        lambda_delta=0.05,
+        lambda_intervention=0.10,
+        lambda_mean=0.25,
+        lambda_sample=0.07,
+        lambda_critic=0.40,
+    )
+    actor_only = _training_signature(
+        variant="ppo_cbf_projected_reward_off",
+        lambda_delta=55.0,
+        lambda_intervention=44.0,
+        lambda_mean=0.25,
+        lambda_sample=0.07,
+        lambda_critic=0.40,
+    )
+    actor_critic = _training_signature(
+        variant="ppo_cbf_integrated_actor_critic",
+        lambda_delta=0.05,
+        lambda_intervention=0.10,
+        lambda_mean=0.25,
+        lambda_sample=0.07,
+        lambda_critic=0.40,
+    )
+
+    reward_only_settings = reward_only["effective_training_settings"]
+    assert reward_only_settings["lambda_delta"] == 0.05
+    assert reward_only_settings["lambda_intervention"] == 0.10
+    assert reward_only_settings["lambda_mean"] == 0.0
+    assert reward_only_settings["lambda_sample"] == 0.0
+    assert reward_only_settings["lambda_critic"] == 0.0
+
+    reward_actor_settings = reward_actor["effective_training_settings"]
+    assert reward_actor_settings["lambda_delta"] == 0.05
+    assert reward_actor_settings["lambda_intervention"] == 0.10
+    assert reward_actor_settings["lambda_mean"] == 0.25
+    assert reward_actor_settings["lambda_sample"] == 0.07
+    assert reward_actor_settings["lambda_critic"] == 0.0
+
+    actor_only_settings = actor_only["effective_training_settings"]
+    assert actor_only_settings["lambda_delta"] == 0.0
+    assert actor_only_settings["lambda_intervention"] == 0.0
+    assert actor_only_settings["lambda_mean"] == 0.25
+    assert actor_only_settings["lambda_sample"] == 0.07
+    assert actor_only_settings["lambda_critic"] == 0.0
+
+    actor_critic_settings = actor_critic["effective_training_settings"]
+    assert actor_critic_settings["lambda_delta"] == 0.05
+    assert actor_critic_settings["lambda_intervention"] == 0.10
+    assert actor_critic_settings["lambda_mean"] == 0.25
+    assert actor_critic_settings["lambda_sample"] == 0.07
+    assert actor_critic_settings["lambda_critic"] == 0.40
+
+    for signature in (reward_only, reward_actor, actor_only, actor_critic):
+        contract = signature["model_contract"]
+        assert contract["algorithm_class"] == "ProjectedCBFPPO"
+        assert contract["policy_class"] == "ProjectedCBFActorCriticPolicy"
+        assert not contract["detached_actor_loss_enabled"]
+    assert not reward_only["model_contract"][
+        "differentiable_actor_loss_enabled"
+    ]
+    assert reward_only["model_contract"]["actor_cbf_gradient_path"] == (
+        "differentiable_projection_only"
+    )
+    for signature in (reward_actor, actor_only, actor_critic):
+        assert signature["model_contract"][
+            "differentiable_actor_loss_enabled"
+        ]
+        assert signature["model_contract"]["actor_cbf_gradient_path"] == (
+            "differentiable_projection_plus_auxiliary_mean_loss"
+        )
+
+
+def test_build_model_dispatches_both_detached_variants(monkeypatch, tmp_path):
+    calls = []
+    sentinel = object()
+
+    def fake_detached_model(policy, env, **kwargs):
+        calls.append((policy, env, kwargs))
+        return sentinel
+
+    monkeypatch.setattr(
+        progression, "DetachedCBFActorPPO", fake_detached_model
+    )
+    args = _signature_args(n_envs=1, device="cpu")
+    config = progression.resolved_ppo_config(args)
+    train_env = object()
+
+    for variant in (
+        "ppo_cbf_nd_reward_actor",
+        "ppo_cbf_nd_actor_only",
+    ):
+        result = progression.build_model(
+            variant=variant,
+            train_env=train_env,
+            config=config,
+            training_seed=307,
+            args=args,
+            tensorboard_log=tmp_path,
+            base_observation_dim=32,
+        )
+        assert result is sentinel
+
+    assert len(calls) == 2
+    for policy, env, kwargs in calls:
+        assert policy is progression.DetachedCBFActorCriticPolicy
+        assert env is train_env
+        assert kwargs["lambda_actor"] == 0.10
+        assert kwargs["execution_mode"] == "cbf"
+        assert kwargs["policy_kwargs"]["cbf_base_observation_dim"] == 32
+
+
+def test_build_model_gates_each_differentiable_auxiliary_loss(
+    monkeypatch, tmp_path
+):
+    calls = []
+    sentinel = object()
+
+    def fake_projected_model(policy, env, **kwargs):
+        calls.append((policy, env, kwargs))
+        return sentinel
+
+    monkeypatch.setattr(progression, "ProjectedCBFPPO", fake_projected_model)
+    args = _signature_args(
+        n_envs=1,
+        device="cpu",
+        lambda_mean=0.25,
+        lambda_sample=0.07,
+        lambda_critic=0.40,
+    )
+    config = progression.resolved_ppo_config(args)
+    train_env = object()
+    expected = {
+        "ppo_cbf_diff_reward_only": (0.0, 0.0, 0.0),
+        "ppo_cbf_integrated_actor_only": (0.25, 0.07, 0.0),
+        "ppo_cbf_projected_reward_off": (0.25, 0.07, 0.0),
+        "ppo_cbf_integrated_actor_critic": (0.25, 0.07, 0.40),
+    }
+
+    for variant, coefficients in expected.items():
+        result = progression.build_model(
+            variant=variant,
+            train_env=train_env,
+            config=config,
+            training_seed=307,
+            args=args,
+            tensorboard_log=tmp_path,
+            base_observation_dim=32,
+        )
+        assert result is sentinel
+        kwargs = calls[-1][2]
+        assert (
+            kwargs["lambda_mean"],
+            kwargs["lambda_sample"],
+            kwargs["lambda_critic"],
+        ) == coefficients
+
+    assert len(calls) == 4
+    for policy, env, kwargs in calls:
+        assert policy is progression.ProjectedCBFActorCriticPolicy
+        assert env is train_env
+        assert kwargs["execution_mode"] == "cbf"
+
+
 def test_cli_defaults_ensure_training_and_alias_supports_existing_only(monkeypatch):
     monkeypatch.setattr(sys, "argv", ["run_ppo_cbf_progression.py"])
     defaults = progression.parse_args()
@@ -727,7 +969,7 @@ def test_action_clip_callback_accepts_batched_parallel_actions():
 def test_notebook_primary_ladder_is_ppo_first_and_streams_inline():
     notebook_path = PROJECT_ROOT / "notebooks" / "lanelessKaralakou.ipynb"
     notebook = json.loads(notebook_path.read_text(encoding="utf-8"))
-    assert len(notebook["cells"]) == 90
+    assert len(notebook["cells"]) == 98
     sources = {
         cell.get("id"): "".join(cell.get("source", []))
         for cell in notebook["cells"]
@@ -755,9 +997,24 @@ def test_notebook_primary_ladder_is_ppo_first_and_streams_inline():
     assert "stderr=subprocess.STDOUT" in launcher
     assert "PPO_1M_RESULTS[\"ppo_nominal\"]" in sources["ppo_primary_3m"]
     assert "PPO_1M_RESULTS[\"ppo_cbf_reward\"]" in sources["ppo_nominal_500k"]
-    assert "ppo_cbf_integrated_actor_critic" in sources["6ffd8341"]
+    assert "ppo_cbf_nd_reward_actor" in sources["ppo_nd_reward_actor_1m"]
+    assert "ppo_cbf_nd_actor_only" in sources["ppo_nd_actor_only_1m"]
+    assert "stopgrad" in sources["ppo_nd_reward_actor_notes"]
+    assert "no auxiliary safety critic" in sources["ppo_nd_actor_only_notes"]
+    assert "ppo_cbf_diff_reward_only" in sources["6ffd8341"]
     assert "ppo_cbf_integrated_actor_only" in sources["3b70133c"]
-    assert "safety-critic loss" in sources["729d0c1b"]
+    assert "PPO still reaches the actor through `J_P`" in sources["729d0c1b"]
+    assert "ppo_cbf_projected_reward_off" in sources[
+        "ppo_diff_actor_only_1m"
+    ]
+    assert "ppo_cbf_integrated_actor_critic" in sources[
+        "ppo_diff_actor_critic_1m"
+    ]
+    assert "isolates only the auxiliary safety-critic loss" in sources[
+        "ppo_diff_actor_critic_notes"
+    ]
+    assert "PPO_1M_REQUIRED_KPIS" in launcher
+    assert "observed_kpis != expected_kpis" in launcher
     assert "Distance-based completion rate" in sources["ppo_cbf_projected_500k"]
     assert '"ego_dimensions": [3.5, 1.8]' in sources["c9f74b85"]
     assert "PPO_1M_RUN_TRAINING = bool" in launcher
@@ -773,7 +1030,8 @@ def test_notebook_task_ppo_entry_targets_the_progression():
     assert task["flag"] == "PPO_1M_RUN_TRAINING"
     assert task["timesteps_key"] == "PPO_1M_TIMESTEPS_PER_POLICY"
     assert task["n_envs_key"] == "PPO_1M_NUM_ENVS"
-    assert task["train_cells"] == [13, 15, 17, 19]
+    assert task["train_cells"] == [13, 15, 17, 19, 21, 23, 25, 27]
+    assert task["post_cells"] == [29, 30]
 
 
 def test_latest_checkpoint_selection_is_timestep_ordered(tmp_path):

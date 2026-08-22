@@ -3,11 +3,13 @@
 The primary study is:
 
 1. train nominal PPO once and deploy the same checkpoint raw and with CBF;
-2. train PPO while executing the CBF, with an explicit shield-only control;
-3. place the differentiable CBF-QP on the policy mean, retain a final hard
+2. train non-differentiable hard-CBF policies with reward-only,
+   reward-plus-detached-actor, and detached-actor-only feedback;
+3. retain the historical shield-only control and filtered factorial ladder;
+4. place the differentiable CBF-QP on the policy mean, retain a final hard
    projection for the sampled latent action, and train both an actor
    internalization loss and a separate CBF safety-critic loss;
-4. provide an otherwise identical integrated-policy control with the safety
+5. provide an otherwise identical integrated-policy control with the safety
    critic coefficient set to zero.
 
 Every newly trained model is immediately checked over 200 complete episodes
@@ -69,6 +71,8 @@ from laneless_script_config import (
 from ppo_cbf_env import CBFContextPhysicalActionWrapper
 from ppo_observation_variants import install_previous_action_observation
 from projected_ppo_cbf import (
+    DetachedCBFActorCriticPolicy,
+    DetachedCBFActorPPO,
     LatentActionPPO,
     ProjectedCBFActorCriticPolicy,
     ProjectedCBFPPO,
@@ -78,8 +82,8 @@ from run_nominal_ppo_parameter_pilot import PPOActionClipCallback, PPO_CONFIGS
 from train_safety_potential_variants import MTM_CONGESTED_UNCERTAIN_UPDATES
 
 
-PROGRESSION_SCHEMA_VERSION = 5
-PPO_TRAINING_IMPLEMENTATION_VERSION = 9
+PROGRESSION_SCHEMA_VERSION = 7
+PPO_TRAINING_IMPLEMENTATION_VERSION = 11
 TRAINING_SIGNATURE_FILE = "training_signature.json"
 TRAINING_PENDING_SIGNATURE_FILE = "training_signature.pending.json"
 TRAINING_COMPLETION_FILE = "training_complete.json"
@@ -106,6 +110,8 @@ VARIANT_SPECS: dict[str, dict[str, Any]] = {
         "execution_mode": "box",
         "reward_penalty": False,
         "projected_mean": False,
+        "differentiable_actor_loss": False,
+        "detached_actor_loss": False,
         "safety_critic": False,
     },
     "ppo_cbf_shield_only": {
@@ -114,6 +120,8 @@ VARIANT_SPECS: dict[str, dict[str, Any]] = {
         "execution_mode": "cbf",
         "reward_penalty": False,
         "projected_mean": False,
+        "differentiable_actor_loss": False,
+        "detached_actor_loss": False,
         "safety_critic": False,
     },
     "ppo_cbf_reward": {
@@ -122,6 +130,38 @@ VARIANT_SPECS: dict[str, dict[str, Any]] = {
         "execution_mode": "cbf",
         "reward_penalty": True,
         "projected_mean": False,
+        "differentiable_actor_loss": False,
+        "detached_actor_loss": False,
+        "safety_critic": False,
+    },
+    "ppo_cbf_nd_reward_actor": {
+        "label": "PPO with non-differentiable CBF reward + detached actor loss",
+        "level": 2,
+        "execution_mode": "cbf",
+        "reward_penalty": True,
+        "projected_mean": False,
+        "differentiable_actor_loss": False,
+        "detached_actor_loss": True,
+        "safety_critic": False,
+    },
+    "ppo_cbf_nd_actor_only": {
+        "label": "PPO with non-differentiable detached CBF actor loss only",
+        "level": 2,
+        "execution_mode": "cbf",
+        "reward_penalty": False,
+        "projected_mean": False,
+        "differentiable_actor_loss": False,
+        "detached_actor_loss": True,
+        "safety_critic": False,
+    },
+    "ppo_cbf_diff_reward_only": {
+        "label": "PPO with differentiable CBF projection + reward only",
+        "level": 3,
+        "execution_mode": "cbf",
+        "reward_penalty": True,
+        "projected_mean": True,
+        "differentiable_actor_loss": False,
+        "detached_actor_loss": False,
         "safety_critic": False,
     },
     "ppo_cbf_projected_reward_off": {
@@ -130,6 +170,8 @@ VARIANT_SPECS: dict[str, dict[str, Any]] = {
         "execution_mode": "cbf",
         "reward_penalty": False,
         "projected_mean": True,
+        "differentiable_actor_loss": True,
+        "detached_actor_loss": False,
         "safety_critic": False,
     },
     "ppo_cbf_projected": {
@@ -138,6 +180,8 @@ VARIANT_SPECS: dict[str, dict[str, Any]] = {
         "execution_mode": "cbf",
         "reward_penalty": True,
         "projected_mean": True,
+        "differentiable_actor_loss": True,
+        "detached_actor_loss": False,
         "safety_critic": False,
     },
     "ppo_cbf_integrated_actor_critic": {
@@ -146,6 +190,8 @@ VARIANT_SPECS: dict[str, dict[str, Any]] = {
         "execution_mode": "cbf",
         "reward_penalty": True,
         "projected_mean": True,
+        "differentiable_actor_loss": True,
+        "detached_actor_loss": False,
         "safety_critic": True,
     },
     "ppo_cbf_integrated_actor_only": {
@@ -154,11 +200,13 @@ VARIANT_SPECS: dict[str, dict[str, Any]] = {
         "execution_mode": "cbf",
         "reward_penalty": True,
         "projected_mean": True,
+        "differentiable_actor_loss": True,
+        "detached_actor_loss": False,
         "safety_critic": False,
     },
 }
 # Preserve the historical default ladder. The canonical 1M notebook passes
-# its four requested variants explicitly, so older calls do not silently add
+# its requested variants explicitly, so older calls do not silently add
 # new multi-million-step jobs.
 DEFAULT_VARIANTS = (
     "ppo_nominal",
@@ -229,6 +277,9 @@ TENSORBOARD_VARIANT_IDS = {
     "ppo_nominal": "nom",
     "ppo_cbf_shield_only": "shld",
     "ppo_cbf_reward": "rwd",
+    "ppo_cbf_nd_reward_actor": "ndra",
+    "ppo_cbf_nd_actor_only": "ndao",
+    "ppo_cbf_diff_reward_only": "dfro",
     "ppo_cbf_projected_reward_off": "pro0",
     "ppo_cbf_projected": "pro",
     "ppo_cbf_integrated_actor_critic": "iac",
@@ -574,10 +625,19 @@ def _effective_training_settings(
             else 0.0
         ),
         "lambda_mean": (
-            float(args.lambda_mean) if bool(spec["projected_mean"]) else 0.0
+            float(args.lambda_mean)
+            if bool(spec.get("differentiable_actor_loss", False))
+            else 0.0
+        ),
+        "lambda_detached_actor": (
+            float(args.lambda_detached_actor)
+            if bool(spec.get("detached_actor_loss", False))
+            else 0.0
         ),
         "lambda_sample": (
-            float(args.lambda_sample) if bool(spec["projected_mean"]) else 0.0
+            float(args.lambda_sample)
+            if bool(spec.get("differentiable_actor_loss", False))
+            else 0.0
         ),
         "lambda_critic": (
             float(getattr(args, "lambda_critic", 0.10))
@@ -656,12 +716,28 @@ def training_signature(
             "algorithm_class": (
                 "ProjectedCBFPPO"
                 if bool(VARIANT_SPECS[variant]["projected_mean"])
-                else "LatentActionPPO"
+                else (
+                    "DetachedCBFActorPPO"
+                    if bool(
+                        VARIANT_SPECS[variant].get(
+                            "detached_actor_loss", False
+                        )
+                    )
+                    else "LatentActionPPO"
+                )
             ),
             "policy_class": (
                 "ProjectedCBFActorCriticPolicy"
                 if bool(VARIANT_SPECS[variant]["projected_mean"])
-                else "MlpPolicy"
+                else (
+                    "DetachedCBFActorCriticPolicy"
+                    if bool(
+                        VARIANT_SPECS[variant].get(
+                            "detached_actor_loss", False
+                        )
+                    )
+                    else "MlpPolicy"
+                )
             ),
             "net_arch": {"pi": [256, 128], "vf": [256, 128]},
             "activation": "torch.nn.Tanh",
@@ -681,6 +757,35 @@ def training_signature(
             "safety_critic_head": bool(VARIANT_SPECS[variant]["projected_mean"]),
             "safety_critic_loss_enabled": bool(
                 VARIANT_SPECS[variant].get("safety_critic", False)
+            ),
+            "detached_actor_loss_enabled": bool(
+                VARIANT_SPECS[variant].get("detached_actor_loss", False)
+            ),
+            "differentiable_actor_loss_enabled": bool(
+                VARIANT_SPECS[variant].get(
+                    "differentiable_actor_loss", False
+                )
+            ),
+            "actor_cbf_gradient_path": (
+                (
+                    "differentiable_projection_plus_auxiliary_mean_loss"
+                    if bool(
+                        VARIANT_SPECS[variant].get(
+                            "differentiable_actor_loss", False
+                        )
+                    )
+                    else "differentiable_projection_only"
+                )
+                if bool(VARIANT_SPECS[variant]["projected_mean"])
+                else (
+                    "stop_gradient_hard_projection_target"
+                    if bool(
+                        VARIANT_SPECS[variant].get(
+                            "detached_actor_loss", False
+                        )
+                    )
+                    else "none"
+                )
             ),
         },
         "action_contract": {
@@ -1327,8 +1432,16 @@ def build_model(
         return ProjectedCBFPPO(
             ProjectedCBFActorCriticPolicy,
             train_env,
-            lambda_mean=float(args.lambda_mean),
-            lambda_sample=float(args.lambda_sample),
+            lambda_mean=(
+                float(args.lambda_mean)
+                if bool(spec.get("differentiable_actor_loss", False))
+                else 0.0
+            ),
+            lambda_sample=(
+                float(args.lambda_sample)
+                if bool(spec.get("differentiable_actor_loss", False))
+                else 0.0
+            ),
             lambda_critic=(
                 float(args.lambda_critic)
                 if bool(spec.get("safety_critic", False))
@@ -1337,6 +1450,18 @@ def build_model(
             safety_gamma=float(args.safety_critic_gamma),
             safety_cost_clip=float(args.safety_critic_cost_clip),
             policy_kwargs=projected_policy_kwargs,
+            **common_model_kwargs,
+        )
+    if bool(spec.get("detached_actor_loss", False)):
+        detached_policy_kwargs = {
+            **common_policy_kwargs,
+            "cbf_base_observation_dim": int(base_observation_dim),
+        }
+        return DetachedCBFActorPPO(
+            DetachedCBFActorCriticPolicy,
+            train_env,
+            lambda_actor=float(args.lambda_detached_actor),
+            policy_kwargs=detached_policy_kwargs,
             **common_model_kwargs,
         )
     return LatentActionPPO(
@@ -1356,11 +1481,13 @@ def load_model(
     device: str,
     env: VecEnv | None = None,
 ) -> LatentActionPPO:
-    model_class = (
-        ProjectedCBFPPO
-        if bool(VARIANT_SPECS[variant]["projected_mean"])
-        else LatentActionPPO
-    )
+    spec = VARIANT_SPECS[variant]
+    if bool(spec["projected_mean"]):
+        model_class = ProjectedCBFPPO
+    elif bool(spec.get("detached_actor_loss", False)):
+        model_class = DetachedCBFActorPPO
+    else:
+        model_class = LatentActionPPO
     return model_class.load(str(path), device=device, env=env)
 
 
@@ -1598,7 +1725,7 @@ def train_variant(
             )
             latest = diagnostic_frame.iloc[-1]
             print(
-                "[ppo-progression] projected actor gradients",
+                "[ppo-progression] CBF actor-feedback gradients",
                 {
                     "g_cbf/g_ppo": float(
                         latest.get("g_cbf_to_g_ppo_ratio", np.nan)
@@ -2995,7 +3122,21 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--lambda-delta", type=float, default=0.05)
     parser.add_argument("--lambda-intervention", type=float, default=0.10)
-    parser.add_argument("--lambda-mean", type=float, default=0.10)
+    parser.add_argument(
+        "--lambda-mean",
+        type=float,
+        default=0.10,
+        help="Coefficient for the differentiable projected-mean actor loss.",
+    )
+    parser.add_argument(
+        "--lambda-detached-actor",
+        type=float,
+        default=0.10,
+        help=(
+            "Coefficient for the non-differentiable stopped-gradient hard-CBF "
+            "mean-target loss; active only for detached actor-feedback variants."
+        ),
+    )
     parser.add_argument(
         "--lambda-sample",
         type=float,
@@ -3187,7 +3328,12 @@ def main() -> int:
         args.action_rate_penalty
     ) < 0.0:
         raise ValueError("--action-rate-penalty must be finite and non-negative")
-    for name in ("lambda_mean", "lambda_sample", "lambda_critic"):
+    for name in (
+        "lambda_mean",
+        "lambda_detached_actor",
+        "lambda_sample",
+        "lambda_critic",
+    ):
         value = float(getattr(args, name))
         if not np.isfinite(value) or value < 0.0:
             raise ValueError(f"--{name.replace('_', '-')} must be finite and non-negative")
@@ -3564,6 +3710,7 @@ def main() -> int:
         "lambda_delta": float(args.lambda_delta),
         "lambda_intervention": float(args.lambda_intervention),
         "lambda_mean": float(args.lambda_mean),
+        "lambda_detached_actor": float(args.lambda_detached_actor),
         "lambda_sample": float(args.lambda_sample),
         "lambda_critic": float(args.lambda_critic),
         "safety_critic_gamma": float(args.safety_critic_gamma),
