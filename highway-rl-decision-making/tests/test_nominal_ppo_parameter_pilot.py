@@ -411,10 +411,9 @@ def test_notebook_ppo_cell_delegates_to_canonical_cbf_progression():
     assert '"ppo_cbf_nd_actor_only"' in source
     assert '"ppo_cbf_diff_reward_only"' in source
     assert '"ppo_cbf_projected_reward_off"' in source
-    assert '"ppo_cbf_integrated_actor_critic"' in source
     assert '"ppo_cbf_integrated_actor_only"' in source
-    assert '"--lambda-critic", "0.10"' in source
-    assert '"--lambda-critic", "0.0"' in source
+    assert '"ppo_cbf_integrated_actor_critic"' not in source
+    assert '"--lambda-critic"' not in source
     assert '"--lambda-detached-actor", "0.10"' in source
     assert "model = PPO(" not in source
     assert "subprocess.Popen" in source

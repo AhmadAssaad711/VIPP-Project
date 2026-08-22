@@ -6,6 +6,7 @@ from pathlib import Path
 import gymnasium as gym
 import numpy as np
 import torch as th
+from stable_baselines3.common.buffers import RolloutBuffer
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
@@ -398,6 +399,10 @@ def test_projected_ppo_save_load_preserves_action_stages(tmp_path):
             "log_std_init": -1.0,
         },
     )
+    assert type(model.rollout_buffer) is RolloutBuffer
+    assert not model.use_safety_critic
+    assert not model.policy.use_safety_critic
+    assert not hasattr(model.policy, "safety_value_net")
     with th.no_grad():
         model.policy.action_net.weight.zero_()
         model.policy.action_net.bias.copy_(th.tensor([2.0, -0.4]))
@@ -407,6 +412,10 @@ def test_projected_ppo_save_load_preserves_action_stages(tmp_path):
     path = tmp_path / "projected_ppo"
     model.save(path)
     loaded = ProjectedCBFPPO.load(path, device="cpu")
+    assert type(loaded.rollout_buffer) is RolloutBuffer
+    assert not loaded.use_safety_critic
+    assert not loaded.policy.use_safety_critic
+    assert not hasattr(loaded.policy, "safety_value_net")
     actual = loaded.predict_action_stages(
         _augmented_observation(), deterministic=True
     )
@@ -437,6 +446,8 @@ def test_projected_ppo_collector_uses_projected_mean_logprob_and_hard_sample():
     with th.no_grad():
         model.policy.action_net.weight.zero_()
         model.policy.action_net.bias.copy_(th.tensor([2.0, 0.2]))
+    assert type(model.rollout_buffer) is RolloutBuffer
+    assert not hasattr(model.policy, "safety_value_net")
     model.learn(total_timesteps=16)
 
     stored_z = np.asarray(model.rollout_buffer.actions).reshape(-1, 2)
@@ -469,3 +480,74 @@ def test_projected_ppo_collector_uses_projected_mean_logprob_and_hard_sample():
     th.testing.assert_close(
         evaluation.log_prob, stored_log_prob, atol=1e-5, rtol=1e-5
     )
+
+
+class _RewardProjectionEnv(_ProjectionRecordEnv):
+    def step(self, action):
+        observation, _, terminated, truncated, info = super().step(action)
+        return observation, 1.0, terminated, truncated, info
+
+
+def test_plain_projected_ppo_critic_learns_from_reward_returns():
+    env = _RewardProjectionEnv()
+    model = ProjectedCBFPPO(
+        ProjectedCBFActorCriticPolicy,
+        env,
+        execution_mode="cbf",
+        lambda_mean=0.0,
+        lambda_sample=0.0,
+        lambda_critic=0.0,
+        learning_rate=1e-2,
+        n_steps=4,
+        batch_size=4,
+        n_epochs=1,
+        gamma=0.0,
+        seed=29,
+        device="cpu",
+        policy_kwargs={
+            "net_arch": {"pi": [8], "vf": [8]},
+            "ortho_init": False,
+            "log_std_init": -1.0,
+        },
+    )
+    before = [
+        parameter.detach().clone()
+        for parameter in model.policy.value_net.parameters()
+    ]
+    model.learn(total_timesteps=4)
+
+    assert type(model.rollout_buffer) is RolloutBuffer
+    assert not hasattr(model.policy, "safety_value_net")
+    np.testing.assert_allclose(model.rollout_buffer.rewards, 1.0, atol=1e-6)
+    np.testing.assert_allclose(model.rollout_buffer.returns, 1.0, atol=1e-6)
+    after = list(model.policy.value_net.parameters())
+    assert any(not th.equal(old, new.detach()) for old, new in zip(before, after))
+    assert "safety_critic_loss" not in model.cbf_training_diagnostics[-1]
+
+
+def test_explicit_legacy_safety_critic_still_selects_its_custom_buffer():
+    env = _ProjectionRecordEnv()
+    model = ProjectedCBFPPO(
+        ProjectedCBFActorCriticPolicy,
+        env,
+        execution_mode="cbf",
+        lambda_mean=0.0,
+        lambda_sample=0.0,
+        lambda_critic=0.1,
+        learning_rate=0.0,
+        n_steps=2,
+        batch_size=2,
+        n_epochs=1,
+        seed=31,
+        device="cpu",
+        policy_kwargs={
+            "net_arch": {"pi": [8], "vf": [8]},
+            "ortho_init": False,
+            "log_std_init": -1.0,
+        },
+    )
+    assert isinstance(model.rollout_buffer, CBFSafetyRolloutBuffer)
+    assert model.policy.use_safety_critic
+    assert hasattr(model.policy, "safety_value_net")
+    model.learn(total_timesteps=2)
+    assert "safety_critic_loss" in model.cbf_training_diagnostics[-1]

@@ -6,11 +6,10 @@ The primary study is:
 2. train non-differentiable hard-CBF policies with reward-only,
    reward-plus-detached-actor, and detached-actor-only feedback;
 3. retain the historical shield-only control and filtered factorial ladder;
-4. place the differentiable CBF-QP on the policy mean, retain a final hard
-   projection for the sampled latent action, and train both an actor
-   internalization loss and a separate CBF safety-critic loss;
-5. provide an otherwise identical integrated-policy control with the safety
-   critic coefficient set to zero.
+4. compare differentiable CBF reward-only, reward-plus-actor, and actor-only
+   feedback while retaining a final hard projection for each sampled action;
+5. train the ordinary PPO value critic from the resulting reward-shaped
+   returns, without a separate auxiliary CBF safety-critic objective.
 
 Every newly trained model is immediately checked over 200 complete episodes
 with the external CBF OFF and another 200 paired episodes with it ON; both
@@ -82,8 +81,8 @@ from run_nominal_ppo_parameter_pilot import PPOActionClipCallback, PPO_CONFIGS
 from train_safety_potential_variants import MTM_CONGESTED_UNCERTAIN_UPDATES
 
 
-PROGRESSION_SCHEMA_VERSION = 7
-PPO_TRAINING_IMPLEMENTATION_VERSION = 11
+PROGRESSION_SCHEMA_VERSION = 8
+PPO_TRAINING_IMPLEMENTATION_VERSION = 12
 TRAINING_SIGNATURE_FILE = "training_signature.json"
 TRAINING_PENDING_SIGNATURE_FILE = "training_signature.pending.json"
 TRAINING_COMPLETION_FILE = "training_complete.json"
@@ -184,18 +183,8 @@ VARIANT_SPECS: dict[str, dict[str, Any]] = {
         "detached_actor_loss": False,
         "safety_critic": False,
     },
-    "ppo_cbf_integrated_actor_critic": {
-        "label": "PPO with integrated CBF actor and safety-critic losses",
-        "level": 3,
-        "execution_mode": "cbf",
-        "reward_penalty": True,
-        "projected_mean": True,
-        "differentiable_actor_loss": True,
-        "detached_actor_loss": False,
-        "safety_critic": True,
-    },
     "ppo_cbf_integrated_actor_only": {
-        "label": "PPO with integrated CBF actor loss (safety-critic control)",
+        "label": "PPO with differentiable CBF reward + actor loss",
         "level": 3,
         "execution_mode": "cbf",
         "reward_penalty": True,
@@ -282,7 +271,6 @@ TENSORBOARD_VARIANT_IDS = {
     "ppo_cbf_diff_reward_only": "dfro",
     "ppo_cbf_projected_reward_off": "pro0",
     "ppo_cbf_projected": "pro",
-    "ppo_cbf_integrated_actor_critic": "iac",
     "ppo_cbf_integrated_actor_only": "iao",
 }
 
@@ -646,12 +634,12 @@ def _effective_training_settings(
         ),
         "safety_critic_gamma": (
             float(getattr(args, "safety_critic_gamma", 0.99))
-            if bool(spec["projected_mean"])
+            if bool(spec.get("safety_critic", False))
             else 0.0
         ),
         "safety_critic_cost_clip": (
             float(getattr(args, "safety_critic_cost_clip", 1.0))
-            if bool(spec["projected_mean"])
+            if bool(spec.get("safety_critic", False))
             else 0.0
         ),
         "action_rate_penalty": (
@@ -754,7 +742,11 @@ def training_signature(
                 else None
             ),
             "max_cbf_constraints": 18,
-            "safety_critic_head": bool(VARIANT_SPECS[variant]["projected_mean"]),
+            "ordinary_value_critic": True,
+            "ordinary_value_target": "reward_shaped_return",
+            "safety_critic_head": bool(
+                VARIANT_SPECS[variant].get("safety_critic", False)
+            ),
             "safety_critic_loss_enabled": bool(
                 VARIANT_SPECS[variant].get("safety_critic", False)
             ),
@@ -1428,6 +1420,7 @@ def build_model(
             **common_policy_kwargs,
             "cbf_base_observation_dim": int(base_observation_dim),
             "cbf_max_constraints": 18,
+            "use_safety_critic": bool(spec.get("safety_critic", False)),
         }
         return ProjectedCBFPPO(
             ProjectedCBFActorCriticPolicy,
@@ -3146,10 +3139,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--lambda-critic",
         type=float,
-        default=0.10,
+        default=0.0,
         help=(
-            "Coefficient for the integrated policy's auxiliary CBF safety-critic "
-            "loss; it is active only for the actor+critic Level-3 variant."
+            "Legacy/custom auxiliary CBF safety-critic coefficient. All "
+            "canonical study variants keep it at zero and train only the "
+            "ordinary PPO reward critic."
         ),
     )
     parser.add_argument(

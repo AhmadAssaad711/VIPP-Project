@@ -217,7 +217,7 @@ class CBFSafetyRolloutBuffer(RolloutBuffer):
 @dataclass(frozen=True)
 class ProjectedPolicyEvaluation:
     values: th.Tensor
-    safety_values: th.Tensor
+    safety_values: Optional[th.Tensor]
     log_prob: th.Tensor
     entropy: Optional[th.Tensor]
     distribution: DiagGaussianDistribution
@@ -316,6 +316,7 @@ class ProjectedCBFActorCriticPolicy(ActorCriticPolicy):
         cbf_base_observation_dim: int = 42,
         cbf_max_constraints: int = 18,
         cbf_feasibility_tol: float = 1e-6,
+        use_safety_critic: bool = True,
         **kwargs,
     ) -> None:
         if kwargs.get("use_sde", False):
@@ -337,6 +338,8 @@ class ProjectedCBFActorCriticPolicy(ActorCriticPolicy):
             max_constraints=int(cbf_max_constraints),
         )
         self.cbf_feasibility_tol = float(cbf_feasibility_tol)
+        # This must exist before ActorCriticPolicy.__init__ calls our _build().
+        self.use_safety_critic = bool(use_safety_critic)
         super().__init__(*args, **kwargs)
         if not isinstance(self.action_dist, DiagGaussianDistribution):
             raise TypeError("Projected CBF PPO requires a diagonal Gaussian action distribution")
@@ -344,9 +347,11 @@ class ProjectedCBFActorCriticPolicy(ActorCriticPolicy):
             raise TypeError("Projected CBF PPO requires a two-dimensional Box action space")
 
     def _build(self, lr_schedule) -> None:
-        """Add an auxiliary safety-value head to PPO's value pathway only."""
+        """Optionally add a separate safety-value head to PPO's value pathway."""
 
         super()._build(lr_schedule)
+        if not self.use_safety_critic:
+            return
         self.safety_value_net = th.nn.Linear(
             int(self.mlp_extractor.latent_dim_vf), 1
         )
@@ -395,19 +400,18 @@ class ProjectedCBFActorCriticPolicy(ActorCriticPolicy):
     ) -> tuple[
         DiagGaussianDistribution,
         th.Tensor,
-        th.Tensor,
+        Optional[th.Tensor],
         th.Tensor,
         th.Tensor,
         TorchProjection2D,
     ]:
         latent_pi, latent_vf = self._latents(obs)
         values = self.value_net(latent_vf)
-        # The target is a discounted sum of squared hard-CBF corrections, so
-        # it is non-negative by construction.  A softplus head keeps the
-        # bootstrapped target physically meaningful from the first rollout
-        # instead of allowing a random negative value estimate to pull a
-        # safety-return target below zero.
-        safety_values = F.softplus(self.safety_value_net(latent_vf))
+        safety_values: Optional[th.Tensor] = None
+        if self.use_safety_critic:
+            # The optional target is a discounted sum of squared hard-CBF
+            # corrections, so a softplus keeps it non-negative.
+            safety_values = F.softplus(self.safety_value_net(latent_vf))
         mu_raw = self.action_net(latent_pi)
         projection = self.project_actions(obs, mu_raw)
         # No mathematical projection exists when the no-slack set is empty.
@@ -425,6 +429,8 @@ class ProjectedCBFActorCriticPolicy(ActorCriticPolicy):
     def predict_safety_values(self, obs: th.Tensor) -> th.Tensor:
         """Predict discounted future CBF-correction cost from the value branch."""
 
+        if not self.use_safety_critic:
+            raise RuntimeError("This projected policy has no auxiliary safety critic")
         _, latent_vf = self._latents(obs)
         return F.softplus(self.safety_value_net(latent_vf))
 
@@ -1101,7 +1107,12 @@ class DetachedCBFActorPPO(LatentActionPPO):
 
 
 class ProjectedCBFPPO(LatentActionPPO):
-    """PPO with actor internalization and an auxiliary CBF safety critic."""
+    """PPO with a differentiable projected actor and ordinary reward critic.
+
+    A separate CBF safety critic remains available only for loading historical
+    checkpoints or an explicit nonzero ``lambda_critic``.  The canonical study
+    uses the standard PPO rollout buffer and value loss exclusively.
+    """
 
     policy_aliases = {
         **PPO.policy_aliases,
@@ -1113,7 +1124,7 @@ class ProjectedCBFPPO(LatentActionPPO):
         *args,
         lambda_mean: float = 0.10,
         lambda_sample: float = 0.0,
-        lambda_critic: float = 0.10,
+        lambda_critic: float = 0.0,
         safety_gamma: float = 0.99,
         safety_cost_clip: float = 1.0,
         **kwargs,
@@ -1137,18 +1148,46 @@ class ProjectedCBFPPO(LatentActionPPO):
         self.cbf_training_diagnostics: list[dict[str, float]] = []
         kwargs.setdefault("execution_mode", "cbf")
         provided_buffer_class = kwargs.pop("rollout_buffer_class", None)
-        if provided_buffer_class not in (None, CBFSafetyRolloutBuffer):
-            raise ValueError(
-                "ProjectedCBFPPO requires CBFSafetyRolloutBuffer for its safety critic"
+        policy_kwargs = dict(kwargs.pop("policy_kwargs", {}) or {})
+        requested_safety_critic = policy_kwargs.get("use_safety_critic")
+        if requested_safety_critic is None:
+            # Historical projected checkpoints did not save this policy flag,
+            # but their saved buffer class identifies the old safety path.
+            self.use_safety_critic = bool(
+                self.lambda_critic > 0.0
+                or provided_buffer_class is CBFSafetyRolloutBuffer
             )
+        else:
+            self.use_safety_critic = bool(requested_safety_critic)
+        if self.lambda_critic > 0.0 and not self.use_safety_critic:
+            raise ValueError(
+                "A nonzero lambda_critic requires use_safety_critic=True"
+            )
+        policy_kwargs["use_safety_critic"] = self.use_safety_critic
+        kwargs["policy_kwargs"] = policy_kwargs
         buffer_kwargs = dict(kwargs.pop("rollout_buffer_kwargs", {}) or {})
-        buffer_kwargs.update(
-            {
-                "safety_gamma": self.safety_gamma,
-                "safety_cost_clip": self.safety_cost_clip,
-            }
-        )
-        kwargs["rollout_buffer_class"] = CBFSafetyRolloutBuffer
+        if self.use_safety_critic:
+            if provided_buffer_class not in (None, CBFSafetyRolloutBuffer):
+                raise ValueError(
+                    "The optional safety critic requires CBFSafetyRolloutBuffer"
+                )
+            buffer_kwargs.update(
+                {
+                    "safety_gamma": self.safety_gamma,
+                    "safety_cost_clip": self.safety_cost_clip,
+                }
+            )
+            kwargs["rollout_buffer_class"] = CBFSafetyRolloutBuffer
+        else:
+            if provided_buffer_class not in (None, RolloutBuffer):
+                raise ValueError(
+                    "Projected PPO without a safety critic requires RolloutBuffer"
+                )
+            if buffer_kwargs:
+                raise ValueError(
+                    "Plain projected PPO does not accept safety rollout-buffer kwargs"
+                )
+            kwargs["rollout_buffer_class"] = RolloutBuffer
         kwargs["rollout_buffer_kwargs"] = buffer_kwargs
         super().__init__(*args, **kwargs)
         # SB3 load() constructs once with _init_setup_model=False and restores
@@ -1158,6 +1197,12 @@ class ProjectedCBFPPO(LatentActionPPO):
         ):
             raise TypeError(
                 "ProjectedCBFPPO must be constructed with ProjectedCBFActorCriticPolicy"
+            )
+        if hasattr(self, "policy") and bool(
+            self.policy.use_safety_critic
+        ) != bool(self.use_safety_critic):
+            raise RuntimeError(
+                "Projected policy and rollout buffer disagree on safety-critic usage"
             )
 
     def train(self) -> None:
@@ -1232,34 +1277,49 @@ class ProjectedCBFPPO(LatentActionPPO):
                 value_loss = F.mse_loss(rollout_data.returns, values_pred)
                 value_losses.append(float(value_loss.detach().cpu().item()))
 
-                safety_values = evaluation.safety_values.flatten()
-                safety_targets = rollout_data.safety_returns.detach()
-                safety_critic_loss = F.smooth_l1_loss(
-                    safety_values, safety_targets
-                )
-                safety_critic_losses.append(
-                    float(safety_critic_loss.detach().cpu().item())
-                )
-                safety_target_means.append(
-                    float(safety_targets.mean().detach().cpu().item())
-                )
-                safety_prediction_rmses.append(
-                    float(
-                        th.sqrt(
-                            F.mse_loss(safety_values.detach(), safety_targets)
+                safety_critic_loss = th.zeros((), device=self.device)
+                if self.use_safety_critic:
+                    if evaluation.safety_values is None or not isinstance(
+                        self.rollout_buffer, CBFSafetyRolloutBuffer
+                    ):
+                        raise RuntimeError(
+                            "Enabled safety critic is missing its value head or rollout targets"
                         )
-                        .cpu()
-                        .item()
+                    safety_values = evaluation.safety_values.flatten()
+                    safety_targets = rollout_data.safety_returns.detach()
+                    safety_critic_loss = F.smooth_l1_loss(
+                        safety_values, safety_targets
                     )
-                )
-                safety_cost_means.append(
-                    float(rollout_data.safety_costs.mean().detach().cpu().item())
-                )
-                safety_fallback_rates.append(
-                    float(
-                        rollout_data.safety_fallbacks.mean().detach().cpu().item()
+                    safety_critic_losses.append(
+                        float(safety_critic_loss.detach().cpu().item())
                     )
-                )
+                    safety_target_means.append(
+                        float(safety_targets.mean().detach().cpu().item())
+                    )
+                    safety_prediction_rmses.append(
+                        float(
+                            th.sqrt(
+                                F.mse_loss(
+                                    safety_values.detach(), safety_targets
+                                )
+                            )
+                            .cpu()
+                            .item()
+                        )
+                    )
+                    safety_cost_means.append(
+                        float(
+                            rollout_data.safety_costs.mean().detach().cpu().item()
+                        )
+                    )
+                    safety_fallback_rates.append(
+                        float(
+                            rollout_data.safety_fallbacks.mean()
+                            .detach()
+                            .cpu()
+                            .item()
+                        )
+                    )
 
                 if evaluation.entropy is None:
                     entropy_loss = -th.mean(-evaluation.log_prob)
@@ -1403,25 +1463,27 @@ class ProjectedCBFPPO(LatentActionPPO):
         self.logger.record("train/explained_variance", explained_var)
         self.logger.record("train/cbf_lambda_mean", self.lambda_mean)
         self.logger.record("train/cbf_lambda_sample", self.lambda_sample)
-        self.logger.record("train/cbf_lambda_critic", self.lambda_critic)
         self.logger.record("train/cbf_mean_loss", np.mean(mean_losses))
         self.logger.record("train/cbf_sample_loss", np.mean(sample_losses))
-        self.logger.record(
-            "train/cbf_safety_critic_loss", np.mean(safety_critic_losses)
-        )
-        self.logger.record(
-            "train/cbf_safety_target_mean", np.mean(safety_target_means)
-        )
-        self.logger.record(
-            "train/cbf_safety_prediction_rmse",
-            np.mean(safety_prediction_rmses),
-        )
-        self.logger.record(
-            "train/cbf_safety_cost_mean", np.mean(safety_cost_means)
-        )
-        self.logger.record(
-            "train/cbf_safety_fallback_rate", np.mean(safety_fallback_rates)
-        )
+        if self.use_safety_critic:
+            self.logger.record("train/cbf_lambda_critic", self.lambda_critic)
+            self.logger.record(
+                "train/cbf_safety_critic_loss", np.mean(safety_critic_losses)
+            )
+            self.logger.record(
+                "train/cbf_safety_target_mean", np.mean(safety_target_means)
+            )
+            self.logger.record(
+                "train/cbf_safety_prediction_rmse",
+                np.mean(safety_prediction_rmses),
+            )
+            self.logger.record(
+                "train/cbf_safety_cost_mean", np.mean(safety_cost_means)
+            )
+            self.logger.record(
+                "train/cbf_safety_fallback_rate",
+                np.mean(safety_fallback_rates),
+            )
         self.logger.record("train/cbf_mean_correction", np.mean(mean_corrections))
         self.logger.record("train/cbf_mean_infeasible_rate", np.mean(mean_infeasible_rates))
         self.logger.record(
@@ -1440,32 +1502,42 @@ class ProjectedCBFPPO(LatentActionPPO):
                 self.logger.record(
                     f"train/actor_{key}", gradient_summary[key]
                 )
-        self.cbf_training_diagnostics.append(
-            {
-                "n_updates": float(self._n_updates),
-                "num_timesteps": float(self.num_timesteps),
-                "mean_loss": float(np.mean(mean_losses)),
-                "sample_loss": float(np.mean(sample_losses)),
-                "safety_critic_loss": float(np.mean(safety_critic_losses)),
-                "safety_target_mean": float(np.mean(safety_target_means)),
-                "safety_prediction_rmse": float(
-                    np.mean(safety_prediction_rmses)
-                ),
-                "safety_cost_mean": float(np.mean(safety_cost_means)),
-                "safety_fallback_rate": float(np.mean(safety_fallback_rates)),
-                "mean_correction": float(np.mean(mean_corrections)),
-                "mean_infeasible_rate": float(np.mean(mean_infeasible_rates)),
-                "sample_correction": float(
-                    np.mean(sample_corrections) if sample_corrections else 0.0
-                ),
-                "sample_infeasible_rate": float(
-                    np.mean(sample_infeasible_rates)
-                    if sample_infeasible_rates
-                    else 0.0
-                ),
-                **gradient_summary,
-            }
-        )
+        diagnostic_row = {
+            "n_updates": float(self._n_updates),
+            "num_timesteps": float(self.num_timesteps),
+            "mean_loss": float(np.mean(mean_losses)),
+            "sample_loss": float(np.mean(sample_losses)),
+            "mean_correction": float(np.mean(mean_corrections)),
+            "mean_infeasible_rate": float(np.mean(mean_infeasible_rates)),
+            "sample_correction": float(
+                np.mean(sample_corrections) if sample_corrections else 0.0
+            ),
+            "sample_infeasible_rate": float(
+                np.mean(sample_infeasible_rates)
+                if sample_infeasible_rates
+                else 0.0
+            ),
+            **gradient_summary,
+        }
+        if self.use_safety_critic:
+            diagnostic_row.update(
+                {
+                    "safety_critic_loss": float(
+                        np.mean(safety_critic_losses)
+                    ),
+                    "safety_target_mean": float(
+                        np.mean(safety_target_means)
+                    ),
+                    "safety_prediction_rmse": float(
+                        np.mean(safety_prediction_rmses)
+                    ),
+                    "safety_cost_mean": float(np.mean(safety_cost_means)),
+                    "safety_fallback_rate": float(
+                        np.mean(safety_fallback_rates)
+                    ),
+                }
+            )
+        self.cbf_training_diagnostics.append(diagnostic_row)
         if hasattr(self.policy, "log_std"):
             self.logger.record(
                 "train/std", th.exp(self.policy.log_std).mean().item()
