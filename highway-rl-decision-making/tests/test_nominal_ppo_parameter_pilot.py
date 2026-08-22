@@ -73,6 +73,54 @@ def test_parallel_config_keeps_the_same_global_ppo_rollout_size():
     ) == 1_000
 
 
+def test_progress_reward_override_is_explicit_and_non_mutating():
+    base = {"progress_reward_weight": 0.0, "progress_clip": 1.25}
+
+    unchanged = pilot.apply_reward_overrides(base, Namespace())
+    enabled = pilot.apply_reward_overrides(
+        base, Namespace(progress_reward_weight=0.5)
+    )
+
+    assert unchanged == base
+    assert enabled["progress_reward_weight"] == pytest.approx(0.5)
+    assert enabled["progress_clip"] == pytest.approx(1.25)
+    assert base["progress_reward_weight"] == pytest.approx(0.0)
+
+
+def test_progress_reward_override_rejects_nonfinite_weight():
+    with pytest.raises(ValueError, match="progress-reward-weight must be finite"):
+        pilot.apply_reward_overrides(
+            {"progress_reward_weight": 0.0},
+            Namespace(progress_reward_weight=np.inf),
+        )
+
+
+def test_jerk_reward_overrides_are_explicit_and_non_mutating():
+    base = {"jerk_penalty_weight": 0.02, "jerk_scale": 10.0}
+
+    enabled = pilot.apply_reward_overrides(
+        base, Namespace(jerk_penalty_weight=0.01, jerk_scale=8.0)
+    )
+
+    assert enabled["jerk_penalty_weight"] == pytest.approx(0.01)
+    assert enabled["jerk_scale"] == pytest.approx(8.0)
+    assert base["jerk_penalty_weight"] == pytest.approx(0.02)
+    assert base["jerk_scale"] == pytest.approx(10.0)
+
+
+def test_jerk_reward_overrides_reject_invalid_values():
+    with pytest.raises(ValueError, match="jerk-penalty-weight must be finite and non-negative"):
+        pilot.apply_reward_overrides(
+            {"jerk_penalty_weight": 0.02},
+            Namespace(jerk_penalty_weight=-0.1),
+        )
+    with pytest.raises(ValueError, match="jerk-scale must be finite and positive"):
+        pilot.apply_reward_overrides(
+            {"jerk_scale": 10.0},
+            Namespace(jerk_scale=0.0),
+        )
+
+
 def test_nominal_pilot_evaluates_only_the_final_checkpoint_by_default():
     assert pilot.evaluation_steps(
         50_000, 10_000, evaluate_checkpoints=False
