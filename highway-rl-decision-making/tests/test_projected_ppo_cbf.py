@@ -15,6 +15,7 @@ if str(SCRIPTS) not in sys.path:
 
 from cbf_projection import CBFContextLayout, append_cbf_context  # noqa: E402
 from projected_ppo_cbf import (  # noqa: E402
+    CBFSafetyRolloutBuffer,
     LatentActionPPO,
     ProjectedCBFActorCriticPolicy,
     ProjectedCBFPPO,
@@ -123,6 +124,55 @@ def test_deterministic_safe_mean_needs_no_second_projection():
     th.testing.assert_close(stages["executed_action"], stages["mu_safe"])
     assert bool(stages["mean_feasible"].item())
     assert bool(stages["sample_feasible"].item())
+
+
+def test_safety_critic_head_and_rollout_targets_are_nonnegative():
+    observation_space, action_space = _spaces()
+    policy = ProjectedCBFActorCriticPolicy(
+        observation_space,
+        action_space,
+        lr_schedule=lambda _: 1e-3,
+        net_arch={"pi": [8], "vf": [8]},
+        ortho_init=False,
+    )
+    obs = th.tensor(_augmented_observation()[None], dtype=th.float32)
+    safety_value = policy.predict_safety_values(obs)
+    assert bool((safety_value >= 0.0).all())
+    optimizer_parameters = {
+        id(parameter)
+        for group in policy.optimizer.param_groups
+        for parameter in group["params"]
+    }
+    assert id(policy.safety_value_net.weight) in optimizer_parameters
+
+    buffer = CBFSafetyRolloutBuffer(
+        2,
+        observation_space,
+        action_space,
+        device="cpu",
+        gamma=0.99,
+        gae_lambda=0.95,
+        n_envs=1,
+        safety_gamma=0.9,
+        safety_cost_clip=1.0,
+    )
+    for cost in (0.25, 0.5):
+        buffer.add(
+            np.zeros((1, observation_space.shape[0]), dtype=np.float32),
+            np.zeros((1, action_space.shape[0]), dtype=np.float32),
+            np.zeros(1, dtype=np.float32),
+            np.zeros(1, dtype=bool),
+            th.zeros(1),
+            th.zeros(1),
+            safety_costs=np.asarray([cost], dtype=np.float32),
+            safety_fallbacks=np.zeros(1, dtype=np.float32),
+        )
+    buffer.compute_safety_returns(
+        last_safety_values=th.tensor([0.0]), dones=np.asarray([True])
+    )
+    np.testing.assert_allclose(
+        buffer.safety_returns.reshape(-1), [0.7, 0.5], atol=1e-6
+    )
 
 
 class _ProjectionRecordEnv(gym.Env):

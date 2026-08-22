@@ -400,17 +400,20 @@ def test_notebook_ppo_cell_delegates_to_canonical_cbf_progression():
     )
     compile(source, f"{notebook_path}:ppo-cbf-progression", "exec")
     assert "run_ppo_cbf_progression.py" in source
-    assert '"_PPO_TASK_TIMESTEPS_OVERRIDE", 50_000' in source
-    assert "PPO_RUN_TRAINING = True" in source
-    assert "PPO_FORCE_RETRAIN = False" in source
+    assert "PPO_1M_TIMESTEPS_PER_POLICY" in source
+    assert "PPO_1M_RUN_TRAINING" in source
+    assert "PPO_1M_FORCE_RETRAIN" in source
+    assert "PPO_1M_REQUIRE_CUDA = True" in source
     assert '"--traffic-model", "mtm"' in source
     assert '"ppo_nominal"' in source
-    assert '"ppo_cbf_shield_only"' in source
     assert '"ppo_cbf_reward"' in source
-    assert '"ppo_cbf_projected_reward_off"' in source
-    assert '"ppo_cbf_projected"' in source
+    assert '"ppo_cbf_integrated_actor_critic"' in source
+    assert '"ppo_cbf_integrated_actor_only"' in source
+    assert '"--lambda-critic", "0.10"' in source
+    assert '"--lambda-critic", "0.0"' in source
     assert "model = PPO(" not in source
     assert "subprocess.Popen" in source
     assert "stdout=subprocess.PIPE" in source
     assert "stderr=subprocess.STDOUT" in source
-    assert "PPO_PROGRESSION_LOG_PATH" in source
+    assert "PPO_1M_POST_TRAIN_EVAL_EPISODES = 200" in source
+    assert "--task-distance-m" in source

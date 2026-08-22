@@ -14,7 +14,7 @@ Only the original state features enter the learned actor/value networks.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any, Optional
+from typing import Any, Generator, NamedTuple, Optional
 
 import gymnasium as gym
 import numpy as np
@@ -60,9 +60,163 @@ class CBFBaseFeaturesExtractor(BaseFeaturesExtractor):
         return observations[..., : self.base_observation_dim]
 
 
+class CBFSafetyRolloutBufferSamples(NamedTuple):
+    """A PPO minibatch plus targets for the auxiliary CBF safety critic."""
+
+    observations: th.Tensor
+    actions: th.Tensor
+    old_values: th.Tensor
+    old_log_prob: th.Tensor
+    advantages: th.Tensor
+    returns: th.Tensor
+    safety_costs: th.Tensor
+    safety_returns: th.Tensor
+    safety_fallbacks: th.Tensor
+
+
+class CBFSafetyRolloutBuffer(RolloutBuffer):
+    """Rollout storage for a discounted, executed-CBF correction cost.
+
+    The ordinary PPO reward/value targets remain untouched.  This buffer stores
+    the observed hard-filter correction cost separately so the Level-3 safety
+    critic can learn its own discounted value without redefining the task
+    critic's return semantics.
+    """
+
+    def __init__(
+        self,
+        *args,
+        safety_gamma: float = 0.99,
+        safety_cost_clip: float = 1.0,
+        **kwargs,
+    ) -> None:
+        self.safety_gamma = float(safety_gamma)
+        self.safety_cost_clip = float(safety_cost_clip)
+        if not np.isfinite(self.safety_gamma) or not 0.0 <= self.safety_gamma <= 1.0:
+            raise ValueError("safety_gamma must be finite and lie in [0, 1]")
+        if not np.isfinite(self.safety_cost_clip) or self.safety_cost_clip <= 0.0:
+            raise ValueError("safety_cost_clip must be finite and positive")
+        super().__init__(*args, **kwargs)
+
+    def reset(self) -> None:
+        super().reset()
+        self.safety_costs = np.zeros(
+            (self.buffer_size, self.n_envs), dtype=np.float32
+        )
+        self.safety_returns = np.zeros(
+            (self.buffer_size, self.n_envs), dtype=np.float32
+        )
+        self.safety_fallbacks = np.zeros(
+            (self.buffer_size, self.n_envs), dtype=np.float32
+        )
+
+    def _as_env_vector(self, value: Any, *, name: str) -> np.ndarray:
+        array = np.asarray(value, dtype=np.float32)
+        if array.ndim == 0:
+            array = np.full(self.n_envs, float(array), dtype=np.float32)
+        else:
+            array = array.reshape(-1)
+        if int(array.size) != int(self.n_envs):
+            raise ValueError(
+                f"{name} must supply one value per environment "
+                f"({array.size} != {self.n_envs})"
+            )
+        return array.astype(np.float32, copy=False)
+
+    def add(
+        self,
+        obs: np.ndarray,
+        action: np.ndarray,
+        reward: np.ndarray,
+        episode_start: np.ndarray,
+        value: th.Tensor,
+        log_prob: th.Tensor,
+        *,
+        safety_costs: Any = 0.0,
+        safety_fallbacks: Any = 0.0,
+    ) -> None:
+        position = int(self.pos)
+        super().add(obs, action, reward, episode_start, value, log_prob)
+        costs = self._as_env_vector(safety_costs, name="safety_costs")
+        fallbacks = self._as_env_vector(safety_fallbacks, name="safety_fallbacks")
+        self.safety_costs[position] = np.clip(
+            costs, 0.0, self.safety_cost_clip
+        )
+        self.safety_fallbacks[position] = np.clip(fallbacks, 0.0, 1.0)
+
+    def compute_safety_returns(
+        self, *, last_safety_values: th.Tensor, dones: np.ndarray
+    ) -> None:
+        """Compute bootstrapped Monte-Carlo correction-cost returns."""
+
+        last_values = (
+            last_safety_values.detach().clone().cpu().numpy().reshape(-1)
+        )
+        if int(last_values.size) != int(self.n_envs):
+            raise ValueError(
+                "last_safety_values must contain one prediction per environment"
+            )
+        next_returns = last_values.astype(np.float32, copy=False)
+        for step in reversed(range(self.buffer_size)):
+            if step == self.buffer_size - 1:
+                next_non_terminal = 1.0 - np.asarray(dones, dtype=np.float32)
+            else:
+                next_non_terminal = 1.0 - self.episode_starts[step + 1]
+            current = self.safety_costs[step] + (
+                self.safety_gamma * next_non_terminal * next_returns
+            )
+            self.safety_returns[step] = current.astype(np.float32, copy=False)
+            next_returns = self.safety_returns[step]
+
+    def get(
+        self, batch_size: Optional[int] = None
+    ) -> Generator[CBFSafetyRolloutBufferSamples, None, None]:
+        assert self.full, ""
+        indices = np.random.permutation(self.buffer_size * self.n_envs)
+        if not self.generator_ready:
+            for tensor in (
+                "observations",
+                "actions",
+                "values",
+                "log_probs",
+                "advantages",
+                "returns",
+                "safety_costs",
+                "safety_returns",
+                "safety_fallbacks",
+            ):
+                self.__dict__[tensor] = self.swap_and_flatten(self.__dict__[tensor])
+            self.generator_ready = True
+        if batch_size is None:
+            batch_size = self.buffer_size * self.n_envs
+        start_index = 0
+        while start_index < self.buffer_size * self.n_envs:
+            yield self._get_samples(indices[start_index : start_index + batch_size])
+            start_index += batch_size
+
+    def _get_samples(
+        self,
+        batch_inds: np.ndarray,
+        env: Any = None,
+    ) -> CBFSafetyRolloutBufferSamples:
+        data = (
+            self.observations[batch_inds],
+            self.actions[batch_inds].astype(np.float32, copy=False),
+            self.values[batch_inds].flatten(),
+            self.log_probs[batch_inds].flatten(),
+            self.advantages[batch_inds].flatten(),
+            self.returns[batch_inds].flatten(),
+            self.safety_costs[batch_inds].flatten(),
+            self.safety_returns[batch_inds].flatten(),
+            self.safety_fallbacks[batch_inds].flatten(),
+        )
+        return CBFSafetyRolloutBufferSamples(*tuple(map(self.to_torch, data)))
+
+
 @dataclass(frozen=True)
 class ProjectedPolicyEvaluation:
     values: th.Tensor
+    safety_values: th.Tensor
     log_prob: th.Tensor
     entropy: Optional[th.Tensor]
     distribution: DiagGaussianDistribution
@@ -107,6 +261,23 @@ class ProjectedCBFActorCriticPolicy(ActorCriticPolicy):
         if not isinstance(self.action_space, spaces.Box) or tuple(self.action_space.shape) != (2,):
             raise TypeError("Projected CBF PPO requires a two-dimensional Box action space")
 
+    def _build(self, lr_schedule) -> None:
+        """Add an auxiliary safety-value head to PPO's value pathway only."""
+
+        super()._build(lr_schedule)
+        self.safety_value_net = th.nn.Linear(
+            int(self.mlp_extractor.latent_dim_vf), 1
+        )
+        if self.ortho_init:
+            th.nn.init.orthogonal_(self.safety_value_net.weight, gain=1.0)
+            th.nn.init.constant_(self.safety_value_net.bias, 0.0)
+        # ActorCriticPolicy creates its optimizer before this custom head
+        # exists. Rebuild it once so the safety critic is trainable and saved
+        # with the same optimizer contract as the rest of the value pathway.
+        self.optimizer = self.optimizer_class(
+            self.parameters(), lr=lr_schedule(1), **self.optimizer_kwargs
+        )
+
     def _latents(self, obs: th.Tensor) -> tuple[th.Tensor, th.Tensor]:
         features = self.extract_features(obs)
         if self.share_features_extractor:
@@ -144,10 +315,17 @@ class ProjectedCBFActorCriticPolicy(ActorCriticPolicy):
         th.Tensor,
         th.Tensor,
         th.Tensor,
+        th.Tensor,
         TorchProjection2D,
     ]:
         latent_pi, latent_vf = self._latents(obs)
         values = self.value_net(latent_vf)
+        # The target is a discounted sum of squared hard-CBF corrections, so
+        # it is non-negative by construction.  A softplus head keeps the
+        # bootstrapped target physically meaningful from the first rollout
+        # instead of allowing a random negative value estimate to pull a
+        # safety-return target below zero.
+        safety_values = F.softplus(self.safety_value_net(latent_vf))
         mu_raw = self.action_net(latent_pi)
         projection = self.project_actions(obs, mu_raw)
         # No mathematical projection exists when the no-slack set is empty.
@@ -160,12 +338,18 @@ class ProjectedCBFActorCriticPolicy(ActorCriticPolicy):
         )
         distribution = self.action_dist.proba_distribution(mu_safe, self.log_std)
         assert isinstance(distribution, DiagGaussianDistribution)
-        return distribution, values, mu_raw, mu_safe, projection
+        return distribution, values, safety_values, mu_raw, mu_safe, projection
+
+    def predict_safety_values(self, obs: th.Tensor) -> th.Tensor:
+        """Predict discounted future CBF-correction cost from the value branch."""
+
+        _, latent_vf = self._latents(obs)
+        return F.softplus(self.safety_value_net(latent_vf))
 
     def forward(
         self, obs: th.Tensor, deterministic: bool = False
     ) -> tuple[th.Tensor, th.Tensor, th.Tensor]:
-        distribution, values, _, _, _ = self._distribution_and_stages(obs)
+        distribution, values, _, _, _, _ = self._distribution_and_stages(obs)
         latent_z = distribution.get_actions(deterministic=deterministic)
         log_prob = distribution.log_prob(latent_z)
         latent_z = latent_z.reshape((-1, *self.action_space.shape))
@@ -174,11 +358,12 @@ class ProjectedCBFActorCriticPolicy(ActorCriticPolicy):
     def evaluate_actions_with_projection(
         self, obs: th.Tensor, actions: th.Tensor
     ) -> ProjectedPolicyEvaluation:
-        distribution, values, mu_raw, mu_safe, projection = (
+        distribution, values, safety_values, mu_raw, mu_safe, projection = (
             self._distribution_and_stages(obs)
         )
         return ProjectedPolicyEvaluation(
             values=values,
+            safety_values=safety_values,
             log_prob=distribution.log_prob(actions),
             entropy=distribution.entropy(),
             distribution=distribution,
@@ -194,7 +379,7 @@ class ProjectedCBFActorCriticPolicy(ActorCriticPolicy):
         return result.values, result.log_prob, result.entropy
 
     def get_distribution(self, obs: th.Tensor) -> Distribution:
-        distribution, _, _, _, _ = self._distribution_and_stages(obs)
+        distribution, _, _, _, _, _ = self._distribution_and_stages(obs)
         return distribution
 
     def _predict(self, observation: th.Tensor, deterministic: bool = False) -> th.Tensor:
@@ -210,7 +395,7 @@ class ProjectedCBFActorCriticPolicy(ActorCriticPolicy):
     ) -> dict[str, th.Tensor]:
         """Return raw mean, safe mean, latent z, and final hard projection."""
 
-        distribution, _, mu_raw, mu_safe, mean_projection = (
+        distribution, _, _, mu_raw, mu_safe, mean_projection = (
             self._distribution_and_stages(obs)
         )
         latent_z = distribution.get_actions(deterministic=deterministic)
@@ -419,6 +604,38 @@ class LatentActionPPO(PPO):
                 self._last_episode_starts,
                 values,
                 log_probs,
+                **(
+                    {
+                        "safety_costs": np.asarray(
+                            [
+                                float(
+                                    np.clip(
+                                        float(
+                                            info.get(
+                                                "cbf_correction_norm_normalized",
+                                                0.0,
+                                            )
+                                        )
+                                        ** 2,
+                                        0.0,
+                                        rollout_buffer.safety_cost_clip,
+                                    )
+                                )
+                                for info in infos
+                            ],
+                            dtype=np.float32,
+                        ),
+                        "safety_fallbacks": np.asarray(
+                            [
+                                float(bool(info.get("cbf_fallback_used", False)))
+                                for info in infos
+                            ],
+                            dtype=np.float32,
+                        ),
+                    }
+                    if isinstance(rollout_buffer, CBFSafetyRolloutBuffer)
+                    else {}
+                ),
             )
             self._last_obs = new_obs
             self._last_episode_starts = dones
@@ -428,6 +645,18 @@ class LatentActionPPO(PPO):
                 obs_as_tensor(new_obs, self.device)
             )
         rollout_buffer.compute_returns_and_advantage(last_values=values, dones=dones)
+        if isinstance(rollout_buffer, CBFSafetyRolloutBuffer):
+            if not isinstance(self.policy, ProjectedCBFActorCriticPolicy):
+                raise TypeError(
+                    "CBFSafetyRolloutBuffer requires ProjectedCBFActorCriticPolicy"
+                )
+            with th.no_grad():
+                safety_values = self.policy.predict_safety_values(
+                    obs_as_tensor(new_obs, self.device)
+                )
+            rollout_buffer.compute_safety_returns(
+                last_safety_values=safety_values, dones=dones
+            )
         callback.update_locals(locals())
         callback.on_rollout_end()
         return True
@@ -510,7 +739,7 @@ def _gradient_pair_diagnostics(
 
 
 class ProjectedCBFPPO(LatentActionPPO):
-    """PPO surrogate plus mean/sample CBF internalization losses."""
+    """PPO with actor internalization and an auxiliary CBF safety critic."""
 
     policy_aliases = {
         **PPO.policy_aliases,
@@ -522,12 +751,43 @@ class ProjectedCBFPPO(LatentActionPPO):
         *args,
         lambda_mean: float = 0.10,
         lambda_sample: float = 0.0,
+        lambda_critic: float = 0.10,
+        safety_gamma: float = 0.99,
+        safety_cost_clip: float = 1.0,
         **kwargs,
     ) -> None:
         self.lambda_mean = float(lambda_mean)
         self.lambda_sample = float(lambda_sample)
+        self.lambda_critic = float(lambda_critic)
+        self.safety_gamma = float(safety_gamma)
+        self.safety_cost_clip = float(safety_cost_clip)
+        for name, value in (
+            ("lambda_mean", self.lambda_mean),
+            ("lambda_sample", self.lambda_sample),
+            ("lambda_critic", self.lambda_critic),
+        ):
+            if not np.isfinite(value) or value < 0.0:
+                raise ValueError(f"{name} must be finite and non-negative")
+        if not np.isfinite(self.safety_gamma) or not 0.0 <= self.safety_gamma <= 1.0:
+            raise ValueError("safety_gamma must be finite and lie in [0, 1]")
+        if not np.isfinite(self.safety_cost_clip) or self.safety_cost_clip <= 0.0:
+            raise ValueError("safety_cost_clip must be finite and positive")
         self.cbf_training_diagnostics: list[dict[str, float]] = []
         kwargs.setdefault("execution_mode", "cbf")
+        provided_buffer_class = kwargs.pop("rollout_buffer_class", None)
+        if provided_buffer_class not in (None, CBFSafetyRolloutBuffer):
+            raise ValueError(
+                "ProjectedCBFPPO requires CBFSafetyRolloutBuffer for its safety critic"
+            )
+        buffer_kwargs = dict(kwargs.pop("rollout_buffer_kwargs", {}) or {})
+        buffer_kwargs.update(
+            {
+                "safety_gamma": self.safety_gamma,
+                "safety_cost_clip": self.safety_cost_clip,
+            }
+        )
+        kwargs["rollout_buffer_class"] = CBFSafetyRolloutBuffer
+        kwargs["rollout_buffer_kwargs"] = buffer_kwargs
         super().__init__(*args, **kwargs)
         # SB3 load() constructs once with _init_setup_model=False and restores
         # the policy immediately afterward.
@@ -548,6 +808,11 @@ class ProjectedCBFPPO(LatentActionPPO):
         entropy_losses: list[float] = []
         pg_losses: list[float] = []
         value_losses: list[float] = []
+        safety_critic_losses: list[float] = []
+        safety_target_means: list[float] = []
+        safety_prediction_rmses: list[float] = []
+        safety_cost_means: list[float] = []
+        safety_fallback_rates: list[float] = []
         clip_fractions: list[float] = []
         mean_losses: list[float] = []
         sample_losses: list[float] = []
@@ -563,7 +828,10 @@ class ProjectedCBFPPO(LatentActionPPO):
         actor_parameters = [
             parameter
             for name, parameter in self.policy.named_parameters()
-            if parameter.requires_grad and not name.startswith("value_net")
+            if parameter.requires_grad
+            and not name.startswith(
+                ("value_net", "safety_value_net", "mlp_extractor.value_net")
+            )
         ]
 
         for epoch in range(self.n_epochs):
@@ -601,6 +869,35 @@ class ProjectedCBFPPO(LatentActionPPO):
                     )
                 value_loss = F.mse_loss(rollout_data.returns, values_pred)
                 value_losses.append(float(value_loss.detach().cpu().item()))
+
+                safety_values = evaluation.safety_values.flatten()
+                safety_targets = rollout_data.safety_returns.detach()
+                safety_critic_loss = F.smooth_l1_loss(
+                    safety_values, safety_targets
+                )
+                safety_critic_losses.append(
+                    float(safety_critic_loss.detach().cpu().item())
+                )
+                safety_target_means.append(
+                    float(safety_targets.mean().detach().cpu().item())
+                )
+                safety_prediction_rmses.append(
+                    float(
+                        th.sqrt(
+                            F.mse_loss(safety_values.detach(), safety_targets)
+                        )
+                        .cpu()
+                        .item()
+                    )
+                )
+                safety_cost_means.append(
+                    float(rollout_data.safety_costs.mean().detach().cpu().item())
+                )
+                safety_fallback_rates.append(
+                    float(
+                        rollout_data.safety_fallbacks.mean().detach().cpu().item()
+                    )
+                )
 
                 if evaluation.entropy is None:
                     entropy_loss = -th.mean(-evaluation.log_prob)
@@ -673,24 +970,28 @@ class ProjectedCBFPPO(LatentActionPPO):
                     )
                 sample_losses.append(float(sample_loss.detach().cpu().item()))
 
-                auxiliary_loss = (
+                actor_auxiliary_loss = (
                     self.lambda_mean * mean_loss
                     + self.lambda_sample * sample_loss
                 )
+                critic_auxiliary_loss = self.lambda_critic * safety_critic_loss
                 if self.lambda_mean != 0.0 or self.lambda_sample != 0.0:
                     actor_primary_loss = (
                         policy_loss + self.ent_coef * entropy_loss
                     )
                     gradient_rows.append(
                         _gradient_pair_diagnostics(
-                            actor_parameters, actor_primary_loss, auxiliary_loss
+                            actor_parameters,
+                            actor_primary_loss,
+                            actor_auxiliary_loss,
                         )
                     )
                 loss = (
                     policy_loss
                     + self.ent_coef * entropy_loss
                     + self.vf_coef * value_loss
-                    + auxiliary_loss
+                    + actor_auxiliary_loss
+                    + critic_auxiliary_loss
                 )
                 last_loss = loss
 
@@ -737,8 +1038,25 @@ class ProjectedCBFPPO(LatentActionPPO):
         self.logger.record("train/explained_variance", explained_var)
         self.logger.record("train/cbf_lambda_mean", self.lambda_mean)
         self.logger.record("train/cbf_lambda_sample", self.lambda_sample)
+        self.logger.record("train/cbf_lambda_critic", self.lambda_critic)
         self.logger.record("train/cbf_mean_loss", np.mean(mean_losses))
         self.logger.record("train/cbf_sample_loss", np.mean(sample_losses))
+        self.logger.record(
+            "train/cbf_safety_critic_loss", np.mean(safety_critic_losses)
+        )
+        self.logger.record(
+            "train/cbf_safety_target_mean", np.mean(safety_target_means)
+        )
+        self.logger.record(
+            "train/cbf_safety_prediction_rmse",
+            np.mean(safety_prediction_rmses),
+        )
+        self.logger.record(
+            "train/cbf_safety_cost_mean", np.mean(safety_cost_means)
+        )
+        self.logger.record(
+            "train/cbf_safety_fallback_rate", np.mean(safety_fallback_rates)
+        )
         self.logger.record("train/cbf_mean_correction", np.mean(mean_corrections))
         self.logger.record("train/cbf_mean_infeasible_rate", np.mean(mean_infeasible_rates))
         self.logger.record(
@@ -763,6 +1081,13 @@ class ProjectedCBFPPO(LatentActionPPO):
                 "num_timesteps": float(self.num_timesteps),
                 "mean_loss": float(np.mean(mean_losses)),
                 "sample_loss": float(np.mean(sample_losses)),
+                "safety_critic_loss": float(np.mean(safety_critic_losses)),
+                "safety_target_mean": float(np.mean(safety_target_means)),
+                "safety_prediction_rmse": float(
+                    np.mean(safety_prediction_rmses)
+                ),
+                "safety_cost_mean": float(np.mean(safety_cost_means)),
+                "safety_fallback_rate": float(np.mean(safety_fallback_rates)),
                 "mean_correction": float(np.mean(mean_corrections)),
                 "mean_infeasible_rate": float(np.mean(mean_infeasible_rates)),
                 "sample_correction": float(

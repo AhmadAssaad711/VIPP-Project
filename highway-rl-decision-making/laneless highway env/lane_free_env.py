@@ -3,7 +3,7 @@ from __future__ import annotations
 from collections import deque
 from dataclasses import dataclass
 import math
-from typing import Any
+from typing import Any, Callable
 
 import gymnasium as gym
 import numpy as np
@@ -235,6 +235,11 @@ class LaneFreeTrafficEnv(AbstractEnv):
                 "terminate_on_collision": True,
                 "gamma_nudge": 0.0,
                 "ego_controlled": True,
+                # A CBF wrapper can register a physical-action callback that
+                # is evaluated at every simulator frame.  It is deliberately
+                # opt-in so legacy policies retain their original action
+                # semantics and runtime cost.
+                "cbf_substep_filtering": False,
                 # Keep the historical lateral boundary-force assist by default.
                 # Formulation experiments can disable only the ego-side assist
                 # while retaining the same traffic and physical road model.
@@ -276,6 +281,14 @@ class LaneFreeTrafficEnv(AbstractEnv):
                     "spawn_ego_longitudinal_clearance": 18.0,
                     "spawn_ego_lateral_clearance": 0.75,
                     "spawn_time_headway": 0.75,
+                    # Optional CBF-consistent spawn condition.  When enabled,
+                    # the reset state satisfies both the inflated-ellipse
+                    # safe set h >= 0 and psi_1 = h_dot + k1 h >= 0.
+                    "spawn_cbf_safe_set": False,
+                    "spawn_cbf_eps_side": 0.10,
+                    "spawn_cbf_margin_m": 0.0,
+                    "spawn_cbf_k1": 3.68,
+                    "spawn_cbf_psi_margin": 0.0,
                     # The guard controls surrounding traffic only. It never
                     # overwrites the controlled ego action, so an unsafe ego
                     # action can still cause a meaningful collision.
@@ -390,6 +403,92 @@ class LaneFreeTrafficEnv(AbstractEnv):
         self.action_type = None
         self.observation_type = None
 
+    def set_ego_substep_action_filter(
+        self,
+        callback: Callable[[np.ndarray, int], Any] | None,
+    ) -> Callable[[np.ndarray, int], Any] | None:
+        """Install a temporary physical-action filter for simulator substeps.
+
+        The callback receives the *actual proposed ego acceleration* after
+        the optional boundary-force contribution, plus its zero-based index
+        within the policy step.  It may return either a two-element physical
+        acceleration or ``(acceleration, diagnostics)``.  The latter is
+        folded into the regular step ``info`` dictionary, allowing a CBF
+        wrapper to prove its h/psi constraints at the 100 Hz dynamics rate.
+
+        This is intentionally a narrow callback rather than a second action
+        API: normal Gym users and legacy experiments are unchanged unless a
+        wrapper explicitly enables ``cbf_substep_filtering``.
+        """
+
+        previous = getattr(self, "_ego_substep_action_filter", None)
+        self._ego_substep_action_filter = callback
+        return previous
+
+    @staticmethod
+    def _substep_filter_summary(
+        records: list[dict[str, Any]], *, enabled: bool
+    ) -> dict[str, Any]:
+        """Reduce per-frame CBF records to a compact policy-step summary."""
+
+        if not records:
+            return {
+                "enabled": bool(enabled),
+                "steps": 0,
+                "mean_correction_norm_physical": 0.0,
+                "max_correction_norm_physical": 0.0,
+                "mean_correction_norm_normalized": 0.0,
+                "max_correction_norm_normalized": 0.0,
+                "intervention_steps": 0,
+                "fallback_steps": 0,
+                "min_hocbf_margin": float("nan"),
+                "max_hocbf_violation_safe": float("nan"),
+                "hocbf_condition_satisfied": True,
+            }
+
+        def _finite_values(key: str) -> np.ndarray:
+            values = [record.get(key, np.nan) for record in records]
+            array = np.asarray(values, dtype=float).reshape(-1)
+            return array[np.isfinite(array)]
+
+        physical = _finite_values("correction_norm_physical")
+        normalized = _finite_values("correction_norm_normalized")
+        margins = _finite_values("hocbf_margin")
+        violations = _finite_values("max_hocbf_violation_safe")
+        satisfied = [
+            bool(record.get("hocbf_condition_satisfied", True))
+            for record in records
+        ]
+        return {
+            "enabled": bool(enabled),
+            "steps": int(len(records)),
+            "mean_correction_norm_physical": (
+                float(np.mean(physical)) if physical.size else 0.0
+            ),
+            "max_correction_norm_physical": (
+                float(np.max(physical)) if physical.size else 0.0
+            ),
+            "mean_correction_norm_normalized": (
+                float(np.mean(normalized)) if normalized.size else 0.0
+            ),
+            "max_correction_norm_normalized": (
+                float(np.max(normalized)) if normalized.size else 0.0
+            ),
+            "intervention_steps": int(
+                sum(bool(record.get("intervened", False)) for record in records)
+            ),
+            "fallback_steps": int(
+                sum(bool(record.get("fallback_used", False)) for record in records)
+            ),
+            "min_hocbf_margin": (
+                float(np.min(margins)) if margins.size else float("nan")
+            ),
+            "max_hocbf_violation_safe": (
+                float(np.max(violations)) if violations.size else float("nan")
+            ),
+            "hocbf_condition_satisfied": bool(all(satisfied)),
+        }
+
     def reset(
         self,
         *,
@@ -419,6 +518,13 @@ class LaneFreeTrafficEnv(AbstractEnv):
         self._mtm_aggressiveness_stats: dict[str, float] = {}
         self._last_spawn_diagnostics: dict[str, float] = {}
         self._last_traffic_safety_diagnostics: dict[str, float] = {}
+        # A wrapper owns this callback for one Gym step and clears it in a
+        # finally block.  Reset clears stale state in case a caller aborted a
+        # prior step midway through an exception.
+        self._ego_substep_action_filter: Callable[[np.ndarray, int], Any] | None = None
+        self._last_cbf_substep_diagnostics: dict[str, Any] = self._substep_filter_summary(
+            [], enabled=False
+        )
         self._reset()
         obs = self._observe()
         return obs, self._info(obs, self._last_action)
@@ -671,22 +777,77 @@ class LaneFreeTrafficEnv(AbstractEnv):
                 0.75 if ego_pair else 0.35,
             )
         )
-        if lateral_clearance >= required_lateral:
-            return True
-
-        base_longitudinal = float(
-            safety.get(
-                "spawn_ego_longitudinal_clearance"
-                if ego_pair
-                else "spawn_longitudinal_clearance",
-                18.0 if ego_pair else 6.0,
+        physical_safe = lateral_clearance >= required_lateral
+        if not physical_safe:
+            base_longitudinal = float(
+                safety.get(
+                    "spawn_ego_longitudinal_clearance"
+                    if ego_pair
+                    else "spawn_longitudinal_clearance",
+                    18.0 if ego_pair else 6.0,
+                )
             )
-        )
-        closing_speed = max(float(follower.vx - leader.vx), 0.0)
-        required_longitudinal = base_longitudinal + float(
-            safety.get("spawn_time_headway", 0.75)
-        ) * closing_speed
-        return bool(longitudinal_clearance >= required_longitudinal)
+            closing_speed = max(float(follower.vx - leader.vx), 0.0)
+            required_longitudinal = base_longitudinal + float(
+                safety.get("spawn_time_headway", 0.75)
+            ) * closing_speed
+            physical_safe = longitudinal_clearance >= required_longitudinal
+        if not physical_safe:
+            return False
+
+        # The rectangle guard prevents physical contact, but the CBF operates
+        # on an inflated ellipse.  When requested, reset states must satisfy
+        # both h >= 0 and psi_1 = h_dot + k1*h >= 0 before the first action.
+        if bool(safety.get("spawn_cbf_safe_set", False)):
+            eps = max(float(safety.get("spawn_cbf_eps_side", 0.10)), 0.0)
+            dx = float(
+                (second.x - first.x + 0.5 * road_length) % road_length
+                - 0.5 * road_length
+            )
+            dy = float(second.y - first.y)
+            center_distance = float(np.hypot(dx, dy))
+            angle = float(np.arctan2(dy, dx)) if center_distance > 1e-9 else 0.0
+
+            def _inflated_radius_terms(
+                state: LaneFreeVehicleState,
+            ) -> tuple[float, float]:
+                a = float(state.length) / np.sqrt(2.0) + 2.0 * eps
+                b = float(state.width) / np.sqrt(2.0) + 2.0 * eps
+                denominator = np.sqrt(
+                    (b * np.cos(angle)) ** 2 + (a * np.sin(angle)) ** 2
+                )
+                radius = a * b / max(float(denominator), 1e-9)
+                d_radius = (
+                    -a
+                    * b
+                    * (a * a - b * b)
+                    * np.sin(angle)
+                    * np.cos(angle)
+                    / max(float(denominator) ** 3, 1e-9)
+                )
+                return float(radius), float(d_radius)
+
+            first_radius, first_d_radius = _inflated_radius_terms(first)
+            second_radius, second_d_radius = _inflated_radius_terms(second)
+            h_value = center_distance - first_radius - second_radius
+            if h_value < float(safety.get("spawn_cbf_margin_m", 0.0)):
+                return False
+
+            radial = np.asarray([dx, dy], dtype=float) / max(center_distance, 1e-9)
+            tangent = np.asarray([-radial[1], radial[0]], dtype=float)
+            gradient = radial + (
+                -(first_d_radius + second_d_radius)
+                / max(center_distance, 1e-9)
+            ) * tangent
+            relative_velocity = np.asarray(
+                [float(second.vx - first.vx), float(second.vy - first.vy)],
+                dtype=float,
+            )
+            h_dot = float(gradient @ relative_velocity)
+            k1 = float(safety.get("spawn_cbf_k1", 3.68))
+            psi_margin = float(safety.get("spawn_cbf_psi_margin", 0.0))
+            return bool(h_dot + k1 * h_value >= psi_margin)
+        return True
 
     def _sample_mtm_profile(self) -> str:
         mtm_config = self.config.get("mtm", {})
@@ -793,18 +954,58 @@ class LaneFreeTrafficEnv(AbstractEnv):
 
         frames = max(1, int(round(float(self.config["simulation_frequency"]) / float(self.config["policy_frequency"]))))
         dt = float(self.config.get("dt", 1.0 / float(self.config["simulation_frequency"])))
-        for _ in range(frames):
+        substep_filter = getattr(self, "_ego_substep_action_filter", None)
+        substep_enabled = bool(
+            self.config.get("cbf_substep_filtering", False)
+            and callable(substep_filter)
+        )
+        substep_records: list[dict[str, Any]] = []
+        for frame_index in range(frames):
             accelerations = self._compute_accelerations()
             if bool(self.config["ego_controlled"]):
-                accelerations[0, 0] = self._map_action(action_array[0], "longitudinal")
+                ego_ax = self._map_action(action_array[0], "longitudinal")
                 ego_boundary_force = (
                     self._boundary_force(self.vehicle)
                     if bool(self.config.get("ego_boundary_force", True))
                     else 0.0
                 )
-                accelerations[0, 1] = (
-                    self._map_action(action_array[1], "lateral") + ego_boundary_force
+                proposed_ego_acceleration = np.asarray(
+                    [
+                        ego_ax,
+                        self._map_action(action_array[1], "lateral")
+                        + ego_boundary_force,
+                    ],
+                    dtype=float,
                 )
+                if substep_enabled:
+                    filtered = substep_filter(
+                        proposed_ego_acceleration.copy(), int(frame_index)
+                    )
+                    if isinstance(filtered, tuple):
+                        if len(filtered) != 2:
+                            raise ValueError(
+                                "ego substep filter must return action or (action, diagnostics)"
+                            )
+                        safe_acceleration, diagnostics = filtered
+                    else:
+                        safe_acceleration, diagnostics = filtered, {}
+                    safe_acceleration = np.asarray(
+                        safe_acceleration, dtype=float
+                    ).reshape(-1)
+                    if safe_acceleration.size < 2 or not np.all(
+                        np.isfinite(safe_acceleration[:2])
+                    ):
+                        raise ValueError(
+                            "ego substep filter returned a non-finite physical action"
+                        )
+                    accelerations[0, :2] = safe_acceleration[:2]
+                    if isinstance(diagnostics, dict):
+                        substep_records.append(dict(diagnostics))
+                    else:
+                        substep_records.append({})
+                else:
+                    accelerations[0, 0] = ego_ax
+                    accelerations[0, 1] = proposed_ego_acceleration[1]
             accelerations = self._apply_traffic_safety_guard(accelerations, dt)
             accelerations = self._clip_accelerations(accelerations)
             self._last_accelerations = accelerations
@@ -812,6 +1013,10 @@ class LaneFreeTrafficEnv(AbstractEnv):
             self._detect_collisions()
             self.steps += 1
             self.time += dt
+
+        self._last_cbf_substep_diagnostics = self._substep_filter_summary(
+            substep_records, enabled=substep_enabled
+        )
 
         obs = self._observe()
         reward = self._reward(action_array)
@@ -1944,6 +2149,7 @@ class LaneFreeTrafficEnv(AbstractEnv):
         }
         spawn = self._last_spawn_diagnostics or {}
         traffic_safety = self._last_traffic_safety_diagnostics or {}
+        substep_cbf = self._last_cbf_substep_diagnostics or {}
         info.update(
             {
                 "traffic_safe_spawn": bool(spawn.get("safe_spawn", 0.0)),
@@ -1968,6 +2174,37 @@ class LaneFreeTrafficEnv(AbstractEnv):
                 ),
                 "traffic_guard_side_projection_yields": int(
                     traffic_safety.get("side_projection_yields", 0.0)
+                ),
+                "cbf_substep_filter_enabled": bool(
+                    substep_cbf.get("enabled", False)
+                ),
+                "cbf_substep_count": int(substep_cbf.get("steps", 0)),
+                "cbf_substep_mean_correction_norm": float(
+                    substep_cbf.get("mean_correction_norm_physical", 0.0)
+                ),
+                "cbf_substep_max_correction_norm": float(
+                    substep_cbf.get("max_correction_norm_physical", 0.0)
+                ),
+                "cbf_substep_mean_correction_norm_normalized": float(
+                    substep_cbf.get("mean_correction_norm_normalized", 0.0)
+                ),
+                "cbf_substep_max_correction_norm_normalized": float(
+                    substep_cbf.get("max_correction_norm_normalized", 0.0)
+                ),
+                "cbf_substep_intervention_steps": int(
+                    substep_cbf.get("intervention_steps", 0)
+                ),
+                "cbf_substep_fallback_steps": int(
+                    substep_cbf.get("fallback_steps", 0)
+                ),
+                "cbf_substep_min_hocbf_margin": float(
+                    substep_cbf.get("min_hocbf_margin", float("nan"))
+                ),
+                "cbf_substep_max_hocbf_violation_safe": float(
+                    substep_cbf.get("max_hocbf_violation_safe", float("nan"))
+                ),
+                "cbf_substep_hocbf_condition_satisfied": bool(
+                    substep_cbf.get("hocbf_condition_satisfied", True)
                 ),
             }
         )

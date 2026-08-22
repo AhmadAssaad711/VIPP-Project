@@ -47,6 +47,9 @@ def _signature_args(**overrides: object) -> SimpleNamespace:
         "lambda_intervention": 0.10,
         "lambda_mean": 0.10,
         "lambda_sample": 0.0,
+        "lambda_critic": 0.10,
+        "safety_critic_gamma": 0.99,
+        "safety_critic_cost_clip": 1.0,
         "correction_epsilon": 0.03,
     }
     values.update(overrides)
@@ -105,6 +108,8 @@ def test_progression_contains_the_required_causal_controls():
         "ppo_cbf_reward",
         "ppo_cbf_projected_reward_off",
         "ppo_cbf_projected",
+        "ppo_cbf_integrated_actor_critic",
+        "ppo_cbf_integrated_actor_only",
     )
     nominal = progression.VARIANT_SPECS["ppo_nominal"]
     shield_only = progression.VARIANT_SPECS["ppo_cbf_shield_only"]
@@ -113,6 +118,10 @@ def test_progression_contains_the_required_causal_controls():
         "ppo_cbf_projected_reward_off"
     ]
     projected = progression.VARIANT_SPECS["ppo_cbf_projected"]
+    actor_critic = progression.VARIANT_SPECS[
+        "ppo_cbf_integrated_actor_critic"
+    ]
+    actor_only = progression.VARIANT_SPECS["ppo_cbf_integrated_actor_only"]
     assert nominal["execution_mode"] == "box"
     assert not nominal["reward_penalty"]
     assert shield_only["execution_mode"] == "cbf"
@@ -122,6 +131,10 @@ def test_progression_contains_the_required_causal_controls():
     assert projected_reward_off["projected_mean"]
     assert not projected_reward_off["reward_penalty"]
     assert projected["projected_mean"]
+    assert actor_critic["projected_mean"]
+    assert actor_critic["safety_critic"]
+    assert actor_only["projected_mean"]
+    assert not actor_only["safety_critic"]
     assert progression.FILTERED_FACTORIAL_VARIANTS == {
         (False, False): "ppo_cbf_shield_only",
         (True, False): "ppo_cbf_reward",
@@ -336,6 +349,73 @@ def test_complete_episode_evaluation_waits_for_a_terminal_episode(monkeypatch):
     assert row["episode_return"] == 6.0
     assert row["h_min"] == -0.2
     assert row["ego_collisions_per_km"] == 0.0
+
+
+def test_distance_task_caps_at_1km_and_collision_wins_over_completion():
+    class _DistanceEnv(gym.Env):
+        def __init__(self, *, collision_on_second_step: bool) -> None:
+            self.action_space = gym.spaces.Box(-1.0, 1.0, shape=(2,), dtype=np.float32)
+            self.observation_space = gym.spaces.Box(
+                -1.0, 1.0, shape=(1,), dtype=np.float32
+            )
+            self.collision_on_second_step = collision_on_second_step
+            self.steps = 0
+
+        def reset(self, *, seed=None, options=None):
+            del seed, options
+            self.steps = 0
+            return np.zeros(1, dtype=np.float32), {}
+
+        def step(self, action):
+            del action
+            self.steps += 1
+            collision = bool(
+                self.collision_on_second_step and self.steps == 2
+            )
+            return (
+                np.zeros(1, dtype=np.float32),
+                0.0,
+                # The task wrapper must terminate on a collision even when a
+                # legacy simulator configuration does not do so itself.
+                False,
+                False,
+                {
+                    "pipeline_distance_step_m": 600.0,
+                    "ego_collision": collision,
+                    # Exercise the boolean fallback too: no numeric event is
+                    # supplied on the collision transition.
+                    "ego_collision_events": 0,
+                },
+            )
+
+    completed = progression.DistanceTaskEvaluationWrapper(
+        _DistanceEnv(collision_on_second_step=False),
+        task_distance_m=1_000.0,
+        max_policy_steps=3,
+    )
+    completed.reset()
+    completed.step(np.zeros(2, dtype=np.float32))
+    _, _, terminated, truncated, completed_info = completed.step(
+        np.zeros(2, dtype=np.float32)
+    )
+    assert terminated and not truncated
+    assert completed_info["task_completed"]
+    assert completed_info["task_distance_traveled_m"] == 1_000.0
+
+    collided = progression.DistanceTaskEvaluationWrapper(
+        _DistanceEnv(collision_on_second_step=True),
+        task_distance_m=1_000.0,
+        max_policy_steps=3,
+    )
+    collided.reset()
+    collided.step(np.zeros(2, dtype=np.float32))
+    _, _, terminated, _truncated, collision_info = collided.step(
+        np.zeros(2, dtype=np.float32)
+    )
+    assert terminated
+    assert not collision_info["task_completed"]
+    assert collision_info["task_collision_terminated"]
+    assert collision_info["task_distance_traveled_m"] == 1_000.0
 
 
 def test_long_windows_tensorboard_path_uses_durable_artifacts(tmp_path, monkeypatch):
@@ -647,60 +727,53 @@ def test_action_clip_callback_accepts_batched_parallel_actions():
 def test_notebook_primary_ladder_is_ppo_first_and_streams_inline():
     notebook_path = PROJECT_ROOT / "notebooks" / "lanelessKaralakou.ipynb"
     notebook = json.loads(notebook_path.read_text(encoding="utf-8"))
-    assert len(notebook["cells"]) == 86
+    assert len(notebook["cells"]) == 90
     sources = {
         cell.get("id"): "".join(cell.get("source", []))
         for cell in notebook["cells"]
     }
-    assert "PPO–CBF Research Ladder" in sources["959ff31d"]
-    assert "Primary PPO Experiment Ladder" in sources["26a35305"]
+    assert "Canonical 1M PPO study" in sources["959ff31d"]
+    assert "Canonical 1M PPO" in sources["26a35305"]
     launcher = sources["eb9eade5"]
     assert "run_ppo_cbf_progression.py" in launcher
-    assert "PPO_RUN_TRAINING = True" in launcher
-    assert "PPO_FORCE_RETRAIN = False" in launcher
-    assert "PPO_RUN_POST_TRAIN_EVALUATION = True" in launcher
-    assert "PPO_POST_TRAIN_EVAL_EPISODES = 200" in launcher
-    assert "PPO_POST_TRAIN_EVALUATE_REUSED =" in launcher
-    assert "PPO_PROGRESSION_NUM_ENVS" in launcher
-    assert "PPO_PROGRESSION_COMPLETED = True" in launcher
-    assert '"--skip-training"' in launcher
-    assert "RUN_PPO_PROGRESSION" not in launcher
+    assert "PPO_1M_RUN_TRAINING" in launcher
+    assert "PPO_1M_FORCE_RETRAIN" in launcher
+    assert "PPO_1M_REQUIRE_CUDA = True" in launcher
+    assert "PPO_1M_POST_TRAIN_EVAL_EPISODES = 200" in launcher
+    assert "PPO_1M_NUM_ENVS = int" in launcher
+    assert "PPO_1M_GLOBAL_ROLLOUT = 1_000" in launcher
+    assert "PPO_1M_BATCH_SIZE = 100" in launcher
+    assert "PPO_1M_EPOCHS = 10" in launcher
+    assert "PPO_1M_TIMESTEPS_PER_POLICY" in launcher
     assert '"--traffic-model", "mtm"' in launcher
-    assert '"--n-envs", str(PPO_PROGRESSION_NUM_ENVS)' in launcher
-    assert '"--post-train-eval-episodes", str(PPO_POST_TRAIN_EVAL_EPISODES)' in launcher
-    assert '"--skip-post-train-evaluation"' in launcher
+    assert '"--n-envs", str(PPO_1M_NUM_ENVS)' in launcher
+    assert '"--post-train-eval-episodes", str(PPO_1M_POST_TRAIN_EVAL_EPISODES)' in launcher
+    assert '"--task-distance-m", str(PPO_1M_TASK_DISTANCE_M)' in launcher
     assert '"--post-train-evaluate-reused"' in launcher
     assert "subprocess.Popen" in launcher
     assert "stdout=subprocess.PIPE" in launcher
     assert "stderr=subprocess.STDOUT" in launcher
-    assert "PPO_PROGRESSION_LOG_PATH" in launcher
-    elongated = sources["ppo_nominal_500k"]
-    assert "PPO_NOMINAL_500K_TIMESTEPS = 500_000" in elongated
-    assert "PPO_NOMINAL_500K_PPO_CONFIG = 'Q1_stable'" in elongated
-    assert "'--variants', 'ppo_nominal'" in elongated
-    assert "'--post-train-eval-episodes', str(PPO_NOMINAL_500K_EVAL_EPISODES)" in elongated
-    assert "'--skip-evaluation'" in elongated
-    assert "'--skip-counterfactual'" in elongated
-    assert "plot_nominal_ppo_results.py" in elongated
-    assert "06_tensorboard_rollout_scalars.png" in elongated
-    assert "02_post_training_400_episode_kpis.png" in elongated
-    assert "Differentiable CBF Final Optimization/Action Layer" in sources["050cad8d"]
+    assert "PPO_1M_RESULTS[\"ppo_nominal\"]" in sources["ppo_primary_3m"]
+    assert "PPO_1M_RESULTS[\"ppo_cbf_reward\"]" in sources["ppo_nominal_500k"]
+    assert "ppo_cbf_integrated_actor_critic" in sources["6ffd8341"]
+    assert "ppo_cbf_integrated_actor_only" in sources["3b70133c"]
+    assert "safety-critic loss" in sources["729d0c1b"]
+    assert "Distance-based completion rate" in sources["ppo_cbf_projected_500k"]
     assert '"ego_dimensions": [3.5, 1.8]' in sources["c9f74b85"]
-    assert "smoke_ego_dimensions" in sources["2c6e9a65"]
-    assert "Re-run All PPO Evaluations Inline Without Retraining" in sources[
-        "cbf_filter_ablation_heading"
-    ]
-    assert '"--skip-training"' in sources["cbf_filter_ablation_eval"]
+    assert "PPO_1M_RUN_TRAINING = bool" in launcher
+    assert "Read-only status refresh" in sources["cbf_filter_ablation_heading"]
+    assert "post_train_200ep_kpis_ready" in sources["cbf_filter_ablation_eval"]
     active_runner = sources["f7b6efd6"]
-    assert "PPO is launched only by the primary workflow cell" in active_runner
-    assert "RUN_ACTIVE_PPO_TRAIN" not in active_runner
+    assert '"ppo": "ppo-train"' in active_runner
 
 
 def test_notebook_task_ppo_entry_targets_the_progression():
     task = notebook_task.TASKS["ppo-train"]
     assert task["cell"] == 11
-    assert task["flag"] == "PPO_RUN_TRAINING"
-    assert task["timesteps_key"] == "_PPO_TASK_TIMESTEPS_OVERRIDE"
+    assert task["flag"] == "PPO_1M_RUN_TRAINING"
+    assert task["timesteps_key"] == "PPO_1M_TIMESTEPS_PER_POLICY"
+    assert task["n_envs_key"] == "PPO_1M_NUM_ENVS"
+    assert task["train_cells"] == [13, 15, 17, 19]
 
 
 def test_latest_checkpoint_selection_is_timestep_ordered(tmp_path):

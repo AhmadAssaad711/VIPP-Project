@@ -103,6 +103,9 @@ def apply_overrides(namespace: dict[str, Any], args: argparse.Namespace, task: d
     if args.n_envs is not None:
         namespace["DDPG_NUM_ENVS"] = int(args.n_envs)
         namespace["DDPG_CBF_NUM_ENVS"] = int(args.n_envs)
+        ppo_n_envs_key = task.get("n_envs_key")
+        if ppo_n_envs_key:
+            namespace[str(ppo_n_envs_key)] = int(args.n_envs)
     if args.lambda_filter is not None:
         namespace["CBF_FILTER_REWARD_LAMBDA"] = float(args.lambda_filter)
     if args.k0 is not None:
@@ -164,8 +167,12 @@ TASKS = {
     "ppo-train": {
         "deps": [2, 3, 5, 6, 8],
         "cell": 11,
-        "flag": "PPO_RUN_TRAINING",
-        "timesteps_key": "_PPO_TASK_TIMESTEPS_OVERRIDE",
+        # The canonical notebook setup cell only defines the shared launcher.
+        # These four cells invoke its sequential 1M-per-policy runners.
+        "train_cells": [13, 15, 17, 19],
+        "flag": "PPO_1M_RUN_TRAINING",
+        "timesteps_key": "PPO_1M_TIMESTEPS_PER_POLICY",
+        "n_envs_key": "PPO_1M_NUM_ENVS",
     },
     "ddpg-train": {
         "deps": [2, 3, 5, 6, 8, 9],
@@ -295,11 +302,13 @@ def main() -> int:
         )
     else:
         exec_notebook_cell(notebook, notebook_path, int(task["cell"]), namespace)
+        for followup_cell in task.get("train_cells", []):
+            exec_notebook_cell(notebook, notebook_path, int(followup_cell), namespace)
     if args.task == "ppo-train":
-        # Cell 11 delegates to the canonical five-variant PPO progression.
-        # Its runner owns the per-variant manifests and evaluation artifacts,
-        # so the legacy single-model archive path below does not apply.
-        print("[notebook-task] completed ppo-train via PPO-CBF progression runner", flush=True)
+        # Each of the four notebook runners owns its model manifest and paired
+        # 200-OFF/200-ON evaluation artifacts, so the legacy single-model
+        # archive path below does not apply.
+        print("[notebook-task] completed canonical four-policy PPO-CBF ladder", flush=True)
         return 0
 
     tensorboard_after = snapshot_tensorboard_events(tensorboard_roots)

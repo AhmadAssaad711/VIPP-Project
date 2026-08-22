@@ -1,13 +1,14 @@
-"""Canonical PPO progression: external shield, reward feedback, projected policy.
+"""Canonical PPO progression: shield, reward feedback, and integrated CBF PPO.
 
 The primary study is:
 
 1. train nominal PPO once and deploy the same checkpoint raw and with CBF;
 2. train PPO while executing the CBF, with an explicit shield-only control;
-3. cross reward feedback off/on with projected actor off/on as a complete 2x2;
-4. place the differentiable CBF-QP on the policy mean and retain a final hard
-   projection for the sampled latent action, with both reward-off and
-   reward-on projected-policy variants.
+3. place the differentiable CBF-QP on the policy mean, retain a final hard
+   projection for the sampled latent action, and train both an actor
+   internalization loss and a separate CBF safety-critic loss;
+4. provide an otherwise identical integrated-policy control with the safety
+   critic coefficient set to zero.
 
 Every newly trained model is immediately checked over 200 complete episodes
 with the external CBF OFF and another 200 paired episodes with it ON; both
@@ -35,6 +36,20 @@ from functools import partial
 from pathlib import Path
 from typing import Any, Iterable
 
+# Eight vectorized simulator workers already provide the intended CPU
+# parallelism.  Set these before NumPy/PyTorch import so one BLAS/OpenMP pool
+# per worker cannot oversubscribe the machine and freeze the desktop during a
+# long CUDA-backed PPO run.
+for _native_thread_key in (
+    "OMP_NUM_THREADS",
+    "OPENBLAS_NUM_THREADS",
+    "MKL_NUM_THREADS",
+    "NUMEXPR_NUM_THREADS",
+    "VECLIB_MAXIMUM_THREADS",
+    "TORCH_NUM_THREADS",
+):
+    os.environ.setdefault(_native_thread_key, "1")
+
 import gymnasium as gym
 import numpy as np
 import pandas as pd
@@ -52,6 +67,7 @@ from laneless_script_config import (
     env_config_from_args,
 )
 from ppo_cbf_env import CBFContextPhysicalActionWrapper
+from ppo_observation_variants import install_previous_action_observation
 from projected_ppo_cbf import (
     LatentActionPPO,
     ProjectedCBFActorCriticPolicy,
@@ -59,11 +75,11 @@ from projected_ppo_cbf import (
     context_ignoring_policy_kwargs,
 )
 from run_nominal_ppo_parameter_pilot import PPOActionClipCallback, PPO_CONFIGS
-from train_safety_potential_variants import MTM_CONGESTED_UNCERTAIN_UPDATES, deep_update
+from train_safety_potential_variants import MTM_CONGESTED_UNCERTAIN_UPDATES
 
 
-PROGRESSION_SCHEMA_VERSION = 3
-PPO_TRAINING_IMPLEMENTATION_VERSION = 7
+PROGRESSION_SCHEMA_VERSION = 5
+PPO_TRAINING_IMPLEMENTATION_VERSION = 9
 TRAINING_SIGNATURE_FILE = "training_signature.json"
 TRAINING_PENDING_SIGNATURE_FILE = "training_signature.pending.json"
 TRAINING_COMPLETION_FILE = "training_complete.json"
@@ -74,6 +90,8 @@ DEFAULT_EVAL_SCENARIOS = 10
 DEFAULT_EVAL_TIMESTEPS = 800
 DEFAULT_POST_TRAIN_EVAL_EPISODES = 200
 DEFAULT_POST_TRAIN_EVAL_SEED_START = 1_100_000
+DEFAULT_TASK_DISTANCE_M = 1_000.0
+DEFAULT_TASK_MAX_POLICY_STEPS = 3_000
 POST_TRAIN_EVAL_SUMMARY_BLOCKS = 10
 DEFAULT_PPO_CONFIG = "Q0_current_aligned"
 # The lane-free simulator and CBF projection are CPU-bound.  Eight workers use
@@ -88,6 +106,7 @@ VARIANT_SPECS: dict[str, dict[str, Any]] = {
         "execution_mode": "box",
         "reward_penalty": False,
         "projected_mean": False,
+        "safety_critic": False,
     },
     "ppo_cbf_shield_only": {
         "label": "PPO trained with CBF execution (reward-off control)",
@@ -95,6 +114,7 @@ VARIANT_SPECS: dict[str, dict[str, Any]] = {
         "execution_mode": "cbf",
         "reward_penalty": False,
         "projected_mean": False,
+        "safety_critic": False,
     },
     "ppo_cbf_reward": {
         "label": "PPO trained with CBF execution + intervention reward",
@@ -102,6 +122,7 @@ VARIANT_SPECS: dict[str, dict[str, Any]] = {
         "execution_mode": "cbf",
         "reward_penalty": True,
         "projected_mean": False,
+        "safety_critic": False,
     },
     "ppo_cbf_projected_reward_off": {
         "label": "PPO projected CBF (reward-off architecture control)",
@@ -109,6 +130,7 @@ VARIANT_SPECS: dict[str, dict[str, Any]] = {
         "execution_mode": "cbf",
         "reward_penalty": False,
         "projected_mean": True,
+        "safety_critic": False,
     },
     "ppo_cbf_projected": {
         "label": "PPO with differentiable CBF final optimization layer",
@@ -116,9 +138,35 @@ VARIANT_SPECS: dict[str, dict[str, Any]] = {
         "execution_mode": "cbf",
         "reward_penalty": True,
         "projected_mean": True,
+        "safety_critic": False,
+    },
+    "ppo_cbf_integrated_actor_critic": {
+        "label": "PPO with integrated CBF actor and safety-critic losses",
+        "level": 3,
+        "execution_mode": "cbf",
+        "reward_penalty": True,
+        "projected_mean": True,
+        "safety_critic": True,
+    },
+    "ppo_cbf_integrated_actor_only": {
+        "label": "PPO with integrated CBF actor loss (safety-critic control)",
+        "level": 3,
+        "execution_mode": "cbf",
+        "reward_penalty": True,
+        "projected_mean": True,
+        "safety_critic": False,
     },
 }
-DEFAULT_VARIANTS = tuple(VARIANT_SPECS)
+# Preserve the historical default ladder. The canonical 1M notebook passes
+# its four requested variants explicitly, so older calls do not silently add
+# new multi-million-step jobs.
+DEFAULT_VARIANTS = (
+    "ppo_nominal",
+    "ppo_cbf_shield_only",
+    "ppo_cbf_reward",
+    "ppo_cbf_projected_reward_off",
+    "ppo_cbf_projected",
+)
 EVALUATION_MODES = ("raw", "cbf")
 
 
@@ -132,7 +180,20 @@ def _base_observation_features(env_config: dict[str, Any]) -> list[str]:
 
 def _base_observation_dim(env_config: dict[str, Any]) -> int:
     rows = 1 + int(env_config.get("neighbors_count", 5))
-    return rows * len(_base_observation_features(env_config))
+    base = rows * len(_base_observation_features(env_config))
+    return base + (2 if bool(env_config.get("ppo_append_previous_action", False)) else 0)
+
+
+def _ensure_ppo_observation_variant(
+    namespace: dict[str, Any], env_config: dict[str, Any]
+) -> None:
+    """Install the canonical 32D target-y + previous-action observation once."""
+
+    if not bool(env_config.get("ppo_append_previous_action", False)):
+        return
+    if namespace.get("PPO_OBSERVATION_VARIANT") == "target_y_plus_previous_action":
+        return
+    install_previous_action_observation(namespace)
 
 
 POST_TRAIN_EPISODE_MEAN_COLUMNS = {
@@ -170,6 +231,8 @@ TENSORBOARD_VARIANT_IDS = {
     "ppo_cbf_reward": "rwd",
     "ppo_cbf_projected_reward_off": "pro0",
     "ppo_cbf_projected": "pro",
+    "ppo_cbf_integrated_actor_critic": "iac",
+    "ppo_cbf_integrated_actor_only": "iao",
 }
 
 
@@ -192,6 +255,17 @@ def _finite_min(values: Iterable[float], default: float = np.nan) -> float:
     array = np.asarray(list(values), dtype=float).reshape(-1)
     array = array[np.isfinite(array)]
     return float(np.min(array)) if array.size else float(default)
+
+
+def _deep_set_defaults(base: dict[str, Any], defaults: dict[str, Any]) -> dict[str, Any]:
+    """Fill MTM defaults without silently overwriting an explicit study setup."""
+
+    for key, value in defaults.items():
+        if key not in base:
+            base[key] = copy.deepcopy(value)
+        elif isinstance(base[key], dict) and isinstance(value, dict):
+            _deep_set_defaults(base[key], value)
+    return base
 
 
 def _evaluation_horizon_steps(env_config: dict[str, Any]) -> int:
@@ -245,27 +319,38 @@ def _ensure_full_horizon_survival_metric(
     return enriched
 
 
-def _distance_completion_target_m(env_config: dict[str, Any]) -> float:
-    """Return the simulator distance that defines one completed episode."""
+def _distance_completion_target_m(
+    env_config: dict[str, Any], *, task_distance_m: float | None = None
+) -> float:
+    """Return the strict collision-free distance-task completion target."""
 
-    target_distance_m = float(env_config.get("road_length", 0.0))
+    target_distance_m = float(
+        task_distance_m
+        if task_distance_m is not None
+        else env_config.get("evaluation_task_distance_m", DEFAULT_TASK_DISTANCE_M)
+    )
     if not np.isfinite(target_distance_m) or target_distance_m <= 0.0:
         raise ValueError(
-            "Distance-based completion requires a positive finite simulator "
-            "road_length in env_config."
+            "Distance-based completion requires a positive finite task distance."
         )
     return target_distance_m
 
 
 def _distance_completion_flag(
-    *, total_distance_m: float, collision_events: int, env_config: dict[str, Any]
+    *,
+    total_distance_m: float,
+    collision_events: int,
+    env_config: dict[str, Any],
+    task_distance_m: float | None = None,
 ) -> float:
-    """Mark a collision-free episode that traversed one simulator road length."""
+    """Mark a collision-free episode that reaches the strict task distance."""
 
     distance_m = float(total_distance_m)
     return float(
         np.isfinite(distance_m)
-        and distance_m >= _distance_completion_target_m(env_config)
+        and distance_m >= _distance_completion_target_m(
+            env_config, task_distance_m=task_distance_m
+        )
         and int(collision_events) == 0
     )
 
@@ -292,6 +377,117 @@ def _ensure_distance_completion_metric(
         for distance, collision in zip(distances, collisions)
     ]
     return enriched
+
+
+def _task_distance_from_args(args: argparse.Namespace, env_config: dict[str, Any]) -> float:
+    """Resolve a positive explicit task distance, defaulting to 1 km."""
+
+    return _distance_completion_target_m(
+        env_config,
+        task_distance_m=getattr(args, "task_distance_m", DEFAULT_TASK_DISTANCE_M),
+    )
+
+
+def _task_max_policy_steps_from_args(args: argparse.Namespace) -> int:
+    """Resolve the policy-step timeout for a complete distance-task episode."""
+
+    value = int(
+        getattr(args, "task_max_policy_steps", DEFAULT_TASK_MAX_POLICY_STEPS)
+    )
+    if value <= 0:
+        raise ValueError("task_max_policy_steps must be positive")
+    return value
+
+
+class DistanceTaskEvaluationWrapper(gym.Wrapper):
+    """Cap an evaluation episode at an exact collision-free task distance.
+
+    The simulator may wrap around its short physical road.  This wrapper keeps
+    a separate path-distance task, terminates on the first collision, and
+    reports a capped task distance so an evaluation record can never exceed
+    the requested completion distance.
+    """
+
+    def __init__(
+        self,
+        env: gym.Env,
+        *,
+        task_distance_m: float,
+        max_policy_steps: int,
+    ) -> None:
+        super().__init__(env)
+        self.task_distance_m = _distance_completion_target_m(
+            {}, task_distance_m=float(task_distance_m)
+        )
+        self.max_policy_steps = int(max_policy_steps)
+        if self.max_policy_steps <= 0:
+            raise ValueError("max_policy_steps must be positive")
+        self._task_distance_traveled_m = 0.0
+        self._task_steps = 0
+
+    def reset(self, **kwargs):
+        observation, info = self.env.reset(**kwargs)
+        self._task_distance_traveled_m = 0.0
+        self._task_steps = 0
+        info = dict(info)
+        info.update(
+            {
+                "task_distance_m": float(self.task_distance_m),
+                "task_distance_traveled_m": 0.0,
+                "task_distance_step_m": 0.0,
+                "task_completed": False,
+                "task_timeout": False,
+            }
+        )
+        return observation, info
+
+    def step(self, action):
+        observation, reward, terminated, truncated, info = self.env.step(action)
+        info = dict(info)
+        raw_step_distance = float(info.get("pipeline_distance_step_m", 0.0))
+        if not np.isfinite(raw_step_distance):
+            raw_step_distance = 0.0
+        remaining = max(self.task_distance_m - self._task_distance_traveled_m, 0.0)
+        counted_step_distance = min(max(raw_step_distance, 0.0), remaining)
+        self._task_distance_traveled_m = min(
+            self.task_distance_m,
+            self._task_distance_traveled_m + counted_step_distance,
+        )
+        self._task_steps += 1
+        collision = bool(
+            info.get("ego_collision", False)
+            or int(info.get("ego_collision_events", 0)) > 0
+        )
+        completed = bool(
+            not collision
+            and self._task_distance_traveled_m >= self.task_distance_m - 1e-9
+        )
+        timeout = bool(
+            not completed
+            and not collision
+            and (
+                self._task_steps >= self.max_policy_steps
+                or bool(truncated)
+            )
+        )
+        # Treat a reported ego collision as terminal even if a caller supplied
+        # a simulator config with collision termination disabled.  Completion
+        # is collision-free by definition, so the collision has precedence on
+        # a transition that reaches the distance cap as well.
+        terminated = bool(terminated or collision or completed)
+        truncated = bool(truncated or timeout)
+        info.update(
+            {
+                "task_distance_m": float(self.task_distance_m),
+                "task_distance_traveled_m": float(self._task_distance_traveled_m),
+                "task_distance_step_m": float(counted_step_distance),
+                "task_completed": completed,
+                "task_timeout": timeout,
+                "task_collision_terminated": bool(collision),
+                "evaluation_distance_cap_m": float(self.task_distance_m),
+            }
+        )
+        return observation, reward, terminated, truncated, info
 
 
 def _predict_evaluation_action(
@@ -383,11 +579,26 @@ def _effective_training_settings(
         "lambda_sample": (
             float(args.lambda_sample) if bool(spec["projected_mean"]) else 0.0
         ),
-            "action_rate_penalty": (
-                float(getattr(args, "action_rate_penalty", 0.0))
-                if str(variant) == "ppo_nominal"
-                else 0.0
-            ),
+        "lambda_critic": (
+            float(getattr(args, "lambda_critic", 0.10))
+            if bool(spec.get("safety_critic", False))
+            else 0.0
+        ),
+        "safety_critic_gamma": (
+            float(getattr(args, "safety_critic_gamma", 0.99))
+            if bool(spec["projected_mean"])
+            else 0.0
+        ),
+        "safety_critic_cost_clip": (
+            float(getattr(args, "safety_critic_cost_clip", 1.0))
+            if bool(spec["projected_mean"])
+            else 0.0
+        ),
+        "action_rate_penalty": (
+            float(getattr(args, "action_rate_penalty", 0.0))
+            if str(variant) == "ppo_nominal"
+            else 0.0
+        ),
     }
 
 
@@ -456,7 +667,21 @@ def training_signature(
             "activation": "torch.nn.Tanh",
             "base_observation_dim": _base_observation_dim(env_config),
             "base_observation_features": _base_observation_features(env_config),
+            "observation_variant": (
+                "target_y_plus_previous_executed_action"
+                if bool(env_config.get("ppo_append_previous_action", False))
+                else "base_vehicle_table"
+            ),
+            "previous_action_semantics": (
+                "last_normalized_executed_physics_action"
+                if bool(env_config.get("ppo_append_previous_action", False))
+                else None
+            ),
             "max_cbf_constraints": 18,
+            "safety_critic_head": bool(VARIANT_SPECS[variant]["projected_mean"]),
+            "safety_critic_loss_enabled": bool(
+                VARIANT_SPECS[variant].get("safety_critic", False)
+            ),
         },
         "action_contract": {
             "buffer_action": "latent Gaussian sample z",
@@ -466,6 +691,22 @@ def training_signature(
                 else "physical action-box projection"
             ),
             "project_inputs_during_collection": False,
+            "cbf_substep_filtering": bool(
+                env_config.get("cbf_substep_filtering", False)
+                and VARIANT_SPECS[variant]["execution_mode"] == "cbf"
+            ),
+            "physics_substeps_per_policy_action": max(
+                1,
+                int(
+                    round(
+                        float(env_config.get("simulation_frequency", 1.0))
+                        / max(
+                            float(env_config.get("policy_frequency", 1.0)),
+                            1e-9,
+                        )
+                    )
+                ),
+            ),
         },
         "effective_training_settings": _effective_training_settings(
             variant, args
@@ -812,6 +1053,7 @@ def _base_environment(
     env_config: dict[str, Any],
     reward_config: dict[str, float],
 ) -> gym.Env:
+    _ensure_ppo_observation_variant(namespace, env_config)
     env = gym.make(
         "lane-free-v0", render_mode=None, config=copy.deepcopy(env_config)
     )
@@ -1087,6 +1329,13 @@ def build_model(
             train_env,
             lambda_mean=float(args.lambda_mean),
             lambda_sample=float(args.lambda_sample),
+            lambda_critic=(
+                float(args.lambda_critic)
+                if bool(spec.get("safety_critic", False))
+                else 0.0
+            ),
+            safety_gamma=float(args.safety_critic_gamma),
+            safety_cost_clip=float(args.safety_critic_cost_clip),
             policy_kwargs=projected_policy_kwargs,
             **common_model_kwargs,
         )
@@ -1457,8 +1706,10 @@ def make_evaluation_env(
     env_config: dict[str, Any],
     reward_config: dict[str, float],
     correction_epsilon: float,
+    task_distance_m: float = DEFAULT_TASK_DISTANCE_M,
+    task_max_policy_steps: int = DEFAULT_TASK_MAX_POLICY_STEPS,
 ) -> gym.Env:
-    return make_ppo_cbf_env(
+    env = make_ppo_cbf_env(
         namespace,
         env_config=env_config,
         reward_config=reward_config,
@@ -1467,6 +1718,11 @@ def make_evaluation_env(
         lambda_intervention=0.0,
         correction_epsilon=correction_epsilon,
         monitor_path=None,
+    )
+    return DistanceTaskEvaluationWrapper(
+        env,
+        task_distance_m=float(task_distance_m),
+        max_policy_steps=int(task_max_policy_steps),
     )
 
 
@@ -1489,6 +1745,8 @@ def evaluate_scenario(
         env_config=env_config,
         reward_config=reward_config,
         correction_epsilon=float(args.correction_epsilon),
+        task_distance_m=_task_distance_from_args(args, env_config),
+        task_max_policy_steps=_task_max_policy_steps_from_args(args),
     )
     try:
         observation, _ = env.reset(seed=int(scenario_seed))
@@ -1537,8 +1795,24 @@ def evaluate_scenario(
             rewards.append(float(reward))
             segment_return += float(reward)
             segment_steps += 1
-            total_distance_m += float(info.get("pipeline_distance_step_m", 0.0))
-            collision_events += max(int(info.get("ego_collision_events", 0)), 0)
+            total_distance_m += float(
+                info.get(
+                    "task_distance_step_m",
+                    info.get("pipeline_distance_step_m", 0.0),
+                )
+            )
+            step_collision_events = max(
+                int(info.get("ego_collision_events", 0)), 0
+            )
+            if (
+                step_collision_events == 0
+                and bool(
+                    info.get("ego_collision", False)
+                    or info.get("task_collision_terminated", False)
+                )
+            ):
+                step_collision_events = 1
+            collision_events += step_collision_events
             base = env.unwrapped
             speed_errors.append(
                 float(
@@ -1578,11 +1852,11 @@ def evaluate_scenario(
             if terminated or truncated:
                 episode_returns.append(float(segment_return))
                 episode_lengths.append(float(segment_steps))
-                segment_return = 0.0
+                # A scenario is one strict distance task, not a concatenation
+                # of reset episodes.  Continuing here would make a reported
+                # "scenario distance" exceed the 1 km completion cap.
                 segment_steps = 0
-                previous_acceleration = np.zeros(2, dtype=float)
-                if step + 1 < int(args.eval_timesteps):
-                    observation, _ = env.reset()
+                break
 
         if segment_steps > 0:
             episode_returns.append(float(segment_return))
@@ -1647,6 +1921,8 @@ def evaluate_completed_episode(
         env_config=env_config,
         reward_config=reward_config,
         correction_epsilon=float(args.correction_epsilon),
+        task_distance_m=_task_distance_from_args(args, env_config),
+        task_max_policy_steps=_task_max_policy_steps_from_args(args),
     )
     try:
         observation, _ = env.reset(seed=int(episode_seed))
@@ -1689,8 +1965,24 @@ def evaluate_completed_episode(
             observation, reward, terminated, truncated, info = env.step(action)
             info = dict(info)
             rewards.append(float(reward))
-            total_distance_m += float(info.get("pipeline_distance_step_m", 0.0))
-            collision_events += max(int(info.get("ego_collision_events", 0)), 0)
+            total_distance_m += float(
+                info.get(
+                    "task_distance_step_m",
+                    info.get("pipeline_distance_step_m", 0.0),
+                )
+            )
+            step_collision_events = max(
+                int(info.get("ego_collision_events", 0)), 0
+            )
+            if (
+                step_collision_events == 0
+                and bool(
+                    info.get("ego_collision", False)
+                    or info.get("task_collision_terminated", False)
+                )
+            ):
+                step_collision_events = 1
+            collision_events += step_collision_events
             base = env.unwrapped
             speed_errors.append(
                 float(
@@ -1771,6 +2063,18 @@ def evaluate_completed_episode(
                 total_distance_m=total_distance_m,
                 collision_events=collision_events,
                 env_config=env_config,
+                task_distance_m=_task_distance_from_args(args, env_config),
+            ),
+            "task_distance_m": float(
+                info.get(
+                    "task_distance_m",
+                    _task_distance_from_args(args, env_config),
+                )
+            ),
+            "task_completed": bool(info.get("task_completed", False)),
+            "task_timeout": bool(info.get("task_timeout", False)),
+            "task_collision_terminated": bool(
+                info.get("task_collision_terminated", False)
             ),
             "shadow_event_intervention_rate": _finite_mean(
                 shadow_interventions, default=0.0
@@ -2101,9 +2405,9 @@ def evaluate_post_training_model(
             "episode means; h_min is the block minimum."
         ),
         "completion_definition": (
-            "distance_completion_rate=1 when simulator total_distance_m is at "
-            f"least road_length ({_distance_completion_target_m(env_config):.6g} m) "
-            "and distinct_ego_collision_events is zero."
+            "distance_completion_rate=1 when capped task distance reaches "
+            f"{_task_distance_from_args(args, env_config):.6g} m and "
+            "distinct_ego_collision_events is zero."
         ),
         "complete": True,
     }
@@ -2286,11 +2590,11 @@ def repair_post_training_summaries(output_dir: Path) -> pd.DataFrame:
                 "before Mean/SD is calculated; return and episode length are "
                 "episode means; h_min is the block minimum."
             ),
-            "completion_definition": (
-                "distance_completion_rate=1 when simulator total_distance_m is at "
-                f"least road_length ({_distance_completion_target_m(env_config):.6g} m) "
-                "and distinct_ego_collision_events is zero."
-            ),
+        "completion_definition": (
+            "distance_completion_rate=1 when capped task distance reaches "
+            f"{_task_distance_from_args(args, env_config):.6g} m and "
+            "distinct_ego_collision_events is zero."
+        ),
             "complete": True,
         }
         manifest_path.write_text(json.dumps(manifest, indent=2), encoding="utf-8")
@@ -2698,6 +3002,27 @@ def parse_args() -> argparse.Namespace:
         default=0.0,
         help="Optional fresh-sample internalization loss; default off for the primary run.",
     )
+    parser.add_argument(
+        "--lambda-critic",
+        type=float,
+        default=0.10,
+        help=(
+            "Coefficient for the integrated policy's auxiliary CBF safety-critic "
+            "loss; it is active only for the actor+critic Level-3 variant."
+        ),
+    )
+    parser.add_argument(
+        "--safety-critic-gamma",
+        type=float,
+        default=0.99,
+        help="Discount for the safety critic's future CBF-correction cost target.",
+    )
+    parser.add_argument(
+        "--safety-critic-cost-clip",
+        type=float,
+        default=1.0,
+        help="Positive clip for the per-step normalized squared CBF correction cost.",
+    )
     parser.add_argument("--correction-epsilon", type=float, default=0.03)
     parser.add_argument(
         "--checkpoint-freq",
@@ -2709,6 +3034,24 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--eval-scenarios", type=int, default=DEFAULT_EVAL_SCENARIOS)
     parser.add_argument("--eval-seeds", type=int, nargs="+", default=None)
     parser.add_argument("--eval-timesteps", type=int, default=DEFAULT_EVAL_TIMESTEPS)
+    parser.add_argument(
+        "--task-distance-m",
+        type=float,
+        default=DEFAULT_TASK_DISTANCE_M,
+        help=(
+            "Strict collision-free completion distance for every evaluation "
+            "episode; default=1,000 m."
+        ),
+    )
+    parser.add_argument(
+        "--task-max-policy-steps",
+        type=int,
+        default=DEFAULT_TASK_MAX_POLICY_STEPS,
+        help=(
+            "Maximum policy decisions for one complete distance-task evaluation "
+            "episode."
+        ),
+    )
     parser.add_argument("--ttc-cap", type=float, default=30.0)
     parser.add_argument(
         "--post-train-eval-episodes",
@@ -2804,6 +3147,14 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> int:
     protocol.set_stable_native_defaults()
+    # The learner is CUDA-bound in the canonical notebook; limiting its host
+    # thread pools prevents competition with the eight CPU simulator workers.
+    # (``set_num_interop_threads`` can only be called once in a process.)
+    try:
+        th.set_num_threads(1)
+        th.set_num_interop_threads(1)
+    except RuntimeError:
+        pass
     os.environ.setdefault("MPLBACKEND", "Agg")
     args = parse_args()
     if args.skip_training and args.force_retrain:
@@ -2826,6 +3177,8 @@ def main() -> int:
         raise ValueError("At least one evaluation seed is required")
     if int(args.eval_timesteps) <= 0:
         raise ValueError("Evaluation timestep budget must be positive")
+    _task_distance_from_args(args, {})
+    _task_max_policy_steps_from_args(args)
     if int(args.post_train_eval_episodes) <= 0:
         raise ValueError("post-train-eval-episodes must be positive")
     if int(args.checkpoint_freq) <= 0:
@@ -2834,6 +3187,18 @@ def main() -> int:
         args.action_rate_penalty
     ) < 0.0:
         raise ValueError("--action-rate-penalty must be finite and non-negative")
+    for name in ("lambda_mean", "lambda_sample", "lambda_critic"):
+        value = float(getattr(args, name))
+        if not np.isfinite(value) or value < 0.0:
+            raise ValueError(f"--{name.replace('_', '-')} must be finite and non-negative")
+    if not np.isfinite(float(args.safety_critic_gamma)) or not 0.0 <= float(
+        args.safety_critic_gamma
+    ) <= 1.0:
+        raise ValueError("--safety-critic-gamma must be finite and lie in [0, 1]")
+    if not np.isfinite(float(args.safety_critic_cost_clip)) or float(
+        args.safety_critic_cost_clip
+    ) <= 0.0:
+        raise ValueError("--safety-critic-cost-clip must be finite and positive")
     for name in (
         "speed_reward_weight",
         "lateral_reward_weight",
@@ -2882,7 +3247,9 @@ def main() -> int:
     namespace["DEVICE"] = args.device
     env_config = env_config_from_args(args, namespace["ENV_CONFIG"])
     if active_traffic_model(env_config) == "mtm":
-        deep_update(env_config, copy.deepcopy(MTM_CONGESTED_UNCERTAIN_UPDATES))
+        _deep_set_defaults(
+            env_config, copy.deepcopy(MTM_CONGESTED_UNCERTAIN_UPDATES)
+        )
     if args.remove_vehicle_dimensions:
         env_config["observation_include_vehicle_dimensions"] = False
     if not bool(env_config.get("terminate_on_collision", False)):
@@ -2976,6 +3343,28 @@ def main() -> int:
             "expose_target_y": bool(reward_config.get("expose_target_y", False)),
             "remove_vehicle_dimensions": bool(args.remove_vehicle_dimensions),
             "base_observation_dim": _base_observation_dim(env_config),
+            "observation_variant": (
+                "target_y_plus_previous_executed_action"
+                if bool(env_config.get("ppo_append_previous_action", False))
+                else "base_vehicle_table"
+            ),
+            "physics_hz": float(env_config.get("simulation_frequency", np.nan)),
+            "policy_hz": float(env_config.get("policy_frequency", np.nan)),
+            "cbf_substeps_per_policy_action": max(
+                1,
+                int(
+                    round(
+                        float(env_config.get("simulation_frequency", 1.0))
+                        / max(
+                            float(env_config.get("policy_frequency", 1.0)),
+                            1e-9,
+                        )
+                    )
+                ),
+            ),
+            "cbf_substep_filtering": bool(
+                env_config.get("cbf_substep_filtering", False)
+            ),
             "speed_reward_weight": float(
                 reward_config.get("speed_reward_weight", 0.25)
             ),
@@ -3176,6 +3565,9 @@ def main() -> int:
         "lambda_intervention": float(args.lambda_intervention),
         "lambda_mean": float(args.lambda_mean),
         "lambda_sample": float(args.lambda_sample),
+        "lambda_critic": float(args.lambda_critic),
+        "safety_critic_gamma": float(args.safety_critic_gamma),
+        "safety_critic_cost_clip": float(args.safety_critic_cost_clip),
         "action_rate_penalty": float(args.action_rate_penalty),
         "correction_epsilon": float(args.correction_epsilon),
         "collision_penalty": float(reward_config["collision_penalty"]),
@@ -3247,6 +3639,10 @@ def main() -> int:
         ),
         "evaluation_seeds": list(map(int, args.eval_seeds)),
         "evaluation_timesteps": int(args.eval_timesteps),
+        "evaluation_task_distance_m": float(_task_distance_from_args(args, env_config)),
+        "evaluation_task_max_policy_steps": int(
+            _task_max_policy_steps_from_args(args)
+        ),
         "post_training_evaluation": {
             "enabled": not bool(args.skip_post_train_evaluation),
             "episodes_per_external_cbf_mode": int(args.post_train_eval_episodes),
