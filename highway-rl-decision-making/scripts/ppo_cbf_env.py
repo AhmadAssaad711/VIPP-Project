@@ -513,13 +513,20 @@ class CBFContextPhysicalActionWrapper(gym.Wrapper):
         info.update(initial_safety)
         base = self.namespace["_lane_free_base"](self)
         traffic_safety = base.config.get("traffic_safety", {})
-        require_initial_safe = bool(
-            base.config.get("cbf_require_initial_safe_set", False)
-            or (
+        # An explicit top-level setting is authoritative.  This lets an
+        # evaluation protocol retain the source run's CBF-safe spawn sampler
+        # (and therefore paired initial states) while allowing a deployment
+        # gain sweep to inspect candidates whose psi_1 condition is not
+        # satisfied at reset.  When the top-level key is absent, preserve the
+        # historical inference from the traffic safe-spawn configuration.
+        configured_initial_safe = base.config.get("cbf_require_initial_safe_set")
+        if configured_initial_safe is None:
+            require_initial_safe = bool(
                 isinstance(traffic_safety, dict)
                 and traffic_safety.get("spawn_cbf_safe_set", False)
             )
-        )
+        else:
+            require_initial_safe = bool(configured_initial_safe)
         if require_initial_safe and not bool(initial_safety["cbf_initial_safe_set"]):
             raise RuntimeError(
                 "CBF reset violated h >= 0 or psi_1 >= 0: "

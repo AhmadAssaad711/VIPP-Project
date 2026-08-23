@@ -2689,7 +2689,7 @@ def evaluate_post_training_model(
     )
     model = load_model(variant, model_path, args.device)
     rows: list[dict[str, Any]] = []
-    episodes_path, _blocks_path, _kpi_path, _manifest_path = _post_training_eval_paths(
+    episodes_path, _blocks_path, _kpi_path, manifest_path = _post_training_eval_paths(
         run_dir
     )
     progress_status_path = episodes_path.with_name("progress.json")
