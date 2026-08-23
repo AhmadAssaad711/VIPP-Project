@@ -238,8 +238,15 @@ def main() -> int:
     # definitions and metric helper cells; executing 43 would honor its
     # notebook default and launch a fresh training subprocess before loading
     # the saved model.
-    cbf_cells = [33, 35, 37, 39, 41]
+    # The notebook's CBF definitions are split across the current C-section:
+    # QP imports/geometries, wrapper, tuned override, evaluator, and (for the
+    # guided variant) its actor class.  Keep this explicit so final DDPG/CBF
+    # evaluations load the same helpers as an interactive notebook run rather
+    # than relying on stale pre-ladder cell numbers.
+    cbf_cells = [42, 44, 46, 48, 50, 52]
     needs_cbf = args.variant in {"ddpg-cbf", "guided-ddpg-cbf"}
+    if args.variant == "guided-ddpg-cbf":
+        cbf_cells.append(64)
     exec_notebook_cells(
         notebook_path,
         base_cells + (cbf_cells if needs_cbf else []),
@@ -337,28 +344,35 @@ def main() -> int:
         print(f"[eval-runner] loading {model_path}", flush=True)
         model = namespace["PPO"].load(str(model_path), device=args.device)
         print("[eval-runner] evaluating PPO", flush=True)
+        episode_log_path = output_path.with_name(output_path.stem + "_episodes_progress.csv")
         metrics = namespace["evaluate_policy_with_metrics"](
             model,
             episodes=args.episodes,
             seed=args.seed,
             deterministic=True,
             env_config=namespace["ENV_CONFIG"],
+            episode_log_path=episode_log_path,
+            episode_log_label=f"{args.variant}@{output_path.stem}",
         )
     elif args.variant == "ddpg":
         print(f"[eval-runner] loading {model_path}", flush=True)
         model = namespace["DDPG"].load(str(model_path), device=args.device)
         print("[eval-runner] evaluating DDPG", flush=True)
+        episode_log_path = output_path.with_name(output_path.stem + "_episodes_progress.csv")
         metrics = namespace["evaluate_policy_with_metrics"](
             model,
             episodes=args.episodes,
             seed=args.seed,
             deterministic=True,
             env_config=namespace["ENV_CONFIG"],
+            episode_log_path=episode_log_path,
+            episode_log_label=f"{args.variant}@{output_path.stem}",
         )
     elif args.variant == "ddpg-cbf":
         print(f"[eval-runner] loading {model_path}", flush=True)
         model = namespace["DDPG"].load(str(model_path), device=args.device)
         print("[eval-runner] evaluating DDPG-CBF", flush=True)
+        episode_log_path = output_path.with_name(output_path.stem + "_episodes_progress.csv")
         metrics = namespace["evaluate_cbf_policy_with_metrics"](
             model,
             episodes=args.episodes,
@@ -367,11 +381,14 @@ def main() -> int:
             lambda_filter=namespace["CBF_FILTER_REWARD_LAMBDA"],
             eps_side=namespace["CBF_EPS_SIDE"],
             env_config=namespace["ENV_CONFIG"],
+            episode_log_path=episode_log_path,
+            episode_log_label=f"{args.variant}@{output_path.stem}",
         )
     else:
         print(f"[eval-runner] loading {model_path}", flush=True)
         model = namespace["GuidedCBFDDPG"].load(str(model_path), device=args.device)
         print("[eval-runner] evaluating guided DDPG-CBF", flush=True)
+        episode_log_path = output_path.with_name(output_path.stem + "_episodes_progress.csv")
         metrics = namespace["evaluate_cbf_policy_with_metrics"](
             model,
             episodes=args.episodes,
@@ -380,6 +397,8 @@ def main() -> int:
             lambda_filter=namespace["CBF_FILTER_REWARD_LAMBDA"],
             eps_side=namespace["CBF_EPS_SIDE"],
             env_config=namespace["ENV_CONFIG"],
+            episode_log_path=episode_log_path,
+            episode_log_label=f"{args.variant}@{output_path.stem}",
         )
 
     if cache_metrics_path is not None and cache_manifest_path is not None:

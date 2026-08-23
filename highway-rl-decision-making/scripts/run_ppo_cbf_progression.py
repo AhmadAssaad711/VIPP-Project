@@ -205,6 +205,7 @@ DEFAULT_VARIANTS = (
     "ppo_cbf_projected",
 )
 EVALUATION_MODES = ("raw", "cbf")
+COLLISION_EVENT_ATTRIBUTION_SCHEMA_VERSION = 1
 
 
 def _base_observation_features(env_config: dict[str, Any]) -> list[str]:
@@ -2059,6 +2060,14 @@ def evaluate_completed_episode(
         shadow_corrections: list[float] = []
         total_distance_m = 0.0
         collision_events = 0
+        collision_events_direct_qp_failure = 0
+        collision_events_direct_qp_failure_or_fallback = 0
+        collision_event_records: list[dict[str, Any]] = []
+        first_collision_step: int | None = None
+        first_collision_qp_failure_same_step = False
+        first_collision_qp_failure_or_fallback_same_step = False
+        previous_step_qp_failure = False
+        any_prior_qp_failure = False
         previous_acceleration = np.zeros(2, dtype=float)
 
         while True:
@@ -2085,12 +2094,15 @@ def evaluate_completed_episode(
             observation, reward, terminated, truncated, info = env.step(action)
             info = dict(info)
             rewards.append(float(reward))
-            total_distance_m += float(
+            # The event-level QP attribution is populated after collision
+            # count normalization below, on this same policy transition.
+            step_distance_m = float(
                 info.get(
                     "task_distance_step_m",
                     info.get("pipeline_distance_step_m", 0.0),
                 )
             )
+            total_distance_m += step_distance_m
             step_collision_events = max(
                 int(info.get("ego_collision_events", 0)), 0
             )
@@ -2103,6 +2115,121 @@ def evaluate_completed_episode(
             ):
                 step_collision_events = 1
             collision_events += step_collision_events
+            policy_step = int(len(rewards))
+            if mode == "cbf":
+                cbf_qp_success = bool(info.get("cbf_qp_success", True))
+                cbf_fallback_used = bool(info.get("cbf_fallback_used", False))
+                cbf_substep_fallback_steps = int(
+                    info.get("cbf_substep_fallback_steps", 0)
+                )
+                qp_failure_same_step = bool(not cbf_qp_success)
+                qp_failure_or_fallback_same_step = bool(
+                    qp_failure_same_step
+                    or cbf_fallback_used
+                    or cbf_substep_fallback_steps > 0
+                )
+            else:
+                cbf_qp_success = True
+                cbf_fallback_used = False
+                cbf_substep_fallback_steps = 0
+                qp_failure_same_step = False
+                qp_failure_or_fallback_same_step = False
+            if step_collision_events > 0:
+                event_start_index = int(collision_events - step_collision_events + 1)
+                if first_collision_step is None:
+                    first_collision_step = policy_step
+                    first_collision_qp_failure_same_step = bool(
+                        qp_failure_same_step
+                    )
+                    first_collision_qp_failure_or_fallback_same_step = bool(
+                        qp_failure_or_fallback_same_step
+                    )
+                if qp_failure_same_step:
+                    collision_events_direct_qp_failure += step_collision_events
+                if qp_failure_or_fallback_same_step:
+                    collision_events_direct_qp_failure_or_fallback += (
+                        step_collision_events
+                    )
+                for event_offset in range(step_collision_events):
+                    collision_event_records.append(
+                        {
+                            "schema_version": PROGRESSION_SCHEMA_VERSION,
+                            "collision_event_attribution_schema_version": (
+                                COLLISION_EVENT_ATTRIBUTION_SCHEMA_VERSION
+                            ),
+                            "evaluation_kind": "collision_event_qp_attribution",
+                            "variant": variant,
+                            "variant_label": VARIANT_SPECS[variant]["label"],
+                            "mode": mode,
+                            "action_source": action_source,
+                            "external_cbf": "ON" if mode == "cbf" else "OFF",
+                            "training_seed": int(training_seed),
+                            "episode_index": int(episode_index),
+                            "scenario_seed": int(episode_seed),
+                            "episode_seed": int(episode_seed),
+                            "collision_event_index": int(
+                                event_start_index + event_offset
+                            ),
+                            "policy_step": policy_step,
+                            "time_s": float(policy_step * policy_dt),
+                            "step_distance_m": step_distance_m,
+                            "cumulative_distance_m": float(total_distance_m),
+                            "collision_terminal_step": bool(
+                                info.get("task_collision_terminated", False)
+                            ),
+                            "qp_failure_same_step": bool(qp_failure_same_step),
+                            "qp_failure_previous_step": bool(
+                                previous_step_qp_failure
+                            ),
+                            "qp_failure_seen_before_step": bool(any_prior_qp_failure),
+                            "qp_failure_or_fallback_same_step": bool(
+                                qp_failure_or_fallback_same_step
+                            ),
+                            "cbf_qp_success": bool(cbf_qp_success),
+                            "cbf_fallback_used": bool(cbf_fallback_used),
+                            "cbf_substep_fallback_steps": int(
+                                cbf_substep_fallback_steps
+                            ),
+                            "cbf_substep_count": int(
+                                info.get("cbf_substep_count", 0)
+                            ),
+                            "cbf_raw_feasible": bool(
+                                info.get("cbf_raw_feasible", True)
+                            ),
+                            "cbf_event_intervened": bool(
+                                info.get("cbf_event_intervened", False)
+                            ),
+                            "cbf_correction_norm_normalized": float(
+                                info.get("cbf_correction_norm_normalized", 0.0)
+                            ),
+                            "cbf_hocbf_condition_satisfied": bool(
+                                info.get("cbf_hocbf_condition_satisfied", True)
+                            ),
+                            "cbf_hocbf_min_margin": float(
+                                info.get("cbf_hocbf_min_margin", np.nan)
+                            ),
+                            "cbf_max_constraint_violation_raw": float(
+                                info.get(
+                                    "cbf_max_constraint_violation_raw", np.nan
+                                )
+                            ),
+                            "cbf_max_constraint_violation_safe": float(
+                                info.get(
+                                    "cbf_max_constraint_violation_safe", np.nan
+                                )
+                            ),
+                            "h_min_before_step": float(
+                                pre_state.get("h_min", np.nan)
+                            ),
+                            "psi1_min_before_step": float(
+                                pre_state.get("psi1_min", np.nan)
+                            ),
+                        }
+                    )
+            previous_step_qp_failure = bool(qp_failure_same_step)
+            any_prior_qp_failure = bool(
+                any_prior_qp_failure or qp_failure_same_step
+            )
             base = env.unwrapped
             speed_errors.append(
                 float(
@@ -2204,6 +2331,26 @@ def evaluate_completed_episode(
             ),
             "total_distance_m": float(total_distance_m),
             "distinct_ego_collision_events": int(collision_events),
+            "collision_events_direct_qp_failure_same_step": int(
+                collision_events_direct_qp_failure
+            ),
+            "collision_events_direct_qp_failure_or_fallback_same_step": int(
+                collision_events_direct_qp_failure_or_fallback
+            ),
+            "collision_events_without_direct_qp_failure_same_step": int(
+                collision_events - collision_events_direct_qp_failure
+            ),
+            "first_collision_policy_step": int(first_collision_step or 0),
+            "first_collision_qp_failure_same_step": bool(
+                first_collision_qp_failure_same_step
+            ),
+            "first_collision_qp_failure_or_fallback_same_step": bool(
+                first_collision_qp_failure_or_fallback_same_step
+            ),
+            "collision_event_log_count": int(len(collision_event_records)),
+            # The parallel writer removes this private field before writing
+            # the episode-level CSV and stores it in collision_events.csv.
+            "_collision_event_records": collision_event_records,
         }
     finally:
         env.close()
@@ -2215,6 +2362,82 @@ def _post_training_eval_paths(run_dir: Path) -> tuple[Path, Path, Path, Path]:
     root = run_dir / "pe"
     root.mkdir(parents=True, exist_ok=True)
     return root / "e.csv", root / "b.csv", root / "kpi.csv", root / "m.json"
+
+
+def _write_episode_progress_snapshot(
+    *,
+    progress_path: Path,
+    status_path: Path,
+    rows: list[dict[str, Any]],
+    variant: str,
+    expected_episodes: int,
+    state: str = "running",
+    started_at: float | None = None,
+) -> None:
+    """Persist an evaluation row/status after every completed episode.
+
+    The canonical 200+200 evaluation used to keep all rows in memory and
+    write them only after the last episode.  That made a long, healthy run
+    look frozen and discarded useful progress if the notebook output reader
+    was interrupted.  Keep the same final schema, but make a small CSV
+    snapshot and JSON status record visible after each episode.
+    """
+
+    progress_path.parent.mkdir(parents=True, exist_ok=True)
+    public_rows = [
+        {key: value for key, value in row.items() if not str(key).startswith("_")}
+        for row in rows
+    ]
+    pd.DataFrame(public_rows).to_csv(progress_path, index=False)
+    by_mode: dict[str, int] = {}
+    for row in rows:
+        mode = str(row.get("mode", "unknown"))
+        by_mode[mode] = by_mode.get(mode, 0) + 1
+    last = rows[-1] if rows else {}
+    status = {
+        "schema_version": PROGRESSION_SCHEMA_VERSION,
+        "state": str(state),
+        "variant": str(variant),
+        "expected_episodes": int(expected_episodes),
+        "completed_episodes": int(len(rows)),
+        "completed_by_mode": by_mode,
+        "last_mode": last.get("mode"),
+        "last_episode_index": last.get("episode_index"),
+        "last_episode_seed": last.get("episode_seed"),
+        "last_episode_steps": last.get("timesteps"),
+        "last_distance_m": last.get("total_distance_m"),
+        "last_collision_events": last.get("distinct_ego_collision_events"),
+        "last_distance_completion": last.get("distance_completion_rate"),
+        "elapsed_s": (
+            float(max(time.perf_counter() - started_at, 0.0))
+            if started_at is not None
+            else None
+        ),
+        "episode_metrics_path": str(progress_path.resolve()),
+        "updated_at_epoch_s": float(time.time()),
+    }
+    status_path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = status_path.with_suffix(status_path.suffix + ".tmp")
+    temporary.write_text(json.dumps(status, indent=2, default=str), encoding="utf-8")
+    temporary.replace(status_path)
+
+
+def _print_episode_progress(
+    *, row: dict[str, Any], completed: int, expected: int, variant: str
+) -> None:
+    """Emit one flushed, human-readable line for notebook/terminal monitors."""
+
+    deployment = "ON" if str(row.get("mode")) == "cbf" else "OFF"
+    print(
+        "[ppo-progression] eval episode "
+        f"{completed}/{expected} variant={variant} CBF={deployment} "
+        f"seed={int(row.get('episode_seed', 0))} "
+        f"steps={int(row.get('timesteps', 0))} "
+        f"distance={float(row.get('total_distance_m', 0.0)):.1f}m "
+        f"collisions={int(row.get('distinct_ego_collision_events', 0))} "
+        f"complete={bool(row.get('distance_completion_rate', False))}",
+        flush=True,
+    )
 
 
 def _post_training_summary_geometry(episode_count: int) -> tuple[int, int]:
@@ -2466,24 +2689,50 @@ def evaluate_post_training_model(
     )
     model = load_model(variant, model_path, args.device)
     rows: list[dict[str, Any]] = []
+    episodes_path, _blocks_path, _kpi_path, _manifest_path = _post_training_eval_paths(
+        run_dir
+    )
+    progress_status_path = episodes_path.with_name("progress.json")
+    expected_rows = episode_count * len(EVALUATION_MODES)
+    progress_started = time.perf_counter()
+    _write_episode_progress_snapshot(
+        progress_path=episodes_path,
+        status_path=progress_status_path,
+        rows=rows,
+        variant=variant,
+        expected_episodes=expected_rows,
+        started_at=progress_started,
+    )
     for mode in EVALUATION_MODES:
         for episode_index in range(episode_count):
-            rows.append(
-                evaluate_completed_episode(
-                    namespace,
-                    model=model,
-                    variant=variant,
-                    mode=mode,
-                    training_seed=training_seed,
-                    episode_index=episode_index + 1,
-                    episode_seed=int(args.post_train_eval_seed_start) + episode_index,
-                    env_config=env_config,
-                    reward_config=reward_config,
-                    args=args,
-                )
+            row = evaluate_completed_episode(
+                namespace,
+                model=model,
+                variant=variant,
+                mode=mode,
+                training_seed=training_seed,
+                episode_index=episode_index + 1,
+                episode_seed=int(args.post_train_eval_seed_start) + episode_index,
+                env_config=env_config,
+                reward_config=reward_config,
+                args=args,
+            )
+            rows.append(row)
+            _write_episode_progress_snapshot(
+                progress_path=episodes_path,
+                status_path=progress_status_path,
+                rows=rows,
+                variant=variant,
+                expected_episodes=expected_rows,
+                started_at=progress_started,
+            )
+            _print_episode_progress(
+                row=row,
+                completed=len(rows),
+                expected=expected_rows,
+                variant=variant,
             )
     metrics = pd.DataFrame(rows)
-    expected_rows = episode_count * len(EVALUATION_MODES)
     if len(metrics) != expected_rows:
         raise RuntimeError(
             f"Post-training evaluation produced {len(metrics)} episodes; "
@@ -2496,8 +2745,14 @@ def evaluate_post_training_model(
             "episode count for both external CBF modes."
         )
 
-    episodes_path, blocks_path, kpi_path, manifest_path = _post_training_eval_paths(
-        run_dir
+    _write_episode_progress_snapshot(
+        progress_path=episodes_path,
+        status_path=progress_status_path,
+        rows=rows,
+        variant=variant,
+        expected_episodes=expected_rows,
+        state="complete",
+        started_at=progress_started,
     )
     metrics.to_csv(episodes_path, index=False)
     block_metrics, table, summary_geometry = summarize_post_training_episodes(
@@ -2516,6 +2771,7 @@ def evaluate_post_training_model(
         "external_cbf": {"raw": "OFF", "cbf": "ON"},
         "episode_seed_start": int(args.post_train_eval_seed_start),
         "episode_metrics_path": str(episodes_path.resolve()),
+        "episode_progress_status_path": str(progress_status_path.resolve()),
         "pooled_block_metrics_path": str(blocks_path.resolve()),
         "kpi_table_path": str(kpi_path.resolve()),
         "study_kpi_table_path": str(root_summary_path.resolve()),
@@ -2566,8 +2822,20 @@ def evaluate_raw_actor_ablation(
         flush=True,
     )
     model = load_model(variant, model_path, args.device)
-    rows = [
-        evaluate_completed_episode(
+    rows: list[dict[str, Any]] = []
+    episodes_path = ablation_dir / "episodes.csv"
+    progress_status_path = ablation_dir / "progress.json"
+    progress_started = time.perf_counter()
+    _write_episode_progress_snapshot(
+        progress_path=episodes_path,
+        status_path=progress_status_path,
+        rows=rows,
+        variant=variant,
+        expected_episodes=episode_count,
+        started_at=progress_started,
+    )
+    for episode_index in range(episode_count):
+        row = evaluate_completed_episode(
             namespace,
             model=model,
             variant=variant,
@@ -2580,18 +2848,39 @@ def evaluate_raw_actor_ablation(
             args=args,
             action_source="raw_actor_mean",
         )
-        for episode_index in range(episode_count)
-    ]
+        rows.append(row)
+        _write_episode_progress_snapshot(
+            progress_path=episodes_path,
+            status_path=progress_status_path,
+            rows=rows,
+            variant=variant,
+            expected_episodes=episode_count,
+            started_at=progress_started,
+        )
+        _print_episode_progress(
+            row=row,
+            completed=len(rows),
+            expected=episode_count,
+            variant=f"{variant}:raw_actor_mean",
+        )
     metrics = pd.DataFrame(rows)
     if len(metrics) != episode_count:
         raise RuntimeError(
             "Raw-actor ablation produced "
             f"{len(metrics)} episodes; expected {episode_count}."
         )
-    episodes_path = ablation_dir / "episodes.csv"
     blocks_path = ablation_dir / "blocks.csv"
     kpi_path = ablation_dir / "kpi.csv"
     manifest_path = ablation_dir / "manifest.json"
+    _write_episode_progress_snapshot(
+        progress_path=episodes_path,
+        status_path=progress_status_path,
+        rows=rows,
+        variant=variant,
+        expected_episodes=episode_count,
+        state="complete",
+        started_at=progress_started,
+    )
     metrics.to_csv(episodes_path, index=False)
     block_metrics, table, summary_geometry = summarize_post_training_episodes(
         metrics, env_config=env_config
@@ -2615,6 +2904,7 @@ def evaluate_raw_actor_ablation(
         "episode_seed_start": int(args.raw_actor_eval_seed_start),
         **summary_geometry,
         "episode_metrics_path": str(episodes_path.resolve()),
+        "episode_progress_status_path": str(progress_status_path.resolve()),
         "pooled_block_metrics_path": str(blocks_path.resolve()),
         "kpi_table_path": str(kpi_path.resolve()),
         "complete": True,
@@ -2847,24 +3137,59 @@ def evaluate_all(
     output_dir: Path,
 ) -> pd.DataFrame:
     rows: list[dict[str, Any]] = []
+    progress_path = output_dir / "evaluation_scenarios_progress.csv"
+    progress_status_path = output_dir / "evaluation_scenarios_progress.json"
+    expected_rows = len(model_paths) * len(EVALUATION_MODES) * len(args.eval_seeds)
+    progress_started = time.perf_counter()
+    _write_episode_progress_snapshot(
+        progress_path=progress_path,
+        status_path=progress_status_path,
+        rows=rows,
+        variant="all_variants",
+        expected_episodes=expected_rows,
+        started_at=progress_started,
+    )
     for (training_seed, variant), model_path in model_paths.items():
         model = load_model(variant, model_path, args.device)
         for mode in EVALUATION_MODES:
             for scenario_seed in args.eval_seeds:
-                rows.append(
-                    evaluate_scenario(
-                        namespace,
-                        model=model,
-                        variant=variant,
-                        mode=mode,
-                        training_seed=training_seed,
-                        scenario_seed=int(scenario_seed),
-                        env_config=env_config,
-                        reward_config=reward_config,
-                        args=args,
-                    )
+                row = evaluate_scenario(
+                    namespace,
+                    model=model,
+                    variant=variant,
+                    mode=mode,
+                    training_seed=training_seed,
+                    scenario_seed=int(scenario_seed),
+                    env_config=env_config,
+                    reward_config=reward_config,
+                    args=args,
+                )
+                rows.append(row)
+                _write_episode_progress_snapshot(
+                    progress_path=progress_path,
+                    status_path=progress_status_path,
+                    rows=rows,
+                    variant="all_variants",
+                    expected_episodes=expected_rows,
+                    started_at=progress_started,
+                )
+                print(
+                    "[ppo-progression] scenario evaluation "
+                    f"{len(rows)}/{expected_rows} variant={variant} "
+                    f"CBF={'ON' if mode == 'cbf' else 'OFF'} "
+                    f"seed={int(scenario_seed)}",
+                    flush=True,
                 )
     metrics = pd.DataFrame(rows)
+    _write_episode_progress_snapshot(
+        progress_path=progress_path,
+        status_path=progress_status_path,
+        rows=rows,
+        variant="all_variants",
+        expected_episodes=expected_rows,
+        state="complete",
+        started_at=progress_started,
+    )
     metrics.to_csv(output_dir / "evaluation_scenarios.csv", index=False)
     table = ten_kpi_table(metrics)
     table.to_csv(output_dir / "ten_kpi_summary.csv", index=False)

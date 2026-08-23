@@ -34,7 +34,8 @@ import sys
 import time
 import warnings
 from pathlib import Path
-from typing import Any, Optional
+from datetime import datetime
+from typing import Any, Optional, Union
 
 import cloudpickle
 import gymnasium as gym
@@ -966,7 +967,10 @@ def bootstrap_notebook_namespace(project_root: Path) -> dict[str, Any]:
         "__name__": "__main__",
         "Any": Any,
         "Optional": Optional,
+        "Union": Union,
         "Path": Path,
+        "datetime": datetime,
+        "json": json,
         "os": os,
         "sys": sys,
         "time": time,
