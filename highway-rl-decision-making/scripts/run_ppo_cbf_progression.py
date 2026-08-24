@@ -27,11 +27,13 @@ import argparse
 import copy
 import hashlib
 import json
+import multiprocessing as mp
 import os
 import re
 import shutil
 import tempfile
 import time
+from concurrent.futures import ProcessPoolExecutor, as_completed
 from dataclasses import dataclass
 from functools import partial
 from pathlib import Path
@@ -93,6 +95,7 @@ DEFAULT_EVAL_SCENARIOS = 10
 DEFAULT_EVAL_TIMESTEPS = 800
 DEFAULT_POST_TRAIN_EVAL_EPISODES = 200
 DEFAULT_POST_TRAIN_EVAL_SEED_START = 1_100_000
+DEFAULT_POST_TRAIN_EVAL_WORKERS = 20
 DEFAULT_TASK_DISTANCE_M = 1_000.0
 DEFAULT_TASK_MAX_POLICY_STEPS = 3_000
 POST_TRAIN_EVAL_SUMMARY_BLOCKS = 10
@@ -2356,6 +2359,220 @@ def evaluate_completed_episode(
         env.close()
 
 
+_POST_TRAIN_EVAL_WORKER_STATE: dict[str, Any] | None = None
+
+
+def _initialize_post_train_eval_worker(
+    project_root: str,
+    model_path: str,
+    variant: str,
+    device: str,
+    env_config: dict[str, Any],
+    reward_config: dict[str, float],
+    eval_args: argparse.Namespace,
+    cbf_settings: dict[str, Any],
+) -> None:
+    """Create one isolated CPU evaluator for complete-episode evaluation."""
+
+    protocol.set_stable_native_defaults()
+    try:
+        th.set_num_threads(1)
+        th.set_num_interop_threads(1)
+    except RuntimeError:
+        pass
+
+    root = Path(project_root).resolve()
+    namespace = protocol.bootstrap_notebook_namespace(root)
+    protocol.exec_required_notebook_cells(
+        root / "notebooks" / "lanelessKaralakou.ipynb", namespace
+    )
+    namespace["DEVICE"] = str(device)
+    namespace.update(copy.deepcopy(cbf_settings))
+    model = load_model(variant, Path(model_path), str(device))
+
+    global _POST_TRAIN_EVAL_WORKER_STATE
+    _POST_TRAIN_EVAL_WORKER_STATE = {
+        "namespace": namespace,
+        "model": model,
+        "variant": variant,
+        "training_seed": int(eval_args.training_seed)
+        if hasattr(eval_args, "training_seed")
+        else 0,
+        "env_config": env_config,
+        "reward_config": reward_config,
+        "eval_args": eval_args,
+    }
+
+
+def _evaluate_post_train_episode_worker(
+    task: tuple[str, int, int, str, int]
+) -> tuple[str, int, dict[str, Any]]:
+    """Evaluate one complete episode in a worker-owned environment/model."""
+
+    state = _POST_TRAIN_EVAL_WORKER_STATE
+    if state is None:
+        raise RuntimeError("post-training evaluation worker was not initialized")
+    mode, episode_index, episode_seed, action_source, training_seed = task
+    row = evaluate_completed_episode(
+        state["namespace"],
+        model=state["model"],
+        variant=state["variant"],
+        mode=mode,
+        training_seed=int(training_seed),
+        episode_index=int(episode_index),
+        episode_seed=int(episode_seed),
+        env_config=state["env_config"],
+        reward_config=state["reward_config"],
+        args=state["eval_args"],
+        action_source=action_source,
+    )
+    return mode, int(episode_index), row
+
+
+def _ordered_episode_rows(
+    rows: list[dict[str, Any]], modes: tuple[str, ...]
+) -> list[dict[str, Any]]:
+    mode_order = {mode: index for index, mode in enumerate(modes)}
+    return sorted(
+        rows,
+        key=lambda row: (
+            mode_order.get(str(row.get("mode", "")), len(modes)),
+            int(row.get("episode_index", 0)),
+        ),
+    )
+
+
+def _evaluate_complete_episode_rows(
+    namespace: dict[str, Any],
+    *,
+    model_path: Path,
+    variant: str,
+    training_seed: int,
+    env_config: dict[str, Any],
+    reward_config: dict[str, float],
+    args: argparse.Namespace,
+    modes: tuple[str, ...],
+    episode_count: int,
+    seed_start: int,
+    action_source: str,
+    progress_path: Path,
+    status_path: Path,
+    progress_started: float,
+    progress_variant: str,
+) -> list[dict[str, Any]]:
+    """Evaluate complete episodes serially or with the global worker count."""
+
+    expected_rows = int(episode_count) * len(modes)
+    rows: list[dict[str, Any]] = []
+    _write_episode_progress_snapshot(
+        progress_path=progress_path,
+        status_path=status_path,
+        rows=rows,
+        variant=progress_variant,
+        expected_episodes=expected_rows,
+        started_at=progress_started,
+    )
+
+    def record(row: dict[str, Any]) -> None:
+        rows.append(row)
+        _write_episode_progress_snapshot(
+            progress_path=progress_path,
+            status_path=status_path,
+            rows=rows,
+            variant=progress_variant,
+            expected_episodes=expected_rows,
+            started_at=progress_started,
+        )
+        _print_episode_progress(
+            row=row,
+            completed=len(rows),
+            expected=expected_rows,
+            variant=progress_variant,
+        )
+
+    # Keep direct/unit callers that predate the worker option on the safe
+    # serial path; the CLI and notebook both provide the global default of 20.
+    workers = int(getattr(args, "post_train_eval_workers", 1))
+    if workers <= 1:
+        model = load_model(variant, model_path, args.device)
+        for mode in modes:
+            for episode_index in range(int(episode_count)):
+                record(
+                    evaluate_completed_episode(
+                        namespace,
+                        model=model,
+                        variant=variant,
+                        mode=mode,
+                        training_seed=int(training_seed),
+                        episode_index=episode_index + 1,
+                        episode_seed=int(seed_start) + episode_index,
+                        env_config=env_config,
+                        reward_config=reward_config,
+                        args=args,
+                        action_source=action_source,
+                    )
+                )
+        return _ordered_episode_rows(rows, modes)
+
+    cbf_keys = (
+        "CBF_AX_BOUNDS",
+        "CBF_AY_BOUNDS",
+        "CBF_EPS_SIDE",
+        "CBF_K0",
+        "CBF_K1",
+        "CBF_MAX_NEIGHBOR_CONSTRAINTS",
+        "CBF_NEIGHBOR_RANGE",
+        "CBF_QP_FEASIBILITY_TOL",
+        "CBF_TARGET_PAIR_DY",
+    )
+    cbf_settings = {
+        key: copy.deepcopy(namespace[key])
+        for key in cbf_keys
+        if key in namespace
+    }
+    worker_args = copy.copy(args)
+    worker_args.training_seed = int(training_seed)
+    tasks = [
+        (mode, episode_index + 1, int(seed_start) + episode_index, action_source, int(training_seed))
+        for mode in modes
+        for episode_index in range(int(episode_count))
+    ]
+    print(
+        f"[ppo-progression] complete-episode workers={workers} "
+        f"evaluation_device=cpu pending={len(tasks)}",
+        flush=True,
+    )
+    executor = ProcessPoolExecutor(
+        max_workers=workers,
+        mp_context=mp.get_context("spawn"),
+        initializer=_initialize_post_train_eval_worker,
+        initargs=(
+            str(Path(namespace["PROJECT_ROOT"]).resolve()),
+            str(model_path),
+            variant,
+            "cpu",
+            env_config,
+            reward_config,
+            worker_args,
+            cbf_settings,
+        ),
+    )
+    try:
+        futures = [
+            executor.submit(_evaluate_post_train_episode_worker, task)
+            for task in tasks
+        ]
+        for future in as_completed(futures):
+            _mode, _episode_index, row = future.result()
+            record(row)
+    except BaseException:
+        executor.shutdown(wait=False, cancel_futures=True)
+        raise
+    else:
+        executor.shutdown(wait=True)
+    return _ordered_episode_rows(rows, modes)
+
+
 def _post_training_eval_paths(run_dir: Path) -> tuple[Path, Path, Path, Path]:
     """Use concise names because the current model directories are already deep."""
 
@@ -2687,7 +2904,6 @@ def evaluate_post_training_model(
         f"variant={variant} external_cbf=OFF/ON episodes_per_mode={episode_count}",
         flush=True,
     )
-    model = load_model(variant, model_path, args.device)
     rows: list[dict[str, Any]] = []
     episodes_path, blocks_path, kpi_path, manifest_path = _post_training_eval_paths(
         run_dir
@@ -2695,43 +2911,23 @@ def evaluate_post_training_model(
     progress_status_path = episodes_path.with_name("progress.json")
     expected_rows = episode_count * len(EVALUATION_MODES)
     progress_started = time.perf_counter()
-    _write_episode_progress_snapshot(
+    rows = _evaluate_complete_episode_rows(
+        namespace,
+        model_path=model_path,
+        variant=variant,
+        training_seed=int(training_seed),
+        env_config=env_config,
+        reward_config=reward_config,
+        args=args,
+        modes=tuple(EVALUATION_MODES),
+        episode_count=episode_count,
+        seed_start=int(args.post_train_eval_seed_start),
+        action_source="policy",
         progress_path=episodes_path,
         status_path=progress_status_path,
-        rows=rows,
-        variant=variant,
-        expected_episodes=expected_rows,
-        started_at=progress_started,
+        progress_started=progress_started,
+        progress_variant=variant,
     )
-    for mode in EVALUATION_MODES:
-        for episode_index in range(episode_count):
-            row = evaluate_completed_episode(
-                namespace,
-                model=model,
-                variant=variant,
-                mode=mode,
-                training_seed=training_seed,
-                episode_index=episode_index + 1,
-                episode_seed=int(args.post_train_eval_seed_start) + episode_index,
-                env_config=env_config,
-                reward_config=reward_config,
-                args=args,
-            )
-            rows.append(row)
-            _write_episode_progress_snapshot(
-                progress_path=episodes_path,
-                status_path=progress_status_path,
-                rows=rows,
-                variant=variant,
-                expected_episodes=expected_rows,
-                started_at=progress_started,
-            )
-            _print_episode_progress(
-                row=row,
-                completed=len(rows),
-                expected=expected_rows,
-                variant=variant,
-            )
     metrics = pd.DataFrame(rows)
     if len(metrics) != expected_rows:
         raise RuntimeError(
@@ -2770,6 +2966,7 @@ def evaluate_post_training_model(
         "modes": list(EVALUATION_MODES),
         "external_cbf": {"raw": "OFF", "cbf": "ON"},
         "episode_seed_start": int(args.post_train_eval_seed_start),
+        "evaluation_workers": int(getattr(args, "post_train_eval_workers", 1)),
         "episode_metrics_path": str(episodes_path.resolve()),
         "episode_progress_status_path": str(progress_status_path.resolve()),
         "pooled_block_metrics_path": str(blocks_path.resolve()),
@@ -2821,48 +3018,26 @@ def evaluate_raw_actor_ablation(
         f"variant={variant} external_cbf=OFF episodes={episode_count}",
         flush=True,
     )
-    model = load_model(variant, model_path, args.device)
-    rows: list[dict[str, Any]] = []
     episodes_path = ablation_dir / "episodes.csv"
     progress_status_path = ablation_dir / "progress.json"
     progress_started = time.perf_counter()
-    _write_episode_progress_snapshot(
+    rows = _evaluate_complete_episode_rows(
+        namespace,
+        model_path=model_path,
+        variant=variant,
+        training_seed=int(training_seed),
+        env_config=env_config,
+        reward_config=reward_config,
+        args=args,
+        modes=("raw",),
+        episode_count=episode_count,
+        seed_start=int(args.raw_actor_eval_seed_start),
+        action_source="raw_actor_mean",
         progress_path=episodes_path,
         status_path=progress_status_path,
-        rows=rows,
-        variant=variant,
-        expected_episodes=episode_count,
-        started_at=progress_started,
+        progress_started=progress_started,
+        progress_variant=f"{variant}:raw_actor_mean",
     )
-    for episode_index in range(episode_count):
-        row = evaluate_completed_episode(
-            namespace,
-            model=model,
-            variant=variant,
-            mode="raw",
-            training_seed=training_seed,
-            episode_index=episode_index + 1,
-            episode_seed=int(args.raw_actor_eval_seed_start) + episode_index,
-            env_config=env_config,
-            reward_config=reward_config,
-            args=args,
-            action_source="raw_actor_mean",
-        )
-        rows.append(row)
-        _write_episode_progress_snapshot(
-            progress_path=episodes_path,
-            status_path=progress_status_path,
-            rows=rows,
-            variant=variant,
-            expected_episodes=episode_count,
-            started_at=progress_started,
-        )
-        _print_episode_progress(
-            row=row,
-            completed=len(rows),
-            expected=episode_count,
-            variant=f"{variant}:raw_actor_mean",
-        )
     metrics = pd.DataFrame(rows)
     if len(metrics) != episode_count:
         raise RuntimeError(
@@ -2901,6 +3076,7 @@ def evaluate_raw_actor_ablation(
         "variant": variant,
         "training_seed": int(training_seed),
         "external_cbf": "OFF",
+        "evaluation_workers": int(getattr(args, "post_train_eval_workers", 1)),
         "episode_seed_start": int(args.raw_actor_eval_seed_start),
         **summary_geometry,
         "episode_metrics_path": str(episodes_path.resolve()),
@@ -3532,6 +3708,15 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument(
+        "--post-train-eval-workers",
+        type=int,
+        default=DEFAULT_POST_TRAIN_EVAL_WORKERS,
+        help=(
+            "Independent single-threaded CPU workers for all complete-episode "
+            "post-training evaluations; default=%(default)s."
+        ),
+    )
+    parser.add_argument(
         "--skip-post-train-evaluation",
         action="store_true",
         help="Skip the immediate paired complete-episode KPI evaluation.",
@@ -3641,6 +3826,8 @@ def main() -> int:
     _task_max_policy_steps_from_args(args)
     if int(args.post_train_eval_episodes) <= 0:
         raise ValueError("post-train-eval-episodes must be positive")
+    if int(getattr(args, "post_train_eval_workers", 1)) <= 0:
+        raise ValueError("post-train-eval-workers must be positive")
     if int(args.checkpoint_freq) <= 0:
         raise ValueError("checkpoint-freq must be positive")
     if not np.isfinite(float(args.action_rate_penalty)) or float(
@@ -3875,6 +4062,7 @@ def main() -> int:
                 "episodes_per_external_cbf_mode": int(
                     args.post_train_eval_episodes
                 ),
+                "workers": int(getattr(args, "post_train_eval_workers", 1)),
                 "modes": list(EVALUATION_MODES),
                 "evaluate_reused": bool(args.post_train_evaluate_reused),
             },
@@ -4112,6 +4300,7 @@ def main() -> int:
         "post_training_evaluation": {
             "enabled": not bool(args.skip_post_train_evaluation),
             "episodes_per_external_cbf_mode": int(args.post_train_eval_episodes),
+            "workers": int(getattr(args, "post_train_eval_workers", 1)),
             "modes": list(EVALUATION_MODES),
             "external_cbf": {"raw": "OFF", "cbf": "ON"},
             "episode_seed_start": int(args.post_train_eval_seed_start),
@@ -4122,6 +4311,7 @@ def main() -> int:
             "variant": "ppo_cbf_projected",
             "action_source": "raw_actor_mean",
             "external_cbf": "OFF",
+            "workers": int(getattr(args, "post_train_eval_workers", 1)),
             "episodes": int(args.raw_actor_eval_episodes),
             "episode_seed_start": int(args.raw_actor_eval_seed_start),
         },

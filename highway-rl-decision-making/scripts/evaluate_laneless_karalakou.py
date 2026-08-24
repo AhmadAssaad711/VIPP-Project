@@ -1,12 +1,15 @@
 from __future__ import annotations
 
 import argparse
+import copy
 import faulthandler
 import hashlib
 import json
+import multiprocessing as mp
 import os
 import re
 import sys
+from concurrent.futures import ProcessPoolExecutor, as_completed
 from pathlib import Path
 from typing import Any
 
@@ -39,6 +42,7 @@ TEN_KPI_SPECS: tuple[tuple[str, str], ...] = (
     ("Correction norm", "mean_correction_norm"),
     ("Mean jerk norm", "mean_jerk_norm"),
 )
+DEFAULT_EVALUATION_WORKERS = 20
 
 
 def ten_kpi_summary(metrics: pd.DataFrame) -> pd.DataFrame:
@@ -124,10 +128,199 @@ def exec_notebook_cells(
             apply_cbf_overrides(namespace, args)
 
 
+_LANELESS_EVAL_WORKER_STATE: dict[str, Any] | None = None
+
+
+def _initialize_laneless_eval_worker(
+    project_root: str,
+    notebook_path: str,
+    variant: str,
+    model_path: str,
+    device: str,
+    args: argparse.Namespace,
+    env_config: dict[str, Any],
+    needs_cbf: bool,
+) -> None:
+    """Load one notebook-backed model and evaluator in an isolated CPU worker."""
+
+    faulthandler.enable(all_threads=True)
+    set_stable_native_defaults()
+    root = Path(project_root).resolve()
+    notebook = Path(notebook_path).resolve()
+    namespace: dict[str, Any] = {
+        "__name__": "__main__",
+        "PPO": PPO,
+        "DDPG": DDPG,
+    }
+    base_cells = [2, 3, 5, 6, 8]
+    cbf_cells = [42, 44, 46, 48, 50, 52]
+    if variant == "guided-ddpg-cbf":
+        cbf_cells.append(64)
+    exec_notebook_cells(
+        notebook,
+        base_cells + (cbf_cells if needs_cbf else []),
+        namespace,
+        args if needs_cbf else None,
+    )
+    apply_cbf_overrides(namespace, args)
+    namespace["DEVICE"] = str(device)
+    namespace["ENV_CONFIG"] = copy.deepcopy(env_config)
+    if variant == "guided-ddpg-cbf":
+        install_minimal_guided_cbf(namespace)
+
+    if variant == "ppo":
+        model = PPO.load(str(model_path), device=str(device))
+    elif variant == "ddpg":
+        model = DDPG.load(str(model_path), device=str(device))
+    else:
+        model = namespace["GuidedCBFDDPG"].load(
+            str(model_path), device=str(device)
+        )
+
+    global _LANELESS_EVAL_WORKER_STATE
+    _LANELESS_EVAL_WORKER_STATE = {
+        "namespace": namespace,
+        "model": model,
+        "variant": variant,
+        "args": args,
+        "env_config": env_config,
+    }
+
+
+def _evaluate_laneless_episode_worker(
+    task: tuple[int, int]
+) -> tuple[int, dict[str, Any]]:
+    state = _LANELESS_EVAL_WORKER_STATE
+    if state is None:
+        raise RuntimeError("laneless evaluation worker was not initialized")
+    episode_index, episode_seed = task
+    namespace = state["namespace"]
+    model = state["model"]
+    variant = state["variant"]
+    args = state["args"]
+    if variant in {"ppo", "ddpg"}:
+        frame = namespace["evaluate_policy_with_metrics"](
+            model,
+            episodes=1,
+            seed=int(episode_seed),
+            deterministic=True,
+            env_config=state["env_config"],
+            episode_log_path=None,
+            episode_log_label="parallel-worker",
+        )
+    else:
+        frame = namespace["evaluate_cbf_policy_with_metrics"](
+            model,
+            episodes=1,
+            seed=int(episode_seed),
+            deterministic=True,
+            lambda_filter=namespace["CBF_FILTER_REWARD_LAMBDA"],
+            eps_side=namespace["CBF_EPS_SIDE"],
+            env_config=state["env_config"],
+            episode_log_path=None,
+            episode_log_label="parallel-worker",
+        )
+    if len(frame) != 1:
+        raise RuntimeError(
+            f"worker returned {len(frame)} rows for episode {episode_index}"
+        )
+    row = frame.iloc[0].to_dict()
+    # Match the existing serial evaluator's zero-based episode numbering.
+    row["episode"] = int(episode_index) - 1
+    row["seed"] = int(episode_seed)
+    return int(episode_index), row
+
+
+def _evaluate_laneless_with_workers(
+    *,
+    namespace: dict[str, Any],
+    notebook_path: Path,
+    model_path: Path,
+    variant: str,
+    episodes: int,
+    seed: int,
+    env_config: dict[str, Any],
+    args: argparse.Namespace,
+    needs_cbf: bool,
+    episode_log_path: Path,
+    episode_log_label: str,
+) -> pd.DataFrame:
+    workers = int(args.workers)
+    tasks = [
+        (episode_index, int(seed) + episode_index)
+        for episode_index in range(int(episodes))
+    ]
+    print(
+        f"[eval-runner] workers={workers} evaluation_device=cpu "
+        f"pending={len(tasks)}",
+        flush=True,
+    )
+    rows_by_index: dict[int, dict[str, Any]] = {}
+    executor = ProcessPoolExecutor(
+        max_workers=workers,
+        mp_context=mp.get_context("spawn"),
+        initializer=_initialize_laneless_eval_worker,
+        initargs=(
+            str(Path(namespace["PROJECT_ROOT"]).resolve()),
+            str(notebook_path),
+            variant,
+            str(model_path),
+            "cpu",
+            args,
+            env_config,
+            bool(needs_cbf),
+        ),
+    )
+    try:
+        futures = [
+            executor.submit(_evaluate_laneless_episode_worker, task)
+            for task in tasks
+        ]
+        for completed, future in enumerate(as_completed(futures), start=1):
+            episode_index, row = future.result()
+            rows_by_index[int(episode_index)] = row
+            ordered_rows = [
+                rows_by_index[index]
+                for index in sorted(rows_by_index)
+            ]
+            namespace["_write_evaluation_episode_progress"](
+                ordered_rows,
+                episode_log_path,
+                label=episode_log_label,
+                expected_episodes=int(episodes),
+            )
+            print(
+                f"[eval-runner] completed={completed}/{len(tasks)} "
+                f"episode={episode_index + 1}/{len(tasks)} seed={row['seed']}",
+                flush=True,
+            )
+    except BaseException:
+        executor.shutdown(wait=False, cancel_futures=True)
+        raise
+    else:
+        executor.shutdown(wait=True)
+
+    rows = [rows_by_index[index] for index in sorted(rows_by_index)]
+    namespace["_write_evaluation_episode_progress"](
+        rows,
+        episode_log_path,
+        label=episode_log_label,
+        expected_episodes=int(episodes),
+        state="complete",
+    )
+    return pd.DataFrame(rows)
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Run laneless Karalakou final evaluations out of process.")
     parser.add_argument("--variant", choices=["ppo", "ddpg", "ddpg-cbf", "guided-ddpg-cbf"], required=True)
     parser.add_argument("--episodes", type=int, required=True)
+    parser.add_argument(
+        "--workers",
+        type=int,
+        default=DEFAULT_EVALUATION_WORKERS,
+        help="independent single-threaded CPU evaluation workers",
+    )
     parser.add_argument("--seed", type=int, required=True)
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--device", default="cpu")
@@ -224,6 +417,8 @@ def main() -> int:
     faulthandler.enable(all_threads=True)
     set_stable_native_defaults()
     args = parse_args()
+    if int(args.workers) <= 0:
+        raise ValueError("--workers must be positive")
 
     project_root = find_project_root(args.project_root or Path.cwd())
     notebook_path = project_root / "notebooks" / "lanelessKaralakou.ipynb"
@@ -340,7 +535,26 @@ def main() -> int:
             flush=True,
         )
 
-    if args.variant == "ppo":
+    episode_log_path = output_path.with_name(output_path.stem + "_episodes_progress.csv")
+    if int(args.workers) > 1:
+        print(
+            f"[eval-runner] evaluating {args.variant} with {int(args.workers)} workers",
+            flush=True,
+        )
+        metrics = _evaluate_laneless_with_workers(
+            namespace=namespace,
+            notebook_path=notebook_path,
+            model_path=model_path,
+            variant=args.variant,
+            episodes=int(args.episodes),
+            seed=int(args.seed),
+            env_config=namespace["ENV_CONFIG"],
+            args=args,
+            needs_cbf=needs_cbf,
+            episode_log_path=episode_log_path,
+            episode_log_label=f"{args.variant}@{output_path.stem}",
+        )
+    elif args.variant == "ppo":
         print(f"[eval-runner] loading {model_path}", flush=True)
         model = namespace["PPO"].load(str(model_path), device=args.device)
         print("[eval-runner] evaluating PPO", flush=True)
