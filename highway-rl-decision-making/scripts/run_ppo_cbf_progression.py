@@ -71,6 +71,7 @@ from laneless_script_config import (
 )
 from ppo_cbf_env import CBFContextPhysicalActionWrapper
 from ppo_observation_variants import install_previous_action_observation
+from ppo_reward_safety import install_cbf_violation_reward
 from projected_ppo_cbf import (
     DetachedCBFActorCriticPolicy,
     DetachedCBFActorPPO,
@@ -1242,6 +1243,7 @@ def _make_ppo_worker_env(
         worker_project_root / "notebooks" / "lanelessKaralakou.ipynb",
         worker_namespace,
     )
+    install_cbf_violation_reward(worker_namespace)
     worker_namespace.update(copy.deepcopy(cbf_snapshot))
     return make_ppo_cbf_env(
         worker_namespace,
@@ -2384,6 +2386,7 @@ def _initialize_post_train_eval_worker(
     protocol.exec_required_notebook_cells(
         root / "notebooks" / "lanelessKaralakou.ipynb", namespace
     )
+    install_cbf_violation_reward(namespace)
     namespace["DEVICE"] = str(device)
     namespace.update(copy.deepcopy(cbf_settings))
     model = load_model(variant, Path(model_path), str(device))
@@ -3894,6 +3897,7 @@ def main() -> int:
     protocol.exec_required_notebook_cells(
         project_root / "notebooks" / "lanelessKaralakou.ipynb", namespace
     )
+    install_cbf_violation_reward(namespace)
     namespace["DEVICE"] = args.device
     env_config = env_config_from_args(args, namespace["ENV_CONFIG"])
     if active_traffic_model(env_config) == "mtm":
