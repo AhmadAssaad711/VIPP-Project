@@ -319,6 +319,17 @@ def _run_episode(
             discount_factor = float(gamma ** step)
             base = env.unwrapped
             total_return += float(reward)
+            ego_speed = _as_float(
+                info.get("karalakou_ego_speed"),
+                _as_float(getattr(base.vehicle, "vx", np.nan)),
+            )
+            nominal_desired_speed = _as_float(
+                getattr(base.vehicle, "desired_speed", np.nan)
+            )
+            target_speed = _as_float(
+                info.get("karalakou_target_speed"),
+                _as_float(info.get("karalakou_desired_speed"), nominal_desired_speed),
+            )
             row = {
                 "policy": policy_name,
                 "episode_index": int(episode_index),
@@ -328,9 +339,12 @@ def _run_episode(
                 "discount_factor": discount_factor,
                 "discounted_reward": float(discount_factor * float(reward)),
                 "total_return_so_far": float(total_return),
-                "ego_speed": _as_float(info.get("karalakou_ego_speed"), _as_float(getattr(base.vehicle, "vx", np.nan))),
-                "desired_speed": _as_float(info.get("karalakou_desired_speed"), _as_float(getattr(base.vehicle, "desired_speed", np.nan))),
-                "target_speed": _as_float(info.get("karalakou_target_speed")),
+                "ego_speed": ego_speed,
+                # Keep the historical desired_speed column as the primary,
+                # nominal target used by the reward.
+                "desired_speed": target_speed,
+                "target_speed": target_speed,
+                "nominal_desired_speed": nominal_desired_speed,
                 "ego_y": _as_float(info.get("karalakou_ego_y"), _as_float(base.vehicle.position[1])),
                 "target_y": _as_float(info.get("karalakou_target_y")),
                 "progress_m": _as_float(info.get("karalakou_progress_m"), 0.0),
@@ -514,7 +528,10 @@ def _run_episode(
         ),
         "mean_speed": float(frame["ego_speed"].mean()),
         "mean_abs_speed_error": float(
-            np.mean(np.abs(frame["ego_speed"] - frame["desired_speed"]))
+            np.mean(np.abs(frame["ego_speed"] - frame["target_speed"]))
+        ),
+        "mean_abs_nominal_speed_error": float(
+            np.mean(np.abs(frame["ego_speed"] - frame["nominal_desired_speed"]))
         ),
         "mean_abs_lateral_action": float(np.mean(np.abs(frame["action_ay"]))),
         "mean_action_saturation": float(frame["near_saturation_fraction"].mean()),
@@ -767,6 +784,9 @@ def main() -> int:
                 ),
                 "mean_speed": float(frame["mean_speed"].mean()),
                 "mean_abs_speed_error": float(frame["mean_abs_speed_error"].mean()),
+                "mean_abs_nominal_speed_error": float(
+                    frame["mean_abs_nominal_speed_error"].mean()
+                ),
                 "mean_action_saturation": float(frame["mean_action_saturation"].mean()),
                 "positive_ax_near_saturation_rate": float(frame["positive_ax_near_saturation_rate"].mean()),
                 "negative_ax_near_saturation_rate": float(frame["negative_ax_near_saturation_rate"].mean()),

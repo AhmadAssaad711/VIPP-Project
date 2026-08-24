@@ -21,6 +21,14 @@ if str(SCRIPTS_DIR) not in sys.path:
 import run_nominal_ppo_parameter_pilot as pilot
 
 
+def test_at1_observation_is_default_with_legacy_opt_out(monkeypatch):
+    monkeypatch.setattr(sys, "argv", ["ppo-pilot"])
+    assert pilot.parse_args().observation_at1 is True
+
+    monkeypatch.setattr(sys, "argv", ["ppo-pilot", "--no-observation-at1"])
+    assert pilot.parse_args().observation_at1 is False
+
+
 def test_ppo_pilot_table_and_exact_boundaries():
     assert list(pilot.PPO_CONFIGS) == [
         "Q0_current_aligned",
@@ -74,7 +82,11 @@ def test_parallel_config_keeps_the_same_global_ppo_rollout_size():
 
 
 def test_progress_reward_override_is_explicit_and_non_mutating():
-    base = {"progress_reward_weight": 0.0, "progress_clip": 1.25}
+    base = {
+        "progress_reward_weight": 0.0,
+        "progress_clip": 1.25,
+        "progress_distance_scale_m": 2.0,
+    }
 
     unchanged = pilot.apply_reward_overrides(base, Namespace())
     enabled = pilot.apply_reward_overrides(
@@ -84,7 +96,201 @@ def test_progress_reward_override_is_explicit_and_non_mutating():
     assert unchanged == base
     assert enabled["progress_reward_weight"] == pytest.approx(0.5)
     assert enabled["progress_clip"] == pytest.approx(1.25)
+    assert enabled["progress_distance_scale_m"] == pytest.approx(2.0)
     assert base["progress_reward_weight"] == pytest.approx(0.0)
+
+
+def test_progress_distance_scale_override_is_explicit_and_validated():
+    base = {"progress_distance_scale_m": 2.0}
+
+    enabled = pilot.apply_reward_overrides(
+        base, Namespace(progress_distance_scale_m=1.5)
+    )
+
+    assert enabled["progress_distance_scale_m"] == pytest.approx(1.5)
+    assert base["progress_distance_scale_m"] == pytest.approx(2.0)
+    with pytest.raises(
+        ValueError, match="progress-distance-scale-m must be finite and positive"
+    ):
+        pilot.apply_reward_overrides(
+            base, Namespace(progress_distance_scale_m=0.0)
+        )
+
+
+def test_notebook_progress_reward_is_distance_based_not_target_speed_based():
+    import run_cbf_filter_ablation as pipeline
+
+    project_root = Path(__file__).resolve().parents[1]
+    namespace = pipeline.bootstrap_notebook_namespace(project_root)
+    pipeline.exec_required_notebook_cells(
+        project_root / "notebooks" / "lanelessKaralakou.ipynb", namespace
+    )
+    wrapper = object.__new__(namespace["KaralakouRewardWrapper"])
+    wrapper.reward_config = {"progress_distance_scale_m": 2.0}
+
+    # The same travelled distance must receive the same progress credit even
+    # when the dynamic target speed changes; less distance must receive less.
+    assert wrapper._normalized_forward_progress(1.0, 5.0) == pytest.approx(0.5)
+    assert wrapper._normalized_forward_progress(1.0, 20.0) == pytest.approx(0.5)
+    assert wrapper._normalized_forward_progress(0.5, 20.0) == pytest.approx(0.25)
+
+
+def _make_target_speed_test_wrapper(*, blocker_dx=None, blocker_y=5.1, blocker_vx=8.0):
+    """Build the smallest fake lane-free state needed by the target helper."""
+
+    import run_cbf_filter_ablation as pipeline
+
+    project_root = Path(__file__).resolve().parents[1]
+    namespace = pipeline.bootstrap_notebook_namespace(project_root)
+    pipeline.exec_required_notebook_cells(
+        project_root / "notebooks" / "lanelessKaralakou.ipynb", namespace
+    )
+
+    class _Vehicle:
+        def __init__(self, x, y, vx, width=1.8, length=3.5):
+            self.position = np.asarray([x, y], dtype=float)
+            self.vx = float(vx)
+            self.vy = 0.0
+            self.width = float(width)
+            self.length = float(length)
+            self.desired_speed = 20.0
+
+    class _Base:
+        def __init__(self):
+            self.config = {"road_width": 10.2, "sensing_range": 90.0}
+            self.vehicle = _Vehicle(0.0, 5.1, 20.0)
+            self.road = type("_Road", (), {})()
+            vehicles = [self.vehicle]
+            if blocker_dx is not None:
+                vehicles.append(_Vehicle(float(blocker_dx), blocker_y, blocker_vx))
+            self.road.vehicles = vehicles
+
+        @staticmethod
+        def _forward_distance(ego_x, vehicle_x):
+            return float(vehicle_x - ego_x)
+
+    wrapper = object.__new__(namespace["KaralakouRewardWrapper"])
+    wrapper.env = Namespace(unwrapped=_Base())
+    wrapper.reward_config = {
+        "ego_desired_speed": 20.0,
+        "timegap": 1.5,
+        "zone_margin": 0.15,
+        "target_speed_transition_m": 8.0,
+        "target_speed_lateral_transition_m": 0.45,
+        "target_speed_blockage_threshold": 0.55,
+        "target_speed_blockage_transition": 0.15,
+    }
+    return wrapper
+
+
+def test_target_speed_is_continuous_at_the_scan_distance_boundary():
+    scan_distance = 20.0 * 1.5
+    before = _make_target_speed_test_wrapper(blocker_dx=scan_distance - 0.1)
+    after = _make_target_speed_test_wrapper(blocker_dx=scan_distance + 0.1)
+
+    before_speed = before._lateral_target_and_speed()[1]
+    after_speed = after._lateral_target_and_speed()[1]
+
+    # Blocker motion affects lateral guidance only; the longitudinal target
+    # remains the nominal desired speed.
+    assert abs(before_speed - after_speed) < 0.25
+
+
+def test_target_speed_is_continuous_when_a_vehicle_is_overtaken():
+    before = _make_target_speed_test_wrapper(blocker_dx=-0.1)
+    after = _make_target_speed_test_wrapper(blocker_dx=0.1)
+
+    before_speed = before._lateral_target_and_speed()[1]
+    after_speed = after._lateral_target_and_speed()[1]
+
+    # Crossing dx=0 cannot change the nominal longitudinal reference.
+    assert abs(before_speed - after_speed) < 0.75
+
+
+def test_target_speed_remains_nominal_when_blockers_change():
+    far = _make_target_speed_test_wrapper(blocker_dx=80.0, blocker_vx=8.0)
+    near = _make_target_speed_test_wrapper(blocker_dx=12.0, blocker_vx=8.0)
+    lateral = _make_target_speed_test_wrapper(
+        blocker_dx=12.0, blocker_y=1.0, blocker_vx=8.0
+    )
+    fast = _make_target_speed_test_wrapper(blocker_dx=12.0, blocker_vx=24.0)
+
+    far_speed = far._lateral_target_and_speed()[1]
+    near_speed = near._lateral_target_and_speed()[1]
+    lateral_speed = lateral._lateral_target_and_speed()[1]
+    fast_speed = fast._lateral_target_and_speed()[1]
+
+    assert far_speed == pytest.approx(20.0)
+    assert near_speed == pytest.approx(20.0)
+    assert lateral_speed == pytest.approx(20.0)
+    assert fast_speed == pytest.approx(20.0)
+
+
+def test_distance_task_completion_requires_a_collision_free_1000m_episode():
+    import run_cbf_filter_ablation as pipeline
+
+    project_root = Path(__file__).resolve().parents[1]
+    namespace = pipeline.bootstrap_notebook_namespace(project_root)
+    pipeline.exec_required_notebook_cells(
+        project_root / "notebooks" / "lanelessKaralakou.ipynb", namespace
+    )
+
+    class _Vehicle:
+        def __init__(self):
+            self.position = np.zeros(2, dtype=float)
+
+    class _DistanceEnv(gym.Env):
+        observation_space = gym.spaces.Box(-1.0, 1.0, shape=(1,), dtype=np.float32)
+        action_space = gym.spaces.Box(-1.0, 1.0, shape=(1,), dtype=np.float32)
+
+        def __init__(self, collision: bool):
+            self.vehicle = _Vehicle()
+            self.collision = bool(collision)
+
+        def reset(self, *, seed=None, options=None):
+            super().reset(seed=seed)
+            self.vehicle.position[:] = 0.0
+            return np.zeros(1, dtype=np.float32), {}
+
+        def step(self, action):
+            del action
+            # Deliberately cross the target in one simulator step.  The task
+            # wrapper must report the capped target distance, not this raw
+            # overshoot.
+            self.vehicle.position[0] = 1200.0
+            return (
+                np.zeros(1, dtype=np.float32),
+                0.0,
+                False,
+                False,
+                {
+                    "ego_collision": self.collision,
+                    "ego_collision_events": int(self.collision),
+                },
+            )
+
+    wrapper_cls = namespace["TaskProgressWrapper"]
+
+    safe_env = wrapper_cls(_DistanceEnv(False), task_distance_m=1000.0, max_steps=None)
+    safe_env.reset(seed=1)
+    _obs, _reward, terminated, truncated, info = safe_env.step(np.zeros(1))
+    assert terminated and not truncated
+    assert info["task_completed"] is True
+    assert info["task_collision_free"] is True
+    assert info["task_distance_traveled_m"] == pytest.approx(1000.0)
+    assert info["task_step_progress_m"] == pytest.approx(1000.0)
+    assert info["task_progress_ratio"] == pytest.approx(1.0)
+
+    collided_env = wrapper_cls(
+        _DistanceEnv(True), task_distance_m=1000.0, max_steps=None
+    )
+    collided_env.reset(seed=1)
+    _obs, _reward, terminated, truncated, info = collided_env.step(np.zeros(1))
+    assert terminated and not truncated
+    assert info["task_completed"] is False
+    assert info["task_collision_free"] is False
+    assert info["task_collision_events"] == pytest.approx(1.0)
+    assert info["task_distance_traveled_m"] == pytest.approx(1000.0)
 
 
 def test_progress_reward_override_rejects_nonfinite_weight():
@@ -400,24 +606,17 @@ def test_notebook_ppo_cell_delegates_to_canonical_cbf_progression():
     )
     compile(source, f"{notebook_path}:ppo-cbf-progression", "exec")
     assert "run_ppo_cbf_progression.py" in source
-    assert "PPO_1M_TIMESTEPS_PER_POLICY" in source
-    assert "PPO_1M_RUN_TRAINING" in source
-    assert "PPO_1M_FORCE_RETRAIN" in source
-    assert "PPO_1M_REQUIRE_CUDA = True" in source
+    assert '"_PPO_TASK_TIMESTEPS_OVERRIDE", 50_000' in source
+    assert "PPO_RUN_TRAINING = True" in source
+    assert "PPO_FORCE_RETRAIN = False" in source
     assert '"--traffic-model", "mtm"' in source
     assert '"ppo_nominal"' in source
+    assert '"ppo_cbf_shield_only"' in source
     assert '"ppo_cbf_reward"' in source
-    assert '"ppo_cbf_nd_reward_actor"' in source
-    assert '"ppo_cbf_nd_actor_only"' in source
-    assert '"ppo_cbf_diff_reward_only"' in source
     assert '"ppo_cbf_projected_reward_off"' in source
-    assert '"ppo_cbf_integrated_actor_only"' in source
-    assert '"ppo_cbf_integrated_actor_critic"' not in source
-    assert '"--lambda-critic"' not in source
-    assert '"--lambda-detached-actor", "0.10"' in source
+    assert '"ppo_cbf_projected"' in source
     assert "model = PPO(" not in source
     assert "subprocess.Popen" in source
     assert "stdout=subprocess.PIPE" in source
     assert "stderr=subprocess.STDOUT" in source
-    assert "PPO_1M_POST_TRAIN_EVAL_EPISODES = 200" in source
-    assert "--task-distance-m" in source
+    assert "PPO_PROGRESSION_LOG_PATH" in source

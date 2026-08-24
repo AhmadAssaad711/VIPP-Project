@@ -255,6 +255,214 @@ class CBFContextPhysicalActionWrapper(gym.Wrapper):
             "system": copy.deepcopy(system),
         }
 
+    @staticmethod
+    def _hocbf_diagnostics(
+        system: dict[str, Any], safe_action: np.ndarray
+    ) -> dict[str, Any]:
+        """Evaluate the non-box HOCBF rows for one executed substep.
+
+        ``build_cbf_action_constraints`` represents the desired condition
+        ``h_ddot + k1 h_dot + k0 h >= 0`` as ``row @ a <= bound``.  Box
+        constraints are intentionally excluded below: saturation is useful to
+        log separately, whereas this margin answers the CBF stability
+        question directly.
+        """
+
+        rows = np.asarray(system.get("cbf_rows", ()), dtype=float)
+        bounds = np.asarray(system.get("cbf_bounds", ()), dtype=float).reshape(-1)
+        action = np.asarray(safe_action, dtype=float).reshape(-1)[:2]
+        if rows.size == 0 or bounds.size == 0:
+            return {
+                "hocbf_margin": float("inf"),
+                "max_hocbf_violation_safe": 0.0,
+                "hocbf_condition_satisfied": True,
+            }
+        rows = rows.reshape(-1, 2)
+        slack = bounds - rows @ action
+        min_margin = float(np.min(slack))
+        max_violation = float(np.max(-slack))
+        return {
+            "hocbf_margin": min_margin,
+            "max_hocbf_violation_safe": max(0.0, max_violation),
+            "hocbf_condition_satisfied": bool(max_violation <= 1e-5),
+        }
+
+    def _project_substep_action(
+        self, raw_action: Any
+    ) -> tuple[np.ndarray, dict[str, Any]]:
+        """Project a fresh physical action against the current physics state."""
+
+        # Do not use ``current_constraint_system`` here: it intentionally
+        # caches the policy-rate observation context.  At 100 Hz the traffic
+        # state changes during the ten simulator frames, so each substep needs
+        # a new HOCBF polytope.
+        system = self._constraint_system()
+        result = project_polytope_2d_numpy(
+            raw_action,
+            system["rows"],
+            system["bounds"],
+            action_low=self.physical_low,
+            action_high=self.physical_high,
+        )
+        record = self._projection_record(
+            raw_action=raw_action,
+            safe_action=result.action,
+            result=result,
+            system=system,
+            cbf_applied=True,
+        )
+        record.update(self._hocbf_diagnostics(system, result.action))
+        return result.action.copy(), record
+
+    def _substep_filter_enabled(self, record: dict[str, Any]) -> bool:
+        if not bool(record.get("cbf_applied", False)):
+            return False
+        base = self.namespace["_lane_free_base"](self)
+        return bool(base.config.get("cbf_substep_filtering", False)) and hasattr(
+            base, "set_ego_substep_action_filter"
+        )
+
+    def _initial_safety_diagnostics(self) -> dict[str, Any]:
+        """Check h >= 0 and psi_1 = h_dot + k1 h >= 0 at reset."""
+
+        ego = self.namespace["get_ego_state"](self)
+        neighbors = self.namespace["get_neighbor_states"](
+            self, neighbor_range=self.neighbor_range
+        )
+        h_values: list[float] = []
+        psi_values: list[float] = []
+        geometry = self.namespace.get("pairwise_cbf_geometry")
+        relative_state = self.namespace.get("pairwise_relative_state")
+        derivatives = self.namespace.get("centerline_barrier_derivatives")
+        if geometry is not None and relative_state is not None and derivatives is not None:
+            for neighbor in neighbors:
+                h_value = float(geometry(ego, neighbor, eps_side=self.eps_side)[0])
+                dx, dy, dvx, dvy = relative_state(ego, neighbor)
+                h_derivative, gradient, _hessian, *_ = derivatives(
+                    np.asarray([dx, dy], dtype=float),
+                    ego,
+                    neighbor,
+                    self.eps_side,
+                )
+                del h_derivative
+                h_dot = float(
+                    np.asarray(gradient, dtype=float)
+                    @ np.asarray([dvx, dvy], dtype=float)
+                )
+                h_values.append(h_value)
+                psi_values.append(h_dot + self.k1 * h_value)
+
+        base = self.namespace["_lane_free_base"](self)
+        road_width = float(base.config["road_width"])
+        ego_half_width = 0.5 * float(ego["width"])
+        left_h = float(ego["y"] - ego_half_width)
+        right_h = float(road_width - ego_half_width - ego["y"])
+        h_values.extend([left_h, right_h])
+        psi_values.extend(
+            [
+                float(ego["vy"] + self.k1 * left_h),
+                float(-ego["vy"] + self.k1 * right_h),
+            ]
+        )
+        min_h = float(np.min(h_values)) if h_values else np.nan
+        min_psi = float(np.min(psi_values)) if psi_values else np.nan
+        tolerance = float(self.namespace.get("CBF_QP_FEASIBILITY_TOL", 1e-5))
+        safe = bool(
+            np.isfinite(min_h)
+            and min_h >= -tolerance
+            and np.isfinite(min_psi)
+            and min_psi >= -tolerance
+        )
+        return {
+            "cbf_initial_min_h": min_h,
+            "cbf_initial_min_psi": min_psi,
+            "cbf_initial_safe_set": safe,
+        }
+
+    @staticmethod
+    def _aggregate_substep_record(
+        record: dict[str, Any], substeps: list[dict[str, Any]]
+    ) -> dict[str, Any]:
+        """Turn physics-rate projections into one policy-rate execution record."""
+
+        if not substeps:
+            return record
+        aggregate = copy.deepcopy(record)
+        normalized = np.asarray(
+            [step.get("correction_norm_normalized", 0.0) for step in substeps],
+            dtype=float,
+        )
+        physical = np.asarray(
+            [step.get("correction_norm_physical", 0.0) for step in substeps],
+            dtype=float,
+        )
+        normalized = normalized[np.isfinite(normalized)]
+        physical = physical[np.isfinite(physical)]
+        # The square of the reported policy-rate norm is exactly the mean
+        # per-substep squared correction.  That preserves the reward and
+        # safety-critic cost contract without hiding a 10x scale change.
+        aggregate["correction_norm_normalized"] = float(
+            np.sqrt(np.mean(normalized**2)) if normalized.size else 0.0
+        )
+        aggregate["correction_norm_physical"] = float(
+            np.sqrt(np.mean(physical**2)) if physical.size else 0.0
+        )
+        aggregate["intervened"] = bool(
+            any(bool(step.get("intervened", False)) for step in substeps)
+        )
+        aggregate["feasible"] = bool(
+            all(bool(step.get("feasible", True)) for step in substeps)
+        )
+        aggregate["fallback_used"] = bool(
+            any(bool(step.get("fallback_used", False)) for step in substeps)
+        )
+        aggregate["substep_count"] = int(len(substeps))
+        aggregate["substep_intervention_steps"] = int(
+            sum(bool(step.get("intervened", False)) for step in substeps)
+        )
+        aggregate["substep_fallback_steps"] = int(
+            sum(bool(step.get("fallback_used", False)) for step in substeps)
+        )
+        margins = np.asarray(
+            [step.get("hocbf_margin", np.nan) for step in substeps], dtype=float
+        )
+        margins = margins[np.isfinite(margins)]
+        violations = np.asarray(
+            [step.get("max_hocbf_violation_safe", np.nan) for step in substeps],
+            dtype=float,
+        )
+        violations = violations[np.isfinite(violations)]
+        aggregate["hocbf_margin"] = float(np.min(margins)) if margins.size else np.nan
+        aggregate["max_hocbf_violation_safe"] = (
+            float(np.max(violations)) if violations.size else np.nan
+        )
+        aggregate["hocbf_condition_satisfied"] = bool(
+            all(
+                bool(step.get("hocbf_condition_satisfied", True))
+                for step in substeps
+            )
+        )
+        # Policy diagnostics retain the latent/raw action from the PPO sample
+        # but expose the last actually executed substep action and state.
+        last = substeps[-1]
+        aggregate["safe_action"] = np.asarray(last["safe_action"], dtype=np.float32)
+        aggregate["active_indices"] = np.asarray(
+            last.get("active_indices", ()), dtype=np.int64
+        )
+        aggregate["constraint_hash"] = str(last.get("constraint_hash", ""))
+        aggregate["system"] = copy.deepcopy(last["system"])
+        aggregate["projection_source"] = "substep_active_set_2d"
+        safe_violations = np.asarray(
+            [step.get("max_constraint_violation_safe", np.nan) for step in substeps],
+            dtype=float,
+        )
+        safe_violations = safe_violations[np.isfinite(safe_violations)]
+        if safe_violations.size:
+            aggregate["max_constraint_violation_safe"] = float(
+                np.max(safe_violations)
+            )
+        return aggregate
+
     def set_projection_record(
         self,
         raw_action: Any,
@@ -301,6 +509,30 @@ class CBFContextPhysicalActionWrapper(gym.Wrapper):
         observation, info = self.env.reset(**kwargs)
         system = self._constraint_system()
         info = dict(info)
+        initial_safety = self._initial_safety_diagnostics()
+        info.update(initial_safety)
+        base = self.namespace["_lane_free_base"](self)
+        traffic_safety = base.config.get("traffic_safety", {})
+        # An explicit top-level setting is authoritative.  This lets an
+        # evaluation protocol retain the source run's CBF-safe spawn sampler
+        # (and therefore paired initial states) while allowing a deployment
+        # gain sweep to inspect candidates whose psi_1 condition is not
+        # satisfied at reset.  When the top-level key is absent, preserve the
+        # historical inference from the traffic safe-spawn configuration.
+        configured_initial_safe = base.config.get("cbf_require_initial_safe_set")
+        if configured_initial_safe is None:
+            require_initial_safe = bool(
+                isinstance(traffic_safety, dict)
+                and traffic_safety.get("spawn_cbf_safe_set", False)
+            )
+        else:
+            require_initial_safe = bool(configured_initial_safe)
+        if require_initial_safe and not bool(initial_safety["cbf_initial_safe_set"]):
+            raise RuntimeError(
+                "CBF reset violated h >= 0 or psi_1 >= 0: "
+                f"min_h={initial_safety['cbf_initial_min_h']:.6f}, "
+                f"min_psi={initial_safety['cbf_initial_min_psi']:.6f}"
+            )
         info["cbf_constraint_hash"] = str(system["hash"])
         info["cbf_constraint_count"] = int(system["rows"].shape[0])
         return self._augment_observation(observation, system), info
@@ -330,9 +562,47 @@ class CBFContextPhysicalActionWrapper(gym.Wrapper):
             record = self._box_record(action, system)
             safe_action = record["safe_action"]
 
+        use_substep_filter = self._substep_filter_enabled(record)
+        simulator_action = (
+            np.asarray(record["raw_action"], dtype=np.float32)
+            if use_substep_filter
+            else safe_action
+        )
         normalized_action = np.asarray(
             self.namespace["_physical_to_normalized_action"](
-                self, safe_action
+                self, simulator_action
+            ),
+            dtype=np.float32,
+        ).reshape(-1)[:2]
+        substep_records: list[dict[str, Any]] = []
+        base = self.namespace["_lane_free_base"](self)
+        previous_filter = None
+        if use_substep_filter:
+            def _filter_substep(
+                proposed_physical_action: np.ndarray, _frame_index: int
+            ) -> tuple[np.ndarray, dict[str, Any]]:
+                safe_substep, substep_record = self._project_substep_action(
+                    proposed_physical_action
+                )
+                substep_records.append(substep_record)
+                return safe_substep, substep_record
+
+            previous_filter = base.set_ego_substep_action_filter(_filter_substep)
+        try:
+            observation, reward, terminated, truncated, info = self.env.step(
+                normalized_action
+            )
+        finally:
+            if use_substep_filter:
+                # The environment owns no policy state; leaving a callback
+                # installed would accidentally filter a later raw rollout.
+                base.set_ego_substep_action_filter(previous_filter)
+
+        record = self._aggregate_substep_record(record, substep_records)
+        executed_action = np.asarray(record["safe_action"], dtype=np.float32)
+        executed_normalized_action = np.asarray(
+            self.namespace["_physical_to_normalized_action"](
+                self, executed_action
             ),
             dtype=np.float32,
         ).reshape(-1)[:2]
@@ -340,22 +610,17 @@ class CBFContextPhysicalActionWrapper(gym.Wrapper):
             action_delta_norm_sq = 0.0
         else:
             action_delta = (
-                normalized_action - self._previous_executed_action_normalized
+                executed_normalized_action - self._previous_executed_action_normalized
             )
             action_delta_norm_sq = float(np.dot(action_delta, action_delta))
-        action_rate_penalty = (
-            self.action_rate_penalty_lambda * action_delta_norm_sq
-        )
-        observation, reward, terminated, truncated, info = self.env.step(
-            normalized_action
-        )
+        action_rate_penalty = self.action_rate_penalty_lambda * action_delta_norm_sq
 
         correction_penalty = (
             self.lambda_delta * float(record["correction_norm_normalized"]) ** 2
             + self.lambda_intervention * float(record["intervened"])
         )
         reward = float(reward) - float(correction_penalty) - float(action_rate_penalty)
-        self._previous_executed_action_normalized = normalized_action.copy()
+        self._previous_executed_action_normalized = executed_normalized_action.copy()
         info = dict(info)
         raw = np.asarray(record["raw_action"], dtype=np.float32)
         safe = np.asarray(record["safe_action"], dtype=np.float32)
@@ -382,6 +647,23 @@ class CBFContextPhysicalActionWrapper(gym.Wrapper):
                 "cbf_fallback_used": bool(record["fallback_used"]),
                 "cbf_projection_solver": "active_set_2d_shared",
                 "cbf_projection_source": str(record["projection_source"]),
+                "cbf_substep_filter_enabled": bool(use_substep_filter),
+                "cbf_substep_count": int(record.get("substep_count", 0)),
+                "cbf_substep_intervention_steps": int(
+                    record.get("substep_intervention_steps", 0)
+                ),
+                "cbf_substep_fallback_steps": int(
+                    record.get("substep_fallback_steps", 0)
+                ),
+                "cbf_hocbf_min_margin": float(
+                    record.get("hocbf_margin", np.nan)
+                ),
+                "cbf_hocbf_max_violation_safe": float(
+                    record.get("max_hocbf_violation_safe", np.nan)
+                ),
+                "cbf_hocbf_condition_satisfied": bool(
+                    record.get("hocbf_condition_satisfied", True)
+                ),
                 "cbf_max_constraint_violation_safe": float(
                     record["max_constraint_violation_safe"]
                 ),

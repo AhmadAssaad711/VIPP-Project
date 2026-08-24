@@ -46,7 +46,11 @@ def _signature_args(**overrides: object) -> SimpleNamespace:
         "lambda_delta": 0.05,
         "lambda_intervention": 0.10,
         "lambda_mean": 0.10,
+        "lambda_detached_actor": 0.10,
         "lambda_sample": 0.0,
+        "lambda_critic": 0.10,
+        "safety_critic_gamma": 0.99,
+        "safety_critic_cost_clip": 1.0,
         "correction_epsilon": 0.03,
     }
     values.update(overrides)
@@ -103,25 +107,58 @@ def test_progression_contains_the_required_causal_controls():
         "ppo_nominal",
         "ppo_cbf_shield_only",
         "ppo_cbf_reward",
+        "ppo_cbf_nd_reward_actor",
+        "ppo_cbf_nd_actor_only",
+        "ppo_cbf_diff_reward_only",
         "ppo_cbf_projected_reward_off",
         "ppo_cbf_projected",
+        "ppo_cbf_integrated_actor_only",
     )
     nominal = progression.VARIANT_SPECS["ppo_nominal"]
     shield_only = progression.VARIANT_SPECS["ppo_cbf_shield_only"]
     reward = progression.VARIANT_SPECS["ppo_cbf_reward"]
+    reward_actor = progression.VARIANT_SPECS["ppo_cbf_nd_reward_actor"]
+    detached_actor_only = progression.VARIANT_SPECS[
+        "ppo_cbf_nd_actor_only"
+    ]
+    differentiable_reward_only = progression.VARIANT_SPECS[
+        "ppo_cbf_diff_reward_only"
+    ]
     projected_reward_off = progression.VARIANT_SPECS[
         "ppo_cbf_projected_reward_off"
     ]
     projected = progression.VARIANT_SPECS["ppo_cbf_projected"]
+    actor_only = progression.VARIANT_SPECS["ppo_cbf_integrated_actor_only"]
     assert nominal["execution_mode"] == "box"
     assert not nominal["reward_penalty"]
     assert shield_only["execution_mode"] == "cbf"
     assert not shield_only["reward_penalty"]
     assert reward["execution_mode"] == "cbf"
     assert reward["reward_penalty"]
+    assert not reward["detached_actor_loss"]
+    assert reward_actor["execution_mode"] == "cbf"
+    assert reward_actor["reward_penalty"]
+    assert reward_actor["detached_actor_loss"]
+    assert not reward_actor["projected_mean"]
+    assert detached_actor_only["execution_mode"] == "cbf"
+    assert not detached_actor_only["reward_penalty"]
+    assert detached_actor_only["detached_actor_loss"]
+    assert not detached_actor_only["projected_mean"]
+    assert differentiable_reward_only["projected_mean"]
+    assert differentiable_reward_only["reward_penalty"]
+    assert not differentiable_reward_only["differentiable_actor_loss"]
     assert projected_reward_off["projected_mean"]
     assert not projected_reward_off["reward_penalty"]
+    assert projected_reward_off["differentiable_actor_loss"]
     assert projected["projected_mean"]
+    assert projected["differentiable_actor_loss"]
+    assert actor_only["projected_mean"]
+    assert actor_only["differentiable_actor_loss"]
+    assert not actor_only["safety_critic"]
+    assert not any(
+        bool(spec["safety_critic"])
+        for spec in progression.VARIANT_SPECS.values()
+    )
     assert progression.FILTERED_FACTORIAL_VARIANTS == {
         (False, False): "ppo_cbf_shield_only",
         (True, False): "ppo_cbf_reward",
@@ -338,6 +375,73 @@ def test_complete_episode_evaluation_waits_for_a_terminal_episode(monkeypatch):
     assert row["ego_collisions_per_km"] == 0.0
 
 
+def test_distance_task_caps_at_1km_and_collision_wins_over_completion():
+    class _DistanceEnv(gym.Env):
+        def __init__(self, *, collision_on_second_step: bool) -> None:
+            self.action_space = gym.spaces.Box(-1.0, 1.0, shape=(2,), dtype=np.float32)
+            self.observation_space = gym.spaces.Box(
+                -1.0, 1.0, shape=(1,), dtype=np.float32
+            )
+            self.collision_on_second_step = collision_on_second_step
+            self.steps = 0
+
+        def reset(self, *, seed=None, options=None):
+            del seed, options
+            self.steps = 0
+            return np.zeros(1, dtype=np.float32), {}
+
+        def step(self, action):
+            del action
+            self.steps += 1
+            collision = bool(
+                self.collision_on_second_step and self.steps == 2
+            )
+            return (
+                np.zeros(1, dtype=np.float32),
+                0.0,
+                # The task wrapper must terminate on a collision even when a
+                # legacy simulator configuration does not do so itself.
+                False,
+                False,
+                {
+                    "pipeline_distance_step_m": 600.0,
+                    "ego_collision": collision,
+                    # Exercise the boolean fallback too: no numeric event is
+                    # supplied on the collision transition.
+                    "ego_collision_events": 0,
+                },
+            )
+
+    completed = progression.DistanceTaskEvaluationWrapper(
+        _DistanceEnv(collision_on_second_step=False),
+        task_distance_m=1_000.0,
+        max_policy_steps=3,
+    )
+    completed.reset()
+    completed.step(np.zeros(2, dtype=np.float32))
+    _, _, terminated, truncated, completed_info = completed.step(
+        np.zeros(2, dtype=np.float32)
+    )
+    assert terminated and not truncated
+    assert completed_info["task_completed"]
+    assert completed_info["task_distance_traveled_m"] == 1_000.0
+
+    collided = progression.DistanceTaskEvaluationWrapper(
+        _DistanceEnv(collision_on_second_step=True),
+        task_distance_m=1_000.0,
+        max_policy_steps=3,
+    )
+    collided.reset()
+    collided.step(np.zeros(2, dtype=np.float32))
+    _, _, terminated, _truncated, collision_info = collided.step(
+        np.zeros(2, dtype=np.float32)
+    )
+    assert terminated
+    assert not collision_info["task_completed"]
+    assert collision_info["task_collision_terminated"]
+    assert collision_info["task_distance_traveled_m"] == 1_000.0
+
+
 def test_long_windows_tensorboard_path_uses_durable_artifacts(tmp_path, monkeypatch):
     project_root = tmp_path / "project"
     project_root.mkdir()
@@ -546,6 +650,212 @@ def test_inactive_variant_lambdas_do_not_change_checkpoint_identity():
     assert first == second
 
 
+def test_non_differentiable_actor_variants_have_exact_loss_contracts():
+    reward_actor = _training_signature(
+        variant="ppo_cbf_nd_reward_actor",
+        lambda_delta=0.05,
+        lambda_intervention=0.10,
+        lambda_detached_actor=0.25,
+        lambda_mean=99.0,
+        lambda_critic=88.0,
+    )
+    actor_only = _training_signature(
+        variant="ppo_cbf_nd_actor_only",
+        lambda_delta=77.0,
+        lambda_intervention=66.0,
+        lambda_detached_actor=0.25,
+        lambda_mean=99.0,
+        lambda_critic=88.0,
+    )
+
+    reward_settings = reward_actor["effective_training_settings"]
+    actor_only_settings = actor_only["effective_training_settings"]
+    assert reward_settings["lambda_delta"] == 0.05
+    assert reward_settings["lambda_intervention"] == 0.10
+    assert reward_settings["lambda_detached_actor"] == 0.25
+    assert actor_only_settings["lambda_delta"] == 0.0
+    assert actor_only_settings["lambda_intervention"] == 0.0
+    assert actor_only_settings["lambda_detached_actor"] == 0.25
+    for settings in (reward_settings, actor_only_settings):
+        assert settings["lambda_mean"] == 0.0
+        assert settings["lambda_sample"] == 0.0
+        assert settings["lambda_critic"] == 0.0
+
+    for signature in (reward_actor, actor_only):
+        contract = signature["model_contract"]
+        assert contract["algorithm_class"] == "DetachedCBFActorPPO"
+        assert contract["policy_class"] == "DetachedCBFActorCriticPolicy"
+        assert contract["detached_actor_loss_enabled"]
+        assert contract["actor_cbf_gradient_path"] == (
+            "stop_gradient_hard_projection_target"
+        )
+        assert not contract["safety_critic_loss_enabled"]
+
+
+def test_differentiable_variants_have_exact_reward_actor_contracts():
+    reward_only = _training_signature(
+        variant="ppo_cbf_diff_reward_only",
+        lambda_delta=0.05,
+        lambda_intervention=0.10,
+        lambda_mean=0.25,
+        lambda_sample=0.07,
+        lambda_critic=0.40,
+    )
+    reward_actor = _training_signature(
+        variant="ppo_cbf_integrated_actor_only",
+        lambda_delta=0.05,
+        lambda_intervention=0.10,
+        lambda_mean=0.25,
+        lambda_sample=0.07,
+        lambda_critic=0.40,
+    )
+    actor_only = _training_signature(
+        variant="ppo_cbf_projected_reward_off",
+        lambda_delta=55.0,
+        lambda_intervention=44.0,
+        lambda_mean=0.25,
+        lambda_sample=0.07,
+        lambda_critic=0.40,
+    )
+    reward_only_settings = reward_only["effective_training_settings"]
+    assert reward_only_settings["lambda_delta"] == 0.05
+    assert reward_only_settings["lambda_intervention"] == 0.10
+    assert reward_only_settings["lambda_mean"] == 0.0
+    assert reward_only_settings["lambda_sample"] == 0.0
+    assert reward_only_settings["lambda_critic"] == 0.0
+
+    reward_actor_settings = reward_actor["effective_training_settings"]
+    assert reward_actor_settings["lambda_delta"] == 0.05
+    assert reward_actor_settings["lambda_intervention"] == 0.10
+    assert reward_actor_settings["lambda_mean"] == 0.25
+    assert reward_actor_settings["lambda_sample"] == 0.07
+    assert reward_actor_settings["lambda_critic"] == 0.0
+
+    actor_only_settings = actor_only["effective_training_settings"]
+    assert actor_only_settings["lambda_delta"] == 0.0
+    assert actor_only_settings["lambda_intervention"] == 0.0
+    assert actor_only_settings["lambda_mean"] == 0.25
+    assert actor_only_settings["lambda_sample"] == 0.07
+    assert actor_only_settings["lambda_critic"] == 0.0
+
+    for signature in (reward_only, reward_actor, actor_only):
+        settings = signature["effective_training_settings"]
+        assert settings["safety_critic_gamma"] == 0.0
+        assert settings["safety_critic_cost_clip"] == 0.0
+        contract = signature["model_contract"]
+        assert contract["algorithm_class"] == "ProjectedCBFPPO"
+        assert contract["policy_class"] == "ProjectedCBFActorCriticPolicy"
+        assert not contract["detached_actor_loss_enabled"]
+        assert not contract["safety_critic_loss_enabled"]
+        assert not contract["safety_critic_head"]
+        assert contract["ordinary_value_critic"]
+        assert contract["ordinary_value_target"] == "reward_shaped_return"
+    assert not reward_only["model_contract"][
+        "differentiable_actor_loss_enabled"
+    ]
+    assert reward_only["model_contract"]["actor_cbf_gradient_path"] == (
+        "differentiable_projection_only"
+    )
+    for signature in (reward_actor, actor_only):
+        assert signature["model_contract"][
+            "differentiable_actor_loss_enabled"
+        ]
+        assert signature["model_contract"]["actor_cbf_gradient_path"] == (
+            "differentiable_projection_plus_auxiliary_mean_loss"
+        )
+
+
+def test_build_model_dispatches_both_detached_variants(monkeypatch, tmp_path):
+    calls = []
+    sentinel = object()
+
+    def fake_detached_model(policy, env, **kwargs):
+        calls.append((policy, env, kwargs))
+        return sentinel
+
+    monkeypatch.setattr(
+        progression, "DetachedCBFActorPPO", fake_detached_model
+    )
+    args = _signature_args(n_envs=1, device="cpu")
+    config = progression.resolved_ppo_config(args)
+    train_env = object()
+
+    for variant in (
+        "ppo_cbf_nd_reward_actor",
+        "ppo_cbf_nd_actor_only",
+    ):
+        result = progression.build_model(
+            variant=variant,
+            train_env=train_env,
+            config=config,
+            training_seed=307,
+            args=args,
+            tensorboard_log=tmp_path,
+            base_observation_dim=32,
+        )
+        assert result is sentinel
+
+    assert len(calls) == 2
+    for policy, env, kwargs in calls:
+        assert policy is progression.DetachedCBFActorCriticPolicy
+        assert env is train_env
+        assert kwargs["lambda_actor"] == 0.10
+        assert kwargs["execution_mode"] == "cbf"
+        assert kwargs["policy_kwargs"]["cbf_base_observation_dim"] == 32
+
+
+def test_build_model_gates_each_differentiable_auxiliary_loss(
+    monkeypatch, tmp_path
+):
+    calls = []
+    sentinel = object()
+
+    def fake_projected_model(policy, env, **kwargs):
+        calls.append((policy, env, kwargs))
+        return sentinel
+
+    monkeypatch.setattr(progression, "ProjectedCBFPPO", fake_projected_model)
+    args = _signature_args(
+        n_envs=1,
+        device="cpu",
+        lambda_mean=0.25,
+        lambda_sample=0.07,
+        lambda_critic=0.40,
+    )
+    config = progression.resolved_ppo_config(args)
+    train_env = object()
+    expected = {
+        "ppo_cbf_diff_reward_only": (0.0, 0.0, 0.0),
+        "ppo_cbf_integrated_actor_only": (0.25, 0.07, 0.0),
+        "ppo_cbf_projected_reward_off": (0.25, 0.07, 0.0),
+    }
+
+    for variant, coefficients in expected.items():
+        result = progression.build_model(
+            variant=variant,
+            train_env=train_env,
+            config=config,
+            training_seed=307,
+            args=args,
+            tensorboard_log=tmp_path,
+            base_observation_dim=32,
+        )
+        assert result is sentinel
+        kwargs = calls[-1][2]
+        assert (
+            kwargs["lambda_mean"],
+            kwargs["lambda_sample"],
+            kwargs["lambda_critic"],
+        ) == coefficients
+
+    assert len(calls) == 3
+    for policy, env, kwargs in calls:
+        assert policy is progression.ProjectedCBFActorCriticPolicy
+        assert env is train_env
+        assert kwargs["execution_mode"] == "cbf"
+        assert not kwargs["policy_kwargs"]["use_safety_critic"]
+
+
 def test_cli_defaults_ensure_training_and_alias_supports_existing_only(monkeypatch):
     monkeypatch.setattr(sys, "argv", ["run_ppo_cbf_progression.py"])
     defaults = progression.parse_args()
@@ -553,6 +863,7 @@ def test_cli_defaults_ensure_training_and_alias_supports_existing_only(monkeypat
     assert not defaults.force_retrain
     assert defaults.post_train_eval_episodes == 200
     assert not defaults.skip_post_train_evaluation
+    assert defaults.lambda_critic == 0.0
 
     monkeypatch.setattr(
         sys,
@@ -647,60 +958,69 @@ def test_action_clip_callback_accepts_batched_parallel_actions():
 def test_notebook_primary_ladder_is_ppo_first_and_streams_inline():
     notebook_path = PROJECT_ROOT / "notebooks" / "lanelessKaralakou.ipynb"
     notebook = json.loads(notebook_path.read_text(encoding="utf-8"))
-    assert len(notebook["cells"]) == 86
+    assert len(notebook["cells"]) == 96
     sources = {
         cell.get("id"): "".join(cell.get("source", []))
         for cell in notebook["cells"]
     }
-    assert "PPO–CBF Research Ladder" in sources["959ff31d"]
-    assert "Primary PPO Experiment Ladder" in sources["26a35305"]
+    assert "Canonical 1M PPO study" in sources["959ff31d"]
+    assert "Canonical 1M PPO" in sources["26a35305"]
     launcher = sources["eb9eade5"]
     assert "run_ppo_cbf_progression.py" in launcher
-    assert "PPO_RUN_TRAINING = True" in launcher
-    assert "PPO_FORCE_RETRAIN = False" in launcher
-    assert "PPO_RUN_POST_TRAIN_EVALUATION = True" in launcher
-    assert "PPO_POST_TRAIN_EVAL_EPISODES = 200" in launcher
-    assert "PPO_POST_TRAIN_EVALUATE_REUSED =" in launcher
-    assert "PPO_PROGRESSION_NUM_ENVS" in launcher
-    assert "PPO_PROGRESSION_COMPLETED = True" in launcher
-    assert '"--skip-training"' in launcher
-    assert "RUN_PPO_PROGRESSION" not in launcher
+    assert "PPO_1M_RUN_TRAINING" in launcher
+    assert "PPO_1M_FORCE_RETRAIN" in launcher
+    assert "PPO_1M_REQUIRE_CUDA = True" in launcher
+    assert "PPO_1M_POST_TRAIN_EVAL_EPISODES = 200" in launcher
+    assert "PPO_1M_NUM_ENVS = int" in launcher
+    assert "PPO_1M_GLOBAL_ROLLOUT = 1_000" in launcher
+    assert "PPO_1M_BATCH_SIZE = 100" in launcher
+    assert "PPO_1M_EPOCHS = 10" in launcher
+    assert "PPO_1M_TIMESTEPS_PER_POLICY" in launcher
     assert '"--traffic-model", "mtm"' in launcher
-    assert '"--n-envs", str(PPO_PROGRESSION_NUM_ENVS)' in launcher
-    assert '"--post-train-eval-episodes", str(PPO_POST_TRAIN_EVAL_EPISODES)' in launcher
-    assert '"--skip-post-train-evaluation"' in launcher
+    assert '"--n-envs", str(PPO_1M_NUM_ENVS)' in launcher
+    assert '"--post-train-eval-episodes", str(PPO_1M_POST_TRAIN_EVAL_EPISODES)' in launcher
+    assert '"--task-distance-m", str(PPO_1M_TASK_DISTANCE_M)' in launcher
     assert '"--post-train-evaluate-reused"' in launcher
     assert "subprocess.Popen" in launcher
     assert "stdout=subprocess.PIPE" in launcher
     assert "stderr=subprocess.STDOUT" in launcher
-    assert "PPO_PROGRESSION_LOG_PATH" in launcher
-    elongated = sources["ppo_nominal_500k"]
-    assert "PPO_NOMINAL_500K_TIMESTEPS = 500_000" in elongated
-    assert "PPO_NOMINAL_500K_PPO_CONFIG = 'Q1_stable'" in elongated
-    assert "'--variants', 'ppo_nominal'" in elongated
-    assert "'--post-train-eval-episodes', str(PPO_NOMINAL_500K_EVAL_EPISODES)" in elongated
-    assert "'--skip-evaluation'" in elongated
-    assert "'--skip-counterfactual'" in elongated
-    assert "plot_nominal_ppo_results.py" in elongated
-    assert "06_tensorboard_rollout_scalars.png" in elongated
-    assert "02_post_training_400_episode_kpis.png" in elongated
-    assert "Differentiable CBF Final Optimization/Action Layer" in sources["050cad8d"]
-    assert '"ego_dimensions": [3.5, 1.8]' in sources["c9f74b85"]
-    assert "smoke_ego_dimensions" in sources["2c6e9a65"]
-    assert "Re-run All PPO Evaluations Inline Without Retraining" in sources[
-        "cbf_filter_ablation_heading"
+    assert "PPO_1M_RESULTS[\"ppo_nominal\"]" in sources["ppo_primary_3m"]
+    assert "PPO_1M_RESULTS[\"ppo_cbf_reward\"]" in sources["ppo_nominal_500k"]
+    assert "ppo_cbf_nd_reward_actor" in sources["ppo_nd_reward_actor_1m"]
+    assert "ppo_cbf_nd_actor_only" in sources["ppo_nd_actor_only_1m"]
+    assert "stopgrad" in sources["ppo_nd_reward_actor_notes"]
+    assert "no auxiliary safety critic" in sources["ppo_nd_actor_only_notes"]
+    assert "ppo_cbf_diff_reward_only" in sources["6ffd8341"]
+    assert "ppo_cbf_integrated_actor_only" in sources["3b70133c"]
+    assert "PPO still reaches the actor through `J_P`" in sources["729d0c1b"]
+    assert "ppo_cbf_projected_reward_off" in sources[
+        "ppo_diff_actor_only_1m"
     ]
-    assert '"--skip-training"' in sources["cbf_filter_ablation_eval"]
+    assert "ppo_diff_actor_critic_1m" not in sources
+    assert "ppo_diff_actor_critic_notes" not in sources
+    assert "ppo_cbf_integrated_actor_critic" not in launcher
+    assert "reward-shaped returns train the ordinary PPO value critic" in (
+        sources["26a35305"]
+    )
+    assert "PPO_1M_REQUIRED_KPIS" in launcher
+    assert "observed_kpis != expected_kpis" in launcher
+    assert "Distance-based completion rate" in sources["ppo_cbf_projected_500k"]
+    assert '"ego_dimensions": [3.5, 1.8]' in sources["c9f74b85"]
+    assert "PPO_1M_RUN_TRAINING = bool" in launcher
+    assert "Read-only status refresh" in sources["cbf_filter_ablation_heading"]
+    assert "post_train_200ep_kpis_ready" in sources["cbf_filter_ablation_eval"]
     active_runner = sources["f7b6efd6"]
-    assert "PPO is launched only by the primary workflow cell" in active_runner
-    assert "RUN_ACTIVE_PPO_TRAIN" not in active_runner
+    assert '"ppo": "ppo-train"' in active_runner
 
 
 def test_notebook_task_ppo_entry_targets_the_progression():
     task = notebook_task.TASKS["ppo-train"]
     assert task["cell"] == 11
-    assert task["flag"] == "PPO_RUN_TRAINING"
-    assert task["timesteps_key"] == "_PPO_TASK_TIMESTEPS_OVERRIDE"
+    assert task["flag"] == "PPO_1M_RUN_TRAINING"
+    assert task["timesteps_key"] == "PPO_1M_TIMESTEPS_PER_POLICY"
+    assert task["n_envs_key"] == "PPO_1M_NUM_ENVS"
+    assert task["train_cells"] == [13, 15, 17, 19, 21, 23, 25]
+    assert task["post_cells"] == [27, 28]
 
 
 def test_latest_checkpoint_selection_is_timestep_ordered(tmp_path):

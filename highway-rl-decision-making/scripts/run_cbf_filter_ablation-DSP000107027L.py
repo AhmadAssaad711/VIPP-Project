@@ -34,8 +34,7 @@ import sys
 import time
 import warnings
 from pathlib import Path
-from datetime import datetime
-from typing import Any, Optional, Union
+from typing import Any, Optional
 
 import cloudpickle
 import gymnasium as gym
@@ -967,10 +966,7 @@ def bootstrap_notebook_namespace(project_root: Path) -> dict[str, Any]:
         "__name__": "__main__",
         "Any": Any,
         "Optional": Optional,
-        "Union": Union,
         "Path": Path,
-        "datetime": datetime,
-        "json": json,
         "os": os,
         "sys": sys,
         "time": time,
@@ -1030,6 +1026,13 @@ def _mean(values: list[float], default: float = np.nan) -> float:
     return float(np.mean(array)) if array.size else default
 
 
+def _rmse(values: list[float], default: float = np.nan) -> float:
+    """Return the root-mean-square of finite error samples."""
+
+    array = _finite(values)
+    return float(np.sqrt(np.mean(np.square(array)))) if array.size else default
+
+
 def _min(values: list[float], default: float = np.nan) -> float:
     array = _finite(values)
     return float(np.min(array)) if array.size else default
@@ -1046,6 +1049,32 @@ def _as_float(value: Any, default: float = np.nan) -> float:
     except (TypeError, ValueError):
         return default
     return scalar if np.isfinite(scalar) else default
+
+
+def _wrapper_target_speed(env: gym.Env) -> float:
+    """Read the canonical target speed at the current *pre-action* state.
+
+    The reward wrapper publishes ``karalakou_target_speed`` in the info after
+    a transition. That value is useful for executed-state diagnostics, but
+    comparing it with the post-transition speed mixes two different policy
+    timestamps. Walking the wrapper chain and calling the canonical helper
+    keeps the actor metric aligned with the observation on which the action
+    was chosen.
+    """
+
+    current: Any = env
+    visited: set[int] = set()
+    while current is not None and id(current) not in visited:
+        visited.add(id(current))
+        target_fn = getattr(current, "_lateral_target_and_speed", None)
+        if callable(target_fn):
+            try:
+                _target_y, target_speed, _zone_found = target_fn()
+                return float(target_speed)
+            except (TypeError, ValueError, AttributeError, FloatingPointError):
+                return np.nan
+        current = getattr(current, "env", None)
+    return np.nan
 
 
 def seed_everything(seed: int) -> None:
@@ -2230,13 +2259,30 @@ def evaluate_scenario(
         args=args,
     )
     try:
-        obs, _ = env.reset(seed=int(scenario_seed))
+        obs, reset_info = env.reset(seed=int(scenario_seed))
         state_hash = initial_state_hash(env)
+        initial_cbf_min_h = _as_float(reset_info.get("cbf_initial_min_h"))
+        initial_cbf_min_psi = _as_float(reset_info.get("cbf_initial_min_psi"))
+        initial_cbf_safe_set = _as_float(
+            reset_info.get("cbf_initial_safe_set"), default=np.nan
+        )
         rng = np.random.default_rng(int(scenario_seed) + 7_919)
         timestep_budget = evaluation_timestep_budget(args)
         policy_dt = _policy_dt(env)
+        # The historical ablation protocol aggregates fixed-budget segments,
+        # resetting after collision.  A deployment/task evaluation can opt in
+        # to the stricter semantics used for the 1 km completion KPI: one
+        # episode per scenario, collision terminates it, and path distance is
+        # capped exactly at the task target.
+        distance_cap_m = _as_float(
+            getattr(args, "distance_cap_m", np.nan), default=np.inf
+        )
+        stop_after_collision = bool(getattr(args, "stop_after_collision", False))
         rewards: list[float] = []
+        # Primary speed tracking uses the nominal ego desired speed. Keep the
+        # same target definition for policy-state and executed-state metrics.
         speed_errors: list[float] = []
+        nominal_speed_errors: list[float] = []
         jerk_norms: list[float] = []
         h_values: list[float] = []
         h_dot_values: list[float] = []
@@ -2260,7 +2306,13 @@ def evaluate_scenario(
         safe_saturations: list[float] = []
         executed_saturations: list[float] = []
         common_form1_rewards: list[float] = []
+        # Actor-state tracking is sampled before the action is applied. The
+        # existing target_speed_errors list remains the post-transition,
+        # executed-state diagnostic for backward compatibility.
+        policy_target_speed_errors: list[float] = []
+        policy_target_speed_signed_errors: list[float] = []
         target_speed_errors: list[float] = []
+        executed_target_speed_signed_errors: list[float] = []
         target_lateral_errors: list[float] = []
         formulation_cf_values: list[float] = []
         boundary_costs: list[float] = []
@@ -2271,6 +2323,11 @@ def evaluate_scenario(
         acceleration_integrator_clip_rates: list[float] = []
         reference_endpoint_rates: list[float] = []
         controller_saturation_rates: list[float] = []
+        cbf_hddot_values: list[float] = []
+        cbf_hocbf_margin_values: list[float] = []
+        cbf_hocbf_violation_values: list[float] = []
+        cbf_hocbf_satisfied_values: list[float] = []
+        cbf_constraint_violation_values: list[float] = []
         distinct_ego_collision_events = 0
         ego_collision_incidents = 0
         ego_collision_active_timesteps = 0
@@ -2311,6 +2368,13 @@ def evaluate_scenario(
         evaluation_action_hook = namespace.get("ppo_formulation_evaluation_action")
 
         for step in range(timestep_budget):
+            pre_base = env.unwrapped
+            pre_ego_speed = _as_float(getattr(pre_base.vehicle, "vx", np.nan))
+            pre_target_speed = _wrapper_target_speed(env)
+            if np.isfinite(pre_ego_speed) and np.isfinite(pre_target_speed):
+                pre_error = float(pre_ego_speed - pre_target_speed)
+                policy_target_speed_signed_errors.append(pre_error)
+                policy_target_speed_errors.append(abs(pre_error))
             calibration_anchor = bool(
                 calibration_enabled and segment_steps % int(critic_calibration_stride) == 0
             )
@@ -2455,16 +2519,44 @@ def evaluate_scenario(
             )
 
             base = env.unwrapped
-            distance_step_m = _as_float(info.get("pipeline_distance_step_m"), default=0.0)
+            raw_distance_step_m = _as_float(
+                info.get("pipeline_distance_step_m"), default=0.0
+            )
+            distance_step_m = max(raw_distance_step_m, 0.0)
+            if np.isfinite(distance_cap_m):
+                distance_step_m = min(
+                    distance_step_m,
+                    max(float(distance_cap_m) - total_distance_m, 0.0),
+                )
             total_distance_m += distance_step_m
             segment_distance_m += distance_step_m
-            speed_errors.append(abs(float(base.vehicle.vx) - float(base.vehicle.desired_speed)))
+            ego_speed = float(base.vehicle.vx)
+            nominal_desired_speed = float(base.vehicle.desired_speed)
+            nominal_speed_errors.append(abs(ego_speed - nominal_desired_speed))
             common_form1_rewards.append(
                 _as_float(info.get("formulation_common_form1_reward"), default=np.nan)
             )
-            target_speed_errors.append(
-                _as_float(info.get("formulation_abs_target_speed_error"), default=np.nan)
+            # This is the target used by KaralakouRewardWrapper itself.  The
+            # older formulation key is retained only as a fallback for legacy
+            # evaluators that do not expose the reward diagnostics.
+            reward_target_speed = _as_float(
+                info.get("karalakou_target_speed"), default=np.nan
             )
+            if np.isfinite(reward_target_speed):
+                executed_error = float(ego_speed - reward_target_speed)
+                executed_target_speed_signed_errors.append(executed_error)
+                target_speed_errors.append(abs(executed_error))
+            else:
+                fallback_error = _as_float(
+                    info.get("formulation_abs_target_speed_error"), default=np.nan
+                )
+                target_speed_errors.append(fallback_error)
+                if np.isfinite(fallback_error):
+                    executed_target_speed_signed_errors.append(float(fallback_error))
+            primary_speed_error = target_speed_errors[-1]
+            if not np.isfinite(primary_speed_error):
+                primary_speed_error = abs(ego_speed - nominal_desired_speed)
+            speed_errors.append(float(primary_speed_error))
             target_lateral_errors.append(
                 _as_float(info.get("formulation_abs_target_lateral_error_m"), default=np.nan)
             )
@@ -2527,6 +2619,19 @@ def evaluate_scenario(
             neighbor_counts.append(_as_float(pre_state_metrics.get("neighbor_count")))
             traffic_densities.append(
                 _as_float(pre_state_metrics.get("traffic_density_per_km"))
+            )
+            cbf_hddot_values.append(_as_float(info.get("cbf_min_hddot")))
+            cbf_hocbf_margin_values.append(
+                _as_float(info.get("cbf_min_hocbf_margin"))
+            )
+            cbf_hocbf_violation_values.append(
+                _as_float(info.get("cbf_max_hocbf_violation_safe"))
+            )
+            cbf_hocbf_satisfied_values.append(
+                _as_float(info.get("cbf_hocbf_condition_satisfied"))
+            )
+            cbf_constraint_violation_values.append(
+                _as_float(info.get("cbf_max_constraint_violation_safe"))
             )
             rewards.append(float(reward))
             if calibration_enabled:
@@ -2611,12 +2716,34 @@ def evaluate_scenario(
                         "active_constraint_count": int(
                             shadow_filter_info.get("cbf_active_constraint_count", 0)
                         ),
+                        "cbf_min_hddot": _as_float(info.get("cbf_min_hddot")),
+                        "cbf_min_hocbf_margin": _as_float(
+                            info.get("cbf_min_hocbf_margin")
+                        ),
+                        "cbf_max_hocbf_violation_safe": _as_float(
+                            info.get("cbf_max_hocbf_violation_safe")
+                        ),
+                        "cbf_hocbf_condition_satisfied": _as_float(
+                            info.get("cbf_hocbf_condition_satisfied")
+                        ),
+                        "cbf_qp_success": int(bool(info.get("cbf_qp_success", True))),
                         "ego_collision_events": int(info.get("ego_collision_events", 0)),
+                        "ego_collision": int(bool(info.get("ego_collision", False))),
                     }
                 )
 
-            if terminated or truncated:
-                collision_terminal = bool(active_collision or events_step > 0)
+            collision_terminal = bool(active_collision or events_step > 0)
+            distance_cap_reached = bool(
+                np.isfinite(distance_cap_m)
+                and total_distance_m >= float(distance_cap_m) - 1e-9
+            )
+            protocol_boundary = bool(
+                terminated
+                or truncated
+                or distance_cap_reached
+                or (stop_after_collision and collision_terminal)
+            )
+            if protocol_boundary:
                 if calibration_enabled:
                     tail_q = (
                         np.nan if bool(terminated) else policy_q_value(model, np.asarray(obs))
@@ -2650,7 +2777,7 @@ def evaluate_scenario(
                         "distance_m": float(segment_distance_m),
                         "distinct_ego_collision_events": int(segment_collision_events),
                         "terminated": int(bool(terminated)),
-                        "truncated": int(bool(truncated)),
+                        "truncated": int(bool(truncated or (distance_cap_reached and not collision_terminal))),
                         "collision_terminal": int(collision_terminal),
                         "right_censored": 0,
                     }
@@ -2663,7 +2790,15 @@ def evaluate_scenario(
                 previous_acceleration = np.zeros(2, dtype=float)
                 segment_calibration_rewards = []
                 segment_calibration_anchors = []
-                if step + 1 < timestep_budget:
+                # In capped single-episode mode, neither a collision nor
+                # reaching the distance target is followed by an automatic
+                # reset.  This prevents post-collision exposure from being
+                # mistaken for a successful completion.
+                stop_boundary = bool(
+                    distance_cap_reached
+                    or (stop_after_collision and collision_terminal)
+                )
+                if step + 1 < timestep_budget and not stop_boundary:
                     if collision_terminal:
                         resets_after_collision += 1
                     elif truncated:
@@ -2672,6 +2807,8 @@ def evaluate_scenario(
                         resets_after_other_terminal += 1
                     obs, _ = env.reset()
                     reset_calls_total += 1
+                if stop_boundary:
+                    break
 
         if segment_steps > 0:
             if calibration_enabled:
@@ -2754,6 +2891,16 @@ def evaluate_scenario(
             "distance_per_collision_exposure_bound_m": _distance_per_collision_exposure_bound(
                 total_distance_m, distinct_ego_collision_events
             ),
+            "distance_cap_m": float(distance_cap_m),
+            "distance_cap_reached": int(
+                np.isfinite(distance_cap_m)
+                and total_distance_m >= float(distance_cap_m) - 1e-9
+            ),
+            "distance_completion_rate": int(
+                np.isfinite(distance_cap_m)
+                and total_distance_m >= float(distance_cap_m) - 1e-9
+                and distinct_ego_collision_events == 0
+            ),
             "collision_events_per_m": _ratio(distinct_ego_collision_events, total_distance_m),
             "ego_collisions_per_km": _collisions_per_km(
                 distinct_ego_collision_events, total_distance_m
@@ -2784,6 +2931,29 @@ def evaluate_scenario(
             "collision_survived_without_reset": int(collision_survived_without_reset),
             "active_collision_without_event": int(active_collision_without_event),
             "event_without_active_collision": int(event_without_active_collision),
+            "cbf_initial_min_h": float(initial_cbf_min_h),
+            "cbf_initial_min_psi": float(initial_cbf_min_psi),
+            "cbf_initial_safe_set": float(initial_cbf_safe_set),
+            "mean_cbf_hddot": _mean(cbf_hddot_values),
+            "min_cbf_hocbf_margin": _min(cbf_hocbf_margin_values),
+            "max_cbf_hocbf_violation_safe": (
+                float(np.max(_finite(cbf_hocbf_violation_values)))
+                if _finite(cbf_hocbf_violation_values).size
+                else np.nan
+            ),
+            "cbf_hocbf_violation_rate": _mean(
+                [
+                    float(value > 1e-3)
+                    for value in _finite(cbf_hocbf_violation_values).tolist()
+                ],
+                default=np.nan,
+            ),
+            "cbf_hocbf_condition_satisfied_rate": _mean(
+                cbf_hocbf_satisfied_values, default=np.nan
+            ),
+            "mean_cbf_constraint_violation_safe": _mean(
+                cbf_constraint_violation_values, default=np.nan
+            ),
             "h_min": _min(h_values),
             "h_violation_rate": _mean([float(value < 0.0) for value in _finite(h_values).tolist()], default=np.nan),
             "near_boundary_h_threshold": near_boundary_threshold,
@@ -2799,8 +2969,33 @@ def evaluate_scenario(
             "mean_neighbor_count": _mean(neighbor_counts),
             "mean_traffic_density_per_km": _mean(traffic_densities),
             "mean_abs_speed_error": _mean(speed_errors, default=0.0),
+            "mean_abs_nominal_speed_error": _mean(nominal_speed_errors, default=0.0),
             "mean_abs_target_speed_error": _mean(
                 target_speed_errors, default=np.nan
+            ),
+            # Backward-compatible executed-state diagnostics. These compare
+            # the post-transition speed with the target recomputed in the
+            # transition's info record.
+            "rmse_target_speed_error": _rmse(
+                target_speed_errors, default=np.nan
+            ),
+            "mean_abs_executed_target_speed_error": _mean(
+                target_speed_errors, default=np.nan
+            ),
+            "executed_target_speed_bias_mps": _mean(
+                executed_target_speed_signed_errors, default=np.nan
+            ),
+            # Policy-state diagnostics use the target and speed from the
+            # observation state on which the actor chose its action. CBF
+            # filtering cannot retroactively change this quantity.
+            "mean_abs_policy_target_speed_error": _mean(
+                policy_target_speed_errors, default=np.nan
+            ),
+            "policy_target_speed_bias_mps": _mean(
+                policy_target_speed_signed_errors, default=np.nan
+            ),
+            "rmse_policy_target_speed_error": _rmse(
+                policy_target_speed_signed_errors, default=np.nan
             ),
             "mean_abs_target_lateral_error_m": _mean(
                 target_lateral_errors, default=np.nan
@@ -3108,6 +3303,8 @@ def summarize_within_training_seed(
 
     rows: list[dict[str, Any]] = []
     mean_metrics = (
+        "distance_cap_reached",
+        "distance_completion_rate",
         "h_violation_rate",
         "mean_h_dot",
         "mean_ttc_s",
@@ -3117,6 +3314,8 @@ def summarize_within_training_seed(
         "mean_neighbor_count",
         "mean_traffic_density_per_km",
         "mean_abs_speed_error",
+        "mean_abs_nominal_speed_error",
+        "rmse_target_speed_error",
         "mean_jerk_norm",
         "IR",
         "mean_delta_a",
@@ -3134,6 +3333,20 @@ def summarize_within_training_seed(
         "executed_action_saturation_rate",
         "common_form1_return_per_timestep",
         "mean_abs_target_speed_error",
+        "mean_abs_policy_target_speed_error",
+        "rmse_policy_target_speed_error",
+        "policy_target_speed_bias_mps",
+        "mean_abs_executed_target_speed_error",
+        "executed_target_speed_bias_mps",
+        "cbf_initial_min_h",
+        "cbf_initial_min_psi",
+        "cbf_initial_safe_set",
+        "mean_cbf_hddot",
+        "min_cbf_hocbf_margin",
+        "max_cbf_hocbf_violation_safe",
+        "cbf_hocbf_violation_rate",
+        "cbf_hocbf_condition_satisfied_rate",
+        "mean_cbf_constraint_violation_safe",
         "mean_abs_target_lateral_error_m",
         "mean_formulation_cf",
         "mean_boundary_cost",
@@ -3312,6 +3525,8 @@ def paired_comparisons(seed_summary: pd.DataFrame) -> pd.DataFrame:
         "distance_per_collision_m",
         "distance_per_collision_exposure_bound_m",
         "distance_per_collision_right_censored",
+        "distance_cap_reached",
+        "distance_completion_rate",
         "total_distance_m",
         "episode_length_mean",
         "reset_calls_total",
@@ -3323,6 +3538,9 @@ def paired_comparisons(seed_summary: pd.DataFrame) -> pd.DataFrame:
         "mean_vehicle_spacing_m",
         "mean_traffic_density_per_km",
         "mean_abs_speed_error",
+        "mean_abs_target_speed_error",
+        "mean_abs_policy_target_speed_error",
+        "rmse_target_speed_error",
         "mean_jerk_norm",
         "IR",
         "mean_delta_a",
@@ -3418,6 +3636,7 @@ def factorial_effects(seed_summary: pd.DataFrame) -> pd.DataFrame:
         "h_violation_rate",
         "near_boundary_rate",
         "mean_abs_speed_error",
+        "rmse_target_speed_error",
         "mean_jerk_norm",
         "IR",
         "mean_delta_a",

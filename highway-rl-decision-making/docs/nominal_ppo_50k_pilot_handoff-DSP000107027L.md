@@ -24,6 +24,10 @@ fixed-timestep outputs; the legacy in-notebook PPO implementation is removed.
 - Collision protocol: `terminate_on_collision=True`, reset immediately, and
   continue until the fixed training/evaluation timestep budget is consumed.
 - Collisions are distinct events; collision-active timesteps are separate.
+- MTM target look-ahead uses `timegap=1.5 s`. The ego observation's `v_d`,
+  reward speed term, progress normalization, and primary evaluation metric all
+  use the same blocker-aware target speed; the nominal vehicle desired speed is
+  retained only as a diagnostic.
 
 ## Configurations
 
@@ -76,7 +80,7 @@ The primary outputs are `evaluation_scenarios.csv`,
 `ranking_final_evaluation.csv`.
 
 Ranking uses the final 50k behavior: distance per distinct collision,
-return/timestep, speed error, episode length, and deterministic actor action
+return/timestep, RMSE against the blocker-aware target speed, episode length, and deterministic actor action
 saturation. PPO value loss, value-target error/magnitude, KL, entropy, clip
 fraction, policy standard deviation, and raw-action clipping are reported as
 diagnostics. With one screening seed, across-seed variance is intentionally

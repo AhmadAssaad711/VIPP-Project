@@ -6,6 +6,7 @@ from pathlib import Path
 import gymnasium as gym
 import numpy as np
 import torch as th
+from stable_baselines3.common.buffers import RolloutBuffer
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
@@ -15,6 +16,9 @@ if str(SCRIPTS) not in sys.path:
 
 from cbf_projection import CBFContextLayout, append_cbf_context  # noqa: E402
 from projected_ppo_cbf import (  # noqa: E402
+    CBFSafetyRolloutBuffer,
+    DetachedCBFActorCriticPolicy,
+    DetachedCBFActorPPO,
     LatentActionPPO,
     ProjectedCBFActorCriticPolicy,
     ProjectedCBFPPO,
@@ -125,6 +129,55 @@ def test_deterministic_safe_mean_needs_no_second_projection():
     assert bool(stages["sample_feasible"].item())
 
 
+def test_safety_critic_head_and_rollout_targets_are_nonnegative():
+    observation_space, action_space = _spaces()
+    policy = ProjectedCBFActorCriticPolicy(
+        observation_space,
+        action_space,
+        lr_schedule=lambda _: 1e-3,
+        net_arch={"pi": [8], "vf": [8]},
+        ortho_init=False,
+    )
+    obs = th.tensor(_augmented_observation()[None], dtype=th.float32)
+    safety_value = policy.predict_safety_values(obs)
+    assert bool((safety_value >= 0.0).all())
+    optimizer_parameters = {
+        id(parameter)
+        for group in policy.optimizer.param_groups
+        for parameter in group["params"]
+    }
+    assert id(policy.safety_value_net.weight) in optimizer_parameters
+
+    buffer = CBFSafetyRolloutBuffer(
+        2,
+        observation_space,
+        action_space,
+        device="cpu",
+        gamma=0.99,
+        gae_lambda=0.95,
+        n_envs=1,
+        safety_gamma=0.9,
+        safety_cost_clip=1.0,
+    )
+    for cost in (0.25, 0.5):
+        buffer.add(
+            np.zeros((1, observation_space.shape[0]), dtype=np.float32),
+            np.zeros((1, action_space.shape[0]), dtype=np.float32),
+            np.zeros(1, dtype=np.float32),
+            np.zeros(1, dtype=bool),
+            th.zeros(1),
+            th.zeros(1),
+            safety_costs=np.asarray([cost], dtype=np.float32),
+            safety_fallbacks=np.zeros(1, dtype=np.float32),
+        )
+    buffer.compute_safety_returns(
+        last_safety_values=th.tensor([0.0]), dones=np.asarray([True])
+    )
+    np.testing.assert_allclose(
+        buffer.safety_returns.reshape(-1), [0.7, 0.5], atol=1e-6
+    )
+
+
 class _ProjectionRecordEnv(gym.Env):
     metadata = {}
 
@@ -157,6 +210,81 @@ class _ProjectionRecordEnv(gym.Env):
         self.raw_actions.append(raw)
         self.executed_actions.append(action.copy())
         return self.observation.copy(), 0.0, False, False, {}
+
+
+def test_detached_actor_target_has_exact_local_gradient_and_no_solver_graph():
+    env = _ProjectionRecordEnv()
+    model = DetachedCBFActorPPO(
+        DetachedCBFActorCriticPolicy,
+        env,
+        execution_mode="cbf",
+        lambda_actor=0.1,
+        learning_rate=0.0,
+        n_steps=2,
+        batch_size=2,
+        n_epochs=1,
+        seed=7,
+        device="cpu",
+        policy_kwargs={
+            "net_arch": {"pi": [8], "vf": [8]},
+            "ortho_init": False,
+            "log_std_init": -20.0,
+        },
+    )
+    with th.no_grad():
+        model.policy.action_net.weight.zero_()
+        model.policy.action_net.bias.copy_(th.tensor([2.0, 0.0]))
+
+    observations = th.tensor(_augmented_observation()[None], dtype=th.float32)
+    evaluation = model.policy.evaluate_actions_with_mean(
+        observations, th.zeros((1, 2), dtype=th.float32)
+    )
+    projection = model.project_actor_mean_detached(
+        observations, evaluation.mu_raw
+    )
+    loss, correction, infeasible_rate = model.detached_actor_loss(
+        evaluation.mu_raw, projection
+    )
+    gradient = th.autograd.grad(loss, model.policy.action_net.bias)[0]
+
+    assert not projection.action.requires_grad
+    th.testing.assert_close(projection.action[0], th.tensor([0.0, 0.0]))
+    # D = ||mu - stopgrad(P(mu))||^2, so dD/dmu_x = 2 * (2 - 0) = 4.
+    th.testing.assert_close(gradient, th.tensor([4.0, 0.0]), atol=1e-6, rtol=0.0)
+    th.testing.assert_close(correction, th.tensor(2.0), atol=1e-6, rtol=0.0)
+    th.testing.assert_close(infeasible_rate, th.tensor(0.0))
+
+
+def test_detached_ppo_save_load_keeps_plain_critic_and_feedback_coefficient(
+    tmp_path,
+):
+    env = _ProjectionRecordEnv()
+    model = DetachedCBFActorPPO(
+        DetachedCBFActorCriticPolicy,
+        env,
+        execution_mode="cbf",
+        lambda_actor=0.17,
+        learning_rate=0.0,
+        n_steps=2,
+        batch_size=2,
+        n_epochs=1,
+        seed=8,
+        device="cpu",
+        policy_kwargs={
+            "net_arch": {"pi": [8], "vf": [8]},
+            "ortho_init": False,
+            "log_std_init": -20.0,
+        },
+    )
+    assert not hasattr(model.policy, "safety_value_net")
+    path = tmp_path / "detached_cbf_actor_ppo"
+    model.save(path)
+
+    loaded = DetachedCBFActorPPO.load(path, device="cpu")
+    assert isinstance(loaded, DetachedCBFActorPPO)
+    assert isinstance(loaded.policy, DetachedCBFActorCriticPolicy)
+    assert not hasattr(loaded.policy, "safety_value_net")
+    assert loaded.lambda_actor == 0.17
 
 
 def test_rollout_buffer_stores_unclipped_z_while_env_receives_projection():
@@ -271,6 +399,10 @@ def test_projected_ppo_save_load_preserves_action_stages(tmp_path):
             "log_std_init": -1.0,
         },
     )
+    assert type(model.rollout_buffer) is RolloutBuffer
+    assert not model.use_safety_critic
+    assert not model.policy.use_safety_critic
+    assert not hasattr(model.policy, "safety_value_net")
     with th.no_grad():
         model.policy.action_net.weight.zero_()
         model.policy.action_net.bias.copy_(th.tensor([2.0, -0.4]))
@@ -280,6 +412,10 @@ def test_projected_ppo_save_load_preserves_action_stages(tmp_path):
     path = tmp_path / "projected_ppo"
     model.save(path)
     loaded = ProjectedCBFPPO.load(path, device="cpu")
+    assert type(loaded.rollout_buffer) is RolloutBuffer
+    assert not loaded.use_safety_critic
+    assert not loaded.policy.use_safety_critic
+    assert not hasattr(loaded.policy, "safety_value_net")
     actual = loaded.predict_action_stages(
         _augmented_observation(), deterministic=True
     )
@@ -310,6 +446,8 @@ def test_projected_ppo_collector_uses_projected_mean_logprob_and_hard_sample():
     with th.no_grad():
         model.policy.action_net.weight.zero_()
         model.policy.action_net.bias.copy_(th.tensor([2.0, 0.2]))
+    assert type(model.rollout_buffer) is RolloutBuffer
+    assert not hasattr(model.policy, "safety_value_net")
     model.learn(total_timesteps=16)
 
     stored_z = np.asarray(model.rollout_buffer.actions).reshape(-1, 2)
@@ -342,3 +480,74 @@ def test_projected_ppo_collector_uses_projected_mean_logprob_and_hard_sample():
     th.testing.assert_close(
         evaluation.log_prob, stored_log_prob, atol=1e-5, rtol=1e-5
     )
+
+
+class _RewardProjectionEnv(_ProjectionRecordEnv):
+    def step(self, action):
+        observation, _, terminated, truncated, info = super().step(action)
+        return observation, 1.0, terminated, truncated, info
+
+
+def test_plain_projected_ppo_critic_learns_from_reward_returns():
+    env = _RewardProjectionEnv()
+    model = ProjectedCBFPPO(
+        ProjectedCBFActorCriticPolicy,
+        env,
+        execution_mode="cbf",
+        lambda_mean=0.0,
+        lambda_sample=0.0,
+        lambda_critic=0.0,
+        learning_rate=1e-2,
+        n_steps=4,
+        batch_size=4,
+        n_epochs=1,
+        gamma=0.0,
+        seed=29,
+        device="cpu",
+        policy_kwargs={
+            "net_arch": {"pi": [8], "vf": [8]},
+            "ortho_init": False,
+            "log_std_init": -1.0,
+        },
+    )
+    before = [
+        parameter.detach().clone()
+        for parameter in model.policy.value_net.parameters()
+    ]
+    model.learn(total_timesteps=4)
+
+    assert type(model.rollout_buffer) is RolloutBuffer
+    assert not hasattr(model.policy, "safety_value_net")
+    np.testing.assert_allclose(model.rollout_buffer.rewards, 1.0, atol=1e-6)
+    np.testing.assert_allclose(model.rollout_buffer.returns, 1.0, atol=1e-6)
+    after = list(model.policy.value_net.parameters())
+    assert any(not th.equal(old, new.detach()) for old, new in zip(before, after))
+    assert "safety_critic_loss" not in model.cbf_training_diagnostics[-1]
+
+
+def test_explicit_legacy_safety_critic_still_selects_its_custom_buffer():
+    env = _ProjectionRecordEnv()
+    model = ProjectedCBFPPO(
+        ProjectedCBFActorCriticPolicy,
+        env,
+        execution_mode="cbf",
+        lambda_mean=0.0,
+        lambda_sample=0.0,
+        lambda_critic=0.1,
+        learning_rate=0.0,
+        n_steps=2,
+        batch_size=2,
+        n_epochs=1,
+        seed=31,
+        device="cpu",
+        policy_kwargs={
+            "net_arch": {"pi": [8], "vf": [8]},
+            "ortho_init": False,
+            "log_std_init": -1.0,
+        },
+    )
+    assert isinstance(model.rollout_buffer, CBFSafetyRolloutBuffer)
+    assert model.policy.use_safety_critic
+    assert hasattr(model.policy, "safety_value_net")
+    model.learn(total_timesteps=2)
+    assert "safety_critic_loss" in model.cbf_training_diagnostics[-1]

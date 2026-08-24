@@ -61,6 +61,8 @@ COMMON_METRICS = (
     "distance_per_collision_m",
     "distance_per_collision_exposure_bound_m",
     "mean_abs_speed_error",
+    "mean_abs_target_speed_error",
+    "rmse_target_speed_error",
     "episode_length_mean",
     "nominal_action_saturation_rate",
 )
@@ -130,8 +132,8 @@ def validate_common_formulation(
         raise ValueError("The nominal comparison disables the safety potential")
     if float(reward_config.get("w_safe", 0.0)) != 0.0:
         raise ValueError("The nominal comparison requires w_safe=0")
-    if float(reward_config.get("progress_reward_weight", 0.0)) != 0.0:
-        raise ValueError("The nominal comparison freezes progress shaping at zero")
+    if float(reward_config.get("progress_reward_weight", 0.0)) != 0.05:
+        raise ValueError("The nominal comparison expects progress shaping weight 0.05")
 
 
 def _write_json(path: Path, value: Any) -> None:
@@ -290,6 +292,12 @@ def aggregate_checkpoint(frame: pd.DataFrame) -> dict[str, float | int]:
             (_numeric(frame, "distinct_ego_collision_events").fillna(0.0) == 0.0).sum()
         ),
         "mean_abs_speed_error": _weighted_mean(frame, "mean_abs_speed_error"),
+        "mean_abs_target_speed_error": _weighted_mean(
+            frame, "mean_abs_target_speed_error"
+        ),
+        "rmse_target_speed_error": _weighted_mean(
+            frame, "rmse_target_speed_error"
+        ),
         "episode_length_mean": (
             episode_length_sum / segments if segments > 0.0 else _weighted_mean(frame, "episode_length_mean")
         ),
@@ -534,6 +542,8 @@ def main() -> int:
         "ego_collisions_per_km",
         "distance_per_collision_m",
         "mean_abs_speed_error",
+        "mean_abs_target_speed_error",
+        "rmse_target_speed_error",
         "episode_length_mean",
         "nominal_action_saturation_rate",
     ]

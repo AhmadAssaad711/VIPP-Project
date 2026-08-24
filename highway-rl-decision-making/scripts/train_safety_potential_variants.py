@@ -237,7 +237,7 @@ def make_training_env(
         _single_env,
         seed=seed,
         n_envs=n_envs,
-        use_subproc=False,
+        use_subproc=True,
         start_method=namespace["DDPG_SUBPROC_START_METHOD"],
     )
 
@@ -1287,7 +1287,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--train-eval-episodes", type=int, default=2)
     parser.add_argument("--final-eval-episodes", type=int, default=20)
     parser.add_argument("--seed", type=int, default=307_000)
-    parser.add_argument("--n-envs", type=int, default=1)
+    parser.add_argument("--n-envs", type=int, default=20)
     parser.add_argument("--k0", type=float, default=5.29)
     parser.add_argument("--k1", type=float, default=3.68)
     parser.add_argument("--eps-side", type=float, default=0.10)

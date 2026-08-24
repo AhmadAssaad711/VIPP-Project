@@ -18,6 +18,12 @@ policies are contextual controls, not factorial cells.
 All four factorial cells use the same guided learner and replay-buffer
 plumbing. In loss-off cells, the effective actor-loss coefficient is zero.
 
+The canonical fixed-scene and common-state comparison definitions are recorded
+in [`diagnostic_scenarios.md`](diagnostic_scenarios.md). The six-scene core is
+the recommended qualitative suite for comparing learned policies; the
+normal, near-boundary, intervention, dense-traffic, and overtaking strata are
+the recommended common state bank for same-state actor and critic analysis.
+
 ## 1. Train and evaluate raw and shielded deployment
 
 From the repository root, run the pre-registered study with an explicit output

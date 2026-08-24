@@ -120,6 +120,16 @@ def apply_reward_overrides(
         if not np.isfinite(float(progress_reward_weight)):
             raise ValueError("--progress-reward-weight must be finite")
         config["progress_reward_weight"] = float(progress_reward_weight)
+    progress_distance_scale_m = getattr(args, "progress_distance_scale_m", None)
+    if progress_distance_scale_m is not None:
+        if (
+            not np.isfinite(float(progress_distance_scale_m))
+            or float(progress_distance_scale_m) <= 0.0
+        ):
+            raise ValueError(
+                "--progress-distance-scale-m must be finite and positive"
+            )
+        config["progress_distance_scale_m"] = float(progress_distance_scale_m)
     jerk_penalty_weight = getattr(args, "jerk_penalty_weight", None)
     if jerk_penalty_weight is not None:
         if not np.isfinite(float(jerk_penalty_weight)) or float(jerk_penalty_weight) < 0.0:
@@ -1099,6 +1109,17 @@ def ppo_config_payload(
             if bool(getattr(args, "observation_at1", False))
             else "target_y_only"
         ),
+        "observation_target_speed_definition": (
+            "ego_row_v_d_is_nominal_ego_desired_speed;"
+            "neighbor_rows_keep_nominal_vehicle_desired_speed"
+        ),
+        "ego_desired_speed_mps": float(env_config.get("ego_desired_speed", reward_config.get("ego_desired_speed", np.nan))),
+        "primary_speed_tracking_metric": {
+            "name": "mean_abs_target_speed_error",
+            "formula": "mean(abs(ego_speed - nominal_ego_desired_speed))",
+            "target_definition": "the ego vehicle's nominal desired speed used by the reward",
+            "rmse_retained_as_diagnostic": "rmse_target_speed_error",
+        },
         "training_seed": int(training_seed),
         "target_timesteps": int(target_timesteps),
         "parameters": copy.deepcopy(config_values),
@@ -1127,6 +1148,14 @@ def ppo_config_payload(
             "mode": "raw",
             "scenario_seeds": [int(seed) for seed in args.eval_seeds],
             "timestep_budget": int(args.eval_timesteps),
+            "distance_cap_m": float(getattr(args, "evaluation_distance_cap_m", 1000.0)),
+            "stop_after_collision": not bool(
+                getattr(args, "evaluation_continue_after_collision", False)
+            ),
+            "completion_definition": (
+                "distance_completion_rate=1 only when one episode reaches the distance cap "
+                "with zero ego collision events"
+            ),
             "cadence": (
                 "every_checkpoint"
                 if checkpoint_evaluation_enabled(args)
@@ -1140,7 +1169,9 @@ def ppo_config_payload(
             "checkpoint_phase": "post_update_boundary",
             "deterministic": True,
             "terminate_on_collision": True,
-            "reset_immediately_after_collision": True,
+            "reset_immediately_after_collision": bool(
+                getattr(args, "evaluation_continue_after_collision", False)
+            ),
             "distinct_collision_events": True,
             "primary_safety_metric": {
                 "name": "distance_per_collision_m",
@@ -1770,10 +1801,19 @@ def across_seed_final_three(seed_averages: pd.DataFrame) -> pd.DataFrame:
 
 def rank_final_three(across_seed: pd.DataFrame) -> pd.DataFrame:
     ranked = across_seed.copy()
+    speed_metric = (
+        "mean_abs_target_speed_error_seed_mean"
+        if "mean_abs_target_speed_error_seed_mean" in ranked
+        else (
+            "mean_abs_policy_target_speed_error_seed_mean"
+            if "mean_abs_policy_target_speed_error_seed_mean" in ranked
+            else "mean_abs_speed_error_seed_mean"
+        )
+    )
     criteria = {
         "distance_per_collision_exposure_bound_m_seed_mean": False,
         "return_per_timestep_seed_mean": False,
-        "mean_abs_speed_error_seed_mean": True,
+        speed_metric: True,
         "episode_length_mean_seed_mean": False,
         "nominal_action_saturation_rate_seed_mean": True,
     }
@@ -1876,6 +1916,23 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--eval-seeds", type=int, nargs="+", default=None)
     parser.add_argument("--eval-timesteps", type=int, default=DEFAULT_EVAL_TIMESTEPS)
     parser.add_argument(
+        "--evaluation-distance-cap-m",
+        type=float,
+        default=1000.0,
+        help="per-scenario distance cap for the completion KPI (metres)",
+    )
+    parser.add_argument(
+        "--evaluation-continue-after-collision",
+        action="store_true",
+        help="retain the legacy fixed-budget reset-after-collision evaluation protocol",
+    )
+    parser.add_argument(
+        "--ego-desired-speed",
+        type=float,
+        default=16.0,
+        help="fixed nominal desired speed for the controlled ego vehicle (m/s)",
+    )
+    parser.add_argument(
         "--evaluate-checkpoints",
         action="store_true",
         help=(
@@ -1900,18 +1957,35 @@ def parse_args() -> argparse.Namespace:
         default=DEFAULT_GLOBAL_ROLLOUT_SIZE,
         help="global transitions collected per PPO update (must divide checkpoint interval)",
     )
-    parser.add_argument(
+    observation_group = parser.add_mutually_exclusive_group()
+    observation_group.add_argument(
         "--observation-at1",
+        dest="observation_at1",
         action="store_true",
-        help="append the previous normalized executed action a[t-1] to the y-target observation",
+        help="append the previous normalized executed action a[t-1] (default)",
+    )
+    observation_group.add_argument(
+        "--no-observation-at1",
+        dest="observation_at1",
+        action="store_false",
+        help="use the legacy 30D target-y observation without a[t-1]",
     )
     parser.add_argument(
         "--progress-reward-weight",
         type=float,
         default=None,
         help=(
-            "override the forward-progress reward weight; normalized progress is "
-            "clipped by the task's fixed progress_clip setting"
+            "override the distance-based forward-progress reward weight; "
+            "fixed-distance progress is clipped by progress_clip"
+        ),
+    )
+    parser.add_argument(
+        "--progress-distance-scale-m",
+        type=float,
+        default=None,
+        help=(
+            "metres represented by one unit of normalized progress; this fixed "
+            "distance scale is independent of target speed and elapsed time"
         ),
     )
     parser.add_argument(
@@ -1939,7 +2013,12 @@ def parse_args() -> argparse.Namespace:
         "--correction-epsilon", type=float, default=0.03, help=argparse.SUPPRESS
     )
     add_env_config_args(parser)
-    parser.set_defaults(traffic_model="mtm", env_config_json=None, env_config_file=None)
+    parser.set_defaults(
+        traffic_model="mtm",
+        env_config_json=None,
+        env_config_file=None,
+        observation_at1=True,
+    )
     return parser.parse_args()
 
 
@@ -2008,9 +2087,28 @@ def _main_resolved(
     reward_config = apply_reward_overrides(
         pipeline.make_base_reward_config(namespace), args
     )
-    # Both pilots in this study expose the desired lateral target in the
-    # existing second observation slot.  The optional at-1 variant appends the
-    # previous normalized command for jerk-aware policy conditioning.
+    ego_desired_speed = float(args.ego_desired_speed)
+    if not np.isfinite(ego_desired_speed) or ego_desired_speed <= 0.0:
+        raise ValueError("--ego-desired-speed must be finite and positive")
+    evaluation_distance_cap_m = float(
+        getattr(args, "evaluation_distance_cap_m", 1000.0)
+    )
+    if not np.isfinite(evaluation_distance_cap_m) or evaluation_distance_cap_m <= 0.0:
+        raise ValueError("--evaluation-distance-cap-m must be finite and positive")
+    # The strict task protocol is the default: collision terminates the
+    # scenario, and only a collision-free traversal of the distance cap is a
+    # completion.  Keep the opt-in legacy switch for historical comparisons.
+    args.evaluation_distance_cap_m = evaluation_distance_cap_m
+    args.distance_cap_m = evaluation_distance_cap_m
+    args.stop_after_collision = not bool(
+        getattr(args, "evaluation_continue_after_collision", False)
+    )
+    # Keep reset dynamics and the reward/observation target synchronized.
+    env_config["ego_desired_speed"] = ego_desired_speed
+    reward_config["ego_desired_speed"] = ego_desired_speed
+    # The canonical MTM PPO pilot exposes the desired lateral target and the
+    # previous normalized command for jerk-aware policy conditioning.  The
+    # explicit --no-observation-at1 switch preserves the legacy 30D contract.
     reward_config["expose_target_y"] = True
     if bool(args.observation_at1):
         install_previous_action_observation(namespace)
@@ -2054,7 +2152,8 @@ def _main_resolved(
         ),
         "eval_seeds": args.eval_seeds,
         "eval_timesteps": int(args.eval_timesteps),
-        "environment_and_cbf_tuning_changed": False,
+        "environment_and_cbf_tuning_changed": True,
+        "ego_desired_speed_mps": ego_desired_speed,
         "filtered_training": False,
         "n_envs": int(args.n_envs),
         "vectorized_backend": (
@@ -2076,6 +2175,12 @@ def _main_resolved(
             "formula": "total_distance_m / distinct_ego_collision_events",
             "zero_collision_value": "infinity (right-censored)",
         },
+        "primary_speed_tracking_metric": {
+            "name": "mean_abs_target_speed_error",
+            "formula": "mean(abs(ego_speed - nominal_ego_desired_speed))",
+            "target_definition": "the ego vehicle's nominal desired speed used by the reward",
+            "rmse_retained_as_diagnostic": "rmse_target_speed_error",
+        },
         "configurations": {
             name: effective_ppo_config(name, args) for name in selected_configs
         },
@@ -2085,6 +2190,10 @@ def _main_resolved(
             "target_y_plus_previous_action"
             if bool(args.observation_at1)
             else "target_y_only"
+        ),
+        "observation_target_speed_definition": (
+            "ego_row_v_d_is_nominal_ego_desired_speed;"
+            "neighbor_rows_keep_nominal_vehicle_desired_speed"
         ),
         "observation_dimensions": 32 if bool(args.observation_at1) else 30,
     }
@@ -2149,6 +2258,17 @@ def _main_resolved(
         "latest_train_value_loss_seed_mean",
         "latest_train_approx_kl_seed_mean",
     ]
+    policy_abs_column = "mean_abs_target_speed_error_seed_mean"
+    if policy_abs_column in ranking.columns:
+        report_columns.insert(
+            report_columns.index("mean_abs_speed_error_seed_mean") + 1,
+            policy_abs_column,
+        )
+    elif "mean_abs_policy_target_speed_error_seed_mean" in ranking.columns:
+        report_columns.insert(
+            report_columns.index("mean_abs_speed_error_seed_mean") + 1,
+            "mean_abs_policy_target_speed_error_seed_mean",
+        )
     print(ranking[report_columns].to_string(index=False), flush=True)
     print(f"[ppo-pilot] complete: {output_dir}", flush=True)
     return 0

@@ -348,6 +348,14 @@ def part1_ten_kpi_table(episodes: pd.DataFrame, *, policy_dt_s: float) -> pd.Dat
         working["episode_length_steps"] = (
             pd.to_numeric(working["episode_time_s"], errors="coerce") / max(float(policy_dt_s), 1e-9)
         )
+    # Legacy DDPG artifacts predate the dynamic-target RMSE column. Preserve
+    # their readability with an explicitly compatible mean-absolute fallback;
+    # current MTM outputs always provide the exact RMSE.
+    if "rmse_target_speed_error" not in working:
+        if "mean_abs_speed_deviation" in working:
+            working["rmse_target_speed_error"] = working["mean_abs_speed_deviation"]
+        elif "mean_abs_speed_error" in working:
+            working["rmse_target_speed_error"] = working["mean_abs_speed_error"]
 
     missing = [column for _, column in TEN_KPI_SPECS if column not in working]
     if missing:

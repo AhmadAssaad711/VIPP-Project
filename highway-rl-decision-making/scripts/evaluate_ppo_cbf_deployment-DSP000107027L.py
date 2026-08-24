@@ -74,6 +74,9 @@ def _summarize(model_id: str, mode: str, frame: pd.DataFrame) -> dict[str, Any]:
     }
     for metric in (
         "mean_abs_speed_error",
+        "mean_abs_nominal_speed_error",
+        "mean_abs_target_speed_error",
+        "rmse_target_speed_error",
         "mean_jerk_norm",
         "IR",
         "mean_delta_a",
@@ -312,6 +315,12 @@ def main() -> int:
                 "source_models": source_metadata,
                 "deployment_mode": "cbf",
                 "correction_reward": 0.0,
+                "primary_speed_tracking_metric": {
+                    "name": "mean_abs_target_speed_error",
+                    "formula": "mean(abs(ego_speed - nominal_ego_desired_speed))",
+                    "target_definition": "the ego vehicle's nominal desired speed used by the reward",
+                    "rmse_retained_as_diagnostic": "rmse_target_speed_error",
+                },
                 "protocol": "same final snapshots and fixed evaluation reset seeds as the raw 50k pilots",
             },
         )

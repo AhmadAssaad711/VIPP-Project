@@ -52,7 +52,7 @@ KPI_ORDER = [
     ("Ego collisions / km", "ego_collisions_per_km", "Collisions / km"),
     ("Minimum h", "h_min", "Minimum h"),
     ("QP failure rate", "qp_failure_rate", "QP failure rate"),
-    ("Abs speed error (m/s)", "mean_abs_speed_deviation", "Speed error (m/s)"),
+    ("RMSE target-speed error (m/s)", "rmse_target_speed_error", "Target-speed RMSE (m/s)"),
     ("Mean lateral tracking error (m)", "mean_lat_y_error_m", "Lateral error (m)"),
     ("Intervention rate", "event_intervention_rate", "Intervention rate"),
     ("Correction norm", "mean_correction_norm", "Correction norm"),
