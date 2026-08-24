@@ -100,10 +100,8 @@ DEFAULT_TASK_DISTANCE_M = 1_000.0
 DEFAULT_TASK_MAX_POLICY_STEPS = 3_000
 POST_TRAIN_EVAL_SUMMARY_BLOCKS = 10
 DEFAULT_PPO_CONFIG = "Q0_current_aligned"
-# The lane-free simulator and CBF projection are CPU-bound.  Eight workers use
-# this workstation's cores without competing with the learner or oversubscribing
-# a GPU when the policy device is changed from CPU.
-DEFAULT_NUM_ENVS = max(1, min(8, int(os.cpu_count() or 1)))
+# The notebook and direct CLI runs use a fixed 20-worker rollout pool.
+DEFAULT_NUM_ENVS = 20
 
 VARIANT_SPECS: dict[str, dict[str, Any]] = {
     "ppo_nominal": {
