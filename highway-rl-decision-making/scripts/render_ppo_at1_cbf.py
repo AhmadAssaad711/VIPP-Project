@@ -152,7 +152,7 @@ def main() -> int:
         int(
             round(
                 float(env_config.get("simulation_frequency", 20))
-                / float(env_config.get("policy_frequency", 10))
+                / float(env_config.get("policy_frequency", 20))
             )
         ),
     )

@@ -236,7 +236,7 @@ def main() -> int:
     started = time.perf_counter()
     policy_dt = float(env_config.get("dt", 0.05)) * max(
         1,
-        int(round(float(env_config.get("simulation_frequency", 20)) / float(env_config.get("policy_frequency", 10)))),
+        int(round(float(env_config.get("simulation_frequency", 20)) / float(env_config.get("policy_frequency", 20)))),
     )
     guard_enabled = bool(env_config.get("traffic_safety", {}).get("dynamics_guard", False))
 

@@ -97,7 +97,7 @@ DEFAULT_EVAL_TIMESTEPS = 800
 DEFAULT_POST_TRAIN_EVAL_EPISODES = 200
 DEFAULT_POST_TRAIN_EVAL_SEED_START = 1_100_000
 DEFAULT_POST_TRAIN_EVAL_WORKERS = 20
-DEFAULT_TASK_DISTANCE_M = 1_000.0
+DEFAULT_TASK_DISTANCE_M = 600.0
 DEFAULT_TASK_MAX_POLICY_STEPS = 3_000
 POST_TRAIN_EVAL_SUMMARY_BLOCKS = 10
 DEFAULT_PPO_CONFIG = "Q0_current_aligned"
@@ -317,7 +317,7 @@ def _evaluation_horizon_steps(env_config: dict[str, Any]) -> int:
         env_config.get("episode_steps", env_config.get("duration", 2000))
     )
     simulation_frequency = float(env_config.get("simulation_frequency", 20.0))
-    policy_frequency = float(env_config.get("policy_frequency", 10.0))
+    policy_frequency = float(env_config.get("policy_frequency", 20.0))
     frames_per_policy_step = max(
         1, int(round(simulation_frequency / max(policy_frequency, 1e-9)))
     )
@@ -422,7 +422,7 @@ def _ensure_distance_completion_metric(
 
 
 def _task_distance_from_args(args: argparse.Namespace, env_config: dict[str, Any]) -> float:
-    """Resolve a positive explicit task distance, defaulting to 1 km."""
+    """Resolve a positive explicit task distance, defaulting to 600 m."""
 
     return _distance_completion_target_m(
         env_config,
@@ -794,6 +794,15 @@ def training_signature(
             "cbf_substep_filtering": bool(
                 env_config.get("cbf_substep_filtering", False)
                 and VARIANT_SPECS[variant]["execution_mode"] == "cbf"
+            ),
+            "policy_frequency_hz": float(
+                env_config.get("policy_frequency", np.nan)
+            ),
+            "vehicle_policy_frequency_hz": float(
+                env_config.get(
+                    "vehicle_policy_frequency",
+                    env_config.get("simulation_frequency", np.nan),
+                )
             ),
             "physics_substeps_per_policy_action": max(
                 1,
@@ -1978,7 +1987,7 @@ def evaluate_scenario(
                 episode_lengths.append(float(segment_steps))
                 # A scenario is one strict distance task, not a concatenation
                 # of reset episodes.  Continuing here would make a reported
-                # "scenario distance" exceed the 1 km completion cap.
+                # "scenario distance" exceed the 600 m completion cap.
                 segment_steps = 0
                 break
 
@@ -3677,7 +3686,7 @@ def parse_args() -> argparse.Namespace:
         default=DEFAULT_TASK_DISTANCE_M,
         help=(
             "Strict collision-free completion distance for every evaluation "
-            "episode; default=1,000 m."
+            "episode; default=600 m."
         ),
     )
     parser.add_argument(
@@ -4004,6 +4013,12 @@ def main() -> int:
             ),
             "physics_hz": float(env_config.get("simulation_frequency", np.nan)),
             "policy_hz": float(env_config.get("policy_frequency", np.nan)),
+            "vehicle_policy_hz": float(
+                env_config.get(
+                    "vehicle_policy_frequency",
+                    env_config.get("simulation_frequency", np.nan),
+                )
+            ),
             "cbf_substeps_per_policy_action": max(
                 1,
                 int(

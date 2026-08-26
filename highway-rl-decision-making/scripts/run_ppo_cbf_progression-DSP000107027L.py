@@ -201,7 +201,7 @@ def _evaluation_horizon_steps(env_config: dict[str, Any]) -> int:
         env_config.get("episode_steps", env_config.get("duration", 2000))
     )
     simulation_frequency = float(env_config.get("simulation_frequency", 20.0))
-    policy_frequency = float(env_config.get("policy_frequency", 10.0))
+    policy_frequency = float(env_config.get("policy_frequency", 20.0))
     frames_per_policy_step = max(
         1, int(round(simulation_frequency / max(policy_frequency, 1e-9)))
     )

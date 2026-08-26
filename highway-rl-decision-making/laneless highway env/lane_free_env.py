@@ -228,6 +228,10 @@ class LaneFreeTrafficEnv(AbstractEnv):
                 "dt": 0.25,
                 "simulation_frequency": 4,
                 "policy_frequency": 4,
+                # ``None`` means that the surrounding-vehicle controller is
+                # evaluated at every available physics tick. Canonical
+                # experiments set this explicitly to 100 Hz.
+                "vehicle_policy_frequency": None,
                 "vehicles_count": 35,
                 "sensing_range": 80.0,
                 "episode_steps": 800,
@@ -383,6 +387,35 @@ class LaneFreeTrafficEnv(AbstractEnv):
     def configure(self, config: dict | None) -> None:
         if config:
             _deep_update(self.config, config)
+        simulation_frequency = float(self.config.get("simulation_frequency", 1.0))
+        policy_frequency = float(self.config.get("policy_frequency", simulation_frequency))
+        vehicle_policy_frequency_value = self.config.get(
+            "vehicle_policy_frequency", simulation_frequency
+        )
+        if vehicle_policy_frequency_value is None:
+            vehicle_policy_frequency = simulation_frequency
+        else:
+            vehicle_policy_frequency = float(vehicle_policy_frequency_value)
+        frequencies = {
+            "simulation_frequency": simulation_frequency,
+            "policy_frequency": policy_frequency,
+            "vehicle_policy_frequency": vehicle_policy_frequency,
+        }
+        if any(not np.isfinite(value) or value <= 0.0 for value in frequencies.values()):
+            raise ValueError(
+                "simulation, policy, and vehicle-policy frequencies must be finite and positive"
+            )
+        if policy_frequency > simulation_frequency + 1e-9:
+            raise ValueError(
+                "policy_frequency cannot exceed simulation_frequency; "
+                "the ego action cannot update faster than the physics tick"
+            )
+        if vehicle_policy_frequency > simulation_frequency + 1e-9:
+            raise ValueError(
+                "vehicle_policy_frequency cannot exceed simulation_frequency; "
+                "vehicle controllers cannot update faster than the physics tick"
+            )
+        self.config["vehicle_policy_frequency"] = vehicle_policy_frequency
         vehicle_dimensions = np.asarray(
             self.config.get("vehicle_dimensions", self.VEHICLE_DIMENSIONS),
             dtype=float,
@@ -522,6 +555,7 @@ class LaneFreeTrafficEnv(AbstractEnv):
         self._mtm_aggressiveness_stats: dict[str, float] = {}
         self._last_spawn_diagnostics: dict[str, float] = {}
         self._last_traffic_safety_diagnostics: dict[str, float] = {}
+        self._last_vehicle_policy_updates = 0
         # A wrapper owns this callback for one Gym step and clears it in a
         # finally block.  Reset clears stale state in case a caller aborted a
         # prior step midway through an exception.
@@ -956,8 +990,16 @@ class LaneFreeTrafficEnv(AbstractEnv):
         action_array = np.clip(action_array, -1.0, 1.0)
         self._last_action = action_array
 
-        frames = max(1, int(round(float(self.config["simulation_frequency"]) / float(self.config["policy_frequency"]))))
-        dt = float(self.config.get("dt", 1.0 / float(self.config["simulation_frequency"])))
+        simulation_frequency = float(self.config["simulation_frequency"])
+        policy_frequency = float(self.config["policy_frequency"])
+        vehicle_policy_frequency = float(
+            self.config.get("vehicle_policy_frequency", simulation_frequency)
+        )
+        frames = max(1, int(round(simulation_frequency / policy_frequency)))
+        vehicle_policy_frames = max(
+            1, int(round(simulation_frequency / vehicle_policy_frequency))
+        )
+        dt = float(self.config.get("dt", 1.0 / simulation_frequency))
         substep_filter = getattr(self, "_ego_substep_action_filter", None)
         substep_enabled = bool(
             self.config.get("cbf_substep_filtering", False)
@@ -966,8 +1008,21 @@ class LaneFreeTrafficEnv(AbstractEnv):
         substep_records: list[dict[str, Any]] = []
         traffic_safety_records: list[dict[str, float]] = []
         collision_records: list[tuple[int, int, int, bool]] = []
+        vehicle_accelerations: np.ndarray | None = None
+        vehicle_policy_updates = 0
         for frame_index in range(frames):
-            accelerations = self._compute_accelerations()
+            if (
+                vehicle_accelerations is None
+                or frame_index % vehicle_policy_frames == 0
+            ):
+                vehicle_accelerations = np.asarray(
+                    self._compute_accelerations(), dtype=float
+                )
+                vehicle_policy_updates += 1
+            # Keep the vehicle-controller output separate from ego action
+            # injection and the per-physics-tick safety guard. At the
+            # canonical 100 Hz/100 Hz setting this refreshes every frame.
+            accelerations = vehicle_accelerations.copy()
             if bool(self.config["ego_controlled"]):
                 ego_ax = self._map_action(action_array[0], "longitudinal")
                 ego_boundary_force = (
@@ -1030,6 +1085,8 @@ class LaneFreeTrafficEnv(AbstractEnv):
             )
             self.steps += 1
             self.time += dt
+
+        self._last_vehicle_policy_updates = int(vehicle_policy_updates)
 
         if collision_records:
             # A policy step may contain multiple physics frames. Preserve
@@ -2275,6 +2332,15 @@ class LaneFreeTrafficEnv(AbstractEnv):
         elapsed_hours = max(self.time / 3600.0, 1e-9)
         info = {
             "traffic_model": str(self.config.get("traffic_model", "force")),
+            "simulation_frequency_hz": float(self.config.get("simulation_frequency", np.nan)),
+            "policy_frequency_hz": float(self.config.get("policy_frequency", np.nan)),
+            "vehicle_policy_frequency_hz": float(
+                self.config.get(
+                    "vehicle_policy_frequency",
+                    self.config.get("simulation_frequency", np.nan),
+                )
+            ),
+            "vehicle_policy_updates": int(self._last_vehicle_policy_updates),
             "speed": float(self.vehicle.vx),
             "mean_speed": self.mean_speed,
             "collisions": int(self._last_collision_count),

@@ -112,6 +112,9 @@ def main() -> int:
     env_config["real_time_rendering"] = False
     env_config["offscreen_rendering"] = True
     configured_policy_frequency = float(env_config["policy_frequency"])
+    configured_vehicle_policy_frequency = float(
+        env_config.get("vehicle_policy_frequency", env_config["simulation_frequency"])
+    )
     frames_per_video_frame = max(
         1,
         int(
@@ -127,8 +130,8 @@ def main() -> int:
         required_physics_steps,
     )
     # Step at the physics frequency so collision events that begin during the
-    # first half of a 10 Hz policy interval are not hidden by the second half.
-    # Two 20 Hz physics steps are still combined into each 10 Hz video frame.
+    # first part of a 20 Hz policy interval are not hidden by the remainder.
+    # Five 100 Hz physics steps are combined into each 20 Hz video frame.
     env_config["policy_frequency"] = float(env_config["simulation_frequency"])
 
     output_dir = args.output_dir.resolve()
@@ -243,6 +246,7 @@ def main() -> int:
         "road_width_m": float(env_config["road_width"]),
         "physics_dt_s": physics_dt,
         "configured_policy_frequency_hz": configured_policy_frequency,
+        "configured_vehicle_policy_frequency_hz": configured_vehicle_policy_frequency,
         "video_fps": int(args.fps),
         "policy_steps_rendered": rendered_steps,
         "physics_steps_rendered": physics_steps,

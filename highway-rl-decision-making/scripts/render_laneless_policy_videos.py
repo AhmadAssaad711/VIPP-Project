@@ -244,7 +244,7 @@ def run_clip(
     repeat_frames: int,
 ) -> dict[str, Any]:
     policy = policy_for_variant(variant)
-    policy_frequency = float(namespace["ENV_CONFIG"].get("policy_frequency", 4))
+    policy_frequency = float(namespace["ENV_CONFIG"].get("policy_frequency", 20))
     steps = max(1, int(round(float(sim_seconds) * policy_frequency)))
     env_config = video_env_config(namespace["ENV_CONFIG"], steps=steps, scenario=scenario)
     env = make_policy_env(namespace, policy, env_config, seed)

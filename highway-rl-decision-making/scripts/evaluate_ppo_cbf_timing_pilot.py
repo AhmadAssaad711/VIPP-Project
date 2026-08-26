@@ -1,10 +1,9 @@
 """Run a small timing ablation for the external PPO CBF.
 
-The pilot keeps the completed 1M nominal policy, source environment, paired
-episode seeds, and deployment gains fixed.  It evaluates the CBF once per
-policy action (10 Hz) while the lane-free dynamics still integrate at 100 Hz.
-This is the sample-and-hold protocol expected when the actuator command rate
-and the policy rate are both 10 Hz.
+The pilot keeps the completed nominal policy, source environment, paired
+episode seeds, and deployment gains fixed. It evaluates the CBF once per
+20 Hz policy action while the lane-free dynamics still integrate at 100 Hz.
+The surrounding-vehicle controller is refreshed at every 100 Hz physics tick.
 """
 
 from __future__ import annotations
@@ -36,13 +35,13 @@ DEFAULT_WORKERS = 20
 DEFAULT_CORRECTION_EPSILON = 0.03
 DEFAULT_EPS_SIDE = 0.10
 DEFAULT_TTC_CAP = 30.0
-DEFAULT_TASK_DISTANCE_M = 1_000.0
-DEFAULT_TASK_MAX_POLICY_STEPS = 3_000
+DEFAULT_TASK_DISTANCE_M = 600.0
+DEFAULT_TASK_MAX_POLICY_STEPS = 6_000
 DEFAULT_PHYSICS_HZ = 100
-DEFAULT_POLICY_HZ = 10
+DEFAULT_POLICY_HZ = 20
 DEFAULT_RUN_DIR = Path("artifacts/1MRun/nom/ppo_nominal/seed_307")
 DEFAULT_OUTPUT_DIR = Path(
-    "artifacts/1MRun/nom/external_cbf_timing_pilot_fcbf10_fpolicy10_fphysics100"
+    "artifacts/1MRun/nom/external_cbf_timing_pilot_fcbf20_fpolicy20_fphysics100"
 )
 
 
@@ -103,7 +102,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "--task-max-policy-steps",
         type=int,
         default=None,
-        help="Maximum policy steps; defaults to the 10 Hz horizon converted to the selected policy rate.",
+        help="Maximum policy steps; defaults to the 20 Hz horizon converted to the selected policy rate.",
     )
     parser.add_argument(
         "--correction-epsilon",
@@ -143,6 +142,7 @@ def main(argv: list[str] | None = None) -> int:
             "dt": 1.0 / float(args.physics_hz),
             "simulation_frequency": float(args.physics_hz),
             "policy_frequency": float(args.policy_hz),
+            "vehicle_policy_frequency": float(args.physics_hz),
             "cbf_substep_filtering": False,
             "cbf_require_initial_safe_set": False,
         }
@@ -234,7 +234,11 @@ def main(argv: list[str] | None = None) -> int:
         "max_neighbor_constraints": int(namespace["CBF_MAX_NEIGHBOR_CONSTRAINTS"]),
         "task_max_policy_steps": int(eval_args.task_max_policy_steps),
         "cbf_substep_filtering": False,
-        "action_semantics": "CBF-filtered physical action held for ten physics frames",
+        "vehicle_policy_frequency_hz": float(args.physics_hz),
+        "action_semantics": (
+            "CBF-filtered physical action held for "
+            f"{int(round(substeps))} physics frames per policy action"
+        ),
         "complete": True,
     }
     (output_dir / "manifest.json").write_text(
@@ -242,9 +246,10 @@ def main(argv: list[str] | None = None) -> int:
     )
     (output_dir / "README.md").write_text(
         "# External-CBF timing pilot\n\n"
-        "This pilot evaluates the fixed 1M nominal PPO policy with the external "
-        "CBF applied once per 10 Hz policy/action update. The 100 Hz simulator "
-        "holds that filtered physical action for ten physics frames. It uses "
+        "This pilot evaluates the nominal PPO policy with the external "
+        "CBF applied once per 20 Hz policy/action update. The 100 Hz simulator "
+        "holds that filtered physical action for five physics frames, while "
+        "social vehicle controllers update at 100 Hz. It uses "
         "the same paired seeds and deployment gains as the Stage 1 candidate "
         "specified in `manifest.json`.\n",
         encoding="utf-8",

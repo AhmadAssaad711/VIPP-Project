@@ -293,8 +293,8 @@ class CBFContextPhysicalActionWrapper(gym.Wrapper):
         """Project a fresh physical action against the current physics state."""
 
         # Do not use ``current_constraint_system`` here: it intentionally
-        # caches the policy-rate observation context.  At 100 Hz the traffic
-        # state changes during the ten simulator frames, so each substep needs
+        # caches the policy-rate observation context. At 100 Hz the traffic
+        # state changes during the five simulator frames, so each substep needs
         # a new HOCBF polytope.
         system = self._constraint_system()
         result = project_polytope_2d_numpy(
