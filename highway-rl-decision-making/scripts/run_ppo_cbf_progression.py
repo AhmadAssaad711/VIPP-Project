@@ -39,10 +39,9 @@ from functools import partial
 from pathlib import Path
 from typing import Any, Iterable
 
-# Eight vectorized simulator workers already provide the intended CPU
-# parallelism.  Set these before NumPy/PyTorch import so one BLAS/OpenMP pool
-# per worker cannot oversubscribe the machine and freeze the desktop during a
-# long CUDA-backed PPO run.
+# Vectorized simulator workers provide the intended CPU parallelism.  Set
+# these before NumPy/PyTorch import so one BLAS/OpenMP pool per worker cannot
+# oversubscribe the machine and freeze the desktop during a long PPO run.
 for _native_thread_key in (
     "OMP_NUM_THREADS",
     "OPENBLAS_NUM_THREADS",
@@ -85,7 +84,7 @@ from train_safety_potential_variants import MTM_CONGESTED_UNCERTAIN_UPDATES
 
 
 PROGRESSION_SCHEMA_VERSION = 8
-PPO_TRAINING_IMPLEMENTATION_VERSION = 12
+PPO_TRAINING_IMPLEMENTATION_VERSION = 14
 TRAINING_SIGNATURE_FILE = "training_signature.json"
 TRAINING_PENDING_SIGNATURE_FILE = "training_signature.pending.json"
 TRAINING_COMPLETION_FILE = "training_complete.json"
@@ -3497,6 +3496,15 @@ def parse_args() -> argparse.Namespace:
         help="Weight for the bounded additive potential-field risk penalty.",
     )
     parser.add_argument(
+        "--disable-safety-shaping",
+        action="store_true",
+        help=(
+            "Disable all reward-based safety shaping for this run: the legacy "
+            "potential field, risk shaping, and direct safety potentials. "
+            "Collision detection, termination, and collision penalty remain active."
+        ),
+    )
+    parser.add_argument(
         "--risk-potential-shaping-weight",
         type=float,
         default=None,
@@ -3986,6 +3994,22 @@ def main() -> int:
         if not np.isfinite(float(args.risk_potential_shaping_gamma)) or not 0.0 <= float(args.risk_potential_shaping_gamma) <= 1.0:
             raise ValueError("--risk-potential-shaping-gamma must lie in [0, 1]")
         reward_config["risk_potential_shaping_gamma"] = float(args.risk_potential_shaping_gamma)
+    if args.disable_safety_shaping:
+        reward_config.update(
+            {
+                # ``wf * cf`` is the legacy reciprocal potential-field term.
+                "wf": 0.0,
+                "risk_penalty_weight": 0.0,
+                "risk_potential_shaping_weight": 0.0,
+                "use_current_potential": 0.0,
+                "use_safety_potential": 0.0,
+                "w_safe": 0.0,
+                "safety_potential_formulation": "none",
+                "safety_potential_weight": 0.0,
+                "safety_ellipse_weight": 0.0,
+                "safety_ttc_weight": 0.0,
+            }
+        )
     config = resolved_ppo_config(args)
     print(
         "[ppo-progression] starting",
