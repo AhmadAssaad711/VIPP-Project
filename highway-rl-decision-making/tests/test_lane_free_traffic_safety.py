@@ -142,6 +142,111 @@ def test_guard_makes_social_leader_yield_instead_of_overwriting_ego_action():
         env.close()
 
 
+def test_traffic_only_guard_does_not_proactively_react_to_ego():
+    env = LaneFreeTrafficEnv(
+        config={
+            "road_length": 380.0,
+            "vehicles_count": 2,
+            "traffic_safety": {"traffic_only_guard": True},
+            "bounds": {
+                "ax_min": -3.0,
+                "ax_max": 3.0,
+                "ay_min": -3.0,
+                "ay_max": 3.0,
+            },
+        }
+    )
+    try:
+        env.reset(seed=7)
+        ego, social = env.road.vehicles
+        ego.position[:] = [90.0, 5.1]
+        ego.vx, ego.vy = 25.0, 0.0
+        social.position[:] = [100.0, 5.1]
+        social.vx, social.vy = 15.0, 0.0
+        requested = np.asarray([[-2.0, 0.7], [-3.0, 0.0]], dtype=float)
+
+        guarded = env._apply_traffic_safety_guard(requested, dt=0.05)
+
+        assert np.allclose(guarded, requested)
+        diagnostics = env._last_traffic_safety_diagnostics
+        assert diagnostics["traffic_constraints"] == 0.0
+        assert diagnostics["ego_emergency_constraints"] == 0.0
+        assert diagnostics["policy_safety_failures"] == 0.0
+    finally:
+        env.close()
+
+
+def test_traffic_only_guard_preserves_social_social_protection():
+    env = LaneFreeTrafficEnv(
+        config={
+            "road_length": 380.0,
+            "vehicles_count": 3,
+            "traffic_safety": {"traffic_only_guard": True},
+            "bounds": {
+                "ax_min": -3.0,
+                "ax_max": 3.0,
+                "ay_min": -3.0,
+                "ay_max": 3.0,
+            },
+        }
+    )
+    try:
+        env.reset(seed=8)
+        ego, follower, leader = env.road.vehicles
+        ego.position[:] = [250.0, 1.0]
+        follower.position[:] = [90.0, 5.1]
+        leader.position[:] = [100.0, 5.1]
+        follower.vx, follower.vy = 25.0, 0.0
+        leader.vx, leader.vy = 15.0, 0.0
+        requested = np.asarray([[0.0, 0.0], [2.0, 0.0], [0.0, 0.0]], dtype=float)
+
+        guarded = env._apply_traffic_safety_guard(requested, dt=0.05)
+
+        assert np.allclose(guarded[0], requested[0])
+        assert guarded[1, 0] == -3.0
+        diagnostics = env._last_traffic_safety_diagnostics
+        assert diagnostics["traffic_constraints"] == 1.0
+        assert diagnostics["ego_emergency_constraints"] == 0.0
+        assert diagnostics["policy_safety_failures"] == 0.0
+    finally:
+        env.close()
+
+
+def test_traffic_only_guard_does_not_intervene_in_imminent_ego_conflict():
+    env = LaneFreeTrafficEnv(
+        config={
+            "road_length": 380.0,
+            "vehicles_count": 2,
+            "traffic_safety": {"traffic_only_guard": True},
+            "bounds": {
+                "ax_min": -3.0,
+                "ax_max": 3.0,
+                "ay_min": -3.0,
+                "ay_max": 3.0,
+            },
+        }
+    )
+    try:
+        env.reset(seed=9)
+        ego, social = env.road.vehicles
+        ego.position[:] = [94.0, 5.1]
+        ego.vx, ego.vy = 25.0, 0.0
+        social.position[:] = [100.0, 5.1]
+        social.vx, social.vy = 15.0, 0.0
+        requested = np.asarray([[-2.0, 0.7], [-3.0, 0.0]], dtype=float)
+
+        guarded = env._apply_traffic_safety_guard(requested, dt=0.05)
+
+        assert np.allclose(guarded, requested)
+        diagnostics = env._last_traffic_safety_diagnostics
+        assert diagnostics["traffic_constraints"] == 0.0
+        assert diagnostics["ego_emergency_constraints"] == 0.0
+        assert diagnostics["ego_emergency_interventions"] == 0.0
+        assert diagnostics["policy_safety_failures"] == 0.0
+    finally:
+        env.close()
+
+
 def test_side_contact_projection_preserves_common_mode_lateral_acceleration():
     env = LaneFreeTrafficEnv(
         config={

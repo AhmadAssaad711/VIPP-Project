@@ -70,6 +70,7 @@ def test_persistent_collision_event_is_not_overwritten_by_final_physics_frame(
     assert info["active_collisions"] == 1
     assert info["ego_collision_events"] == 1
     assert info["ego_collision"] is True
+    assert info["policy_safety_failures"] == 1
 
 
 def test_collision_that_disappears_before_policy_step_end_still_terminates(
@@ -93,3 +94,4 @@ def test_collision_that_disappears_before_policy_step_end_still_terminates(
     assert info["active_collisions"] == 1
     assert info["ego_collision_events"] == 1
     assert info["ego_collision"] is True
+    assert info["policy_safety_failures"] == 1

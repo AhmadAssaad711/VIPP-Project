@@ -20,6 +20,7 @@ import numpy as np
 
 import run_cbf_filter_ablation as protocol
 from ppo_cbf_env import CBFContextPhysicalActionWrapper
+from ppo_observation_variants import install_previous_action_observation
 from projected_ppo_cbf import LatentActionPPO, ProjectedCBFPPO
 
 
@@ -131,6 +132,8 @@ def main() -> int:
     namespace["DEVICE"] = args.device
 
     env_config = copy.deepcopy(run_config["env_config"])
+    if bool(env_config.get("ppo_append_previous_action", False)):
+        install_previous_action_observation(namespace)
     env_config["real_time_rendering"] = True
     reward_config = copy.deepcopy(run_config["reward_config"])
     action_rate_penalty_lambda = float(run_config.get("action_rate_penalty", 0.0))

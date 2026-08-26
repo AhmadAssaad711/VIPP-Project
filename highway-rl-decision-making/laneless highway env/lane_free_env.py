@@ -293,6 +293,10 @@ class LaneFreeTrafficEnv(AbstractEnv):
                     # overwrites the controlled ego action, so an unsafe ego
                     # action can still cause a meaningful collision.
                     "dynamics_guard": True,
+                    # Opt-in evaluation/training mode: social vehicles keep
+                    # their nominal controller and guard only against other
+                    # social vehicles.  No traffic rule reacts to the ego.
+                    "traffic_only_guard": False,
                     "guard_horizon_s": 1.5,
                     "guard_range_m": 120.0,
                     "guard_longitudinal_clearance": 1.5,
@@ -960,6 +964,8 @@ class LaneFreeTrafficEnv(AbstractEnv):
             and callable(substep_filter)
         )
         substep_records: list[dict[str, Any]] = []
+        traffic_safety_records: list[dict[str, float]] = []
+        collision_records: list[tuple[int, int, int, bool]] = []
         for frame_index in range(frames):
             accelerations = self._compute_accelerations()
             if bool(self.config["ego_controlled"]):
@@ -1007,12 +1013,78 @@ class LaneFreeTrafficEnv(AbstractEnv):
                     accelerations[0, 0] = ego_ax
                     accelerations[0, 1] = proposed_ego_acceleration[1]
             accelerations = self._apply_traffic_safety_guard(accelerations, dt)
+            traffic_safety_records.append(
+                dict(self._last_traffic_safety_diagnostics)
+            )
             accelerations = self._clip_accelerations(accelerations)
             self._last_accelerations = accelerations
             self._integrate(accelerations, dt)
             self._detect_collisions()
+            collision_records.append(
+                (
+                    int(self._last_collision_count),
+                    int(self._last_active_collision_count),
+                    int(self._last_ego_collision_count),
+                    bool(self._last_ego_collision),
+                )
+            )
             self.steps += 1
             self.time += dt
+
+        if collision_records:
+            # A policy step may contain multiple physics frames. Preserve
+            # collision events and termination state from every frame rather
+            # than exposing only the final frame's values.
+            self._last_collision_count = int(
+                sum(record[0] for record in collision_records)
+            )
+            self._last_active_collision_count = int(
+                max(record[1] for record in collision_records)
+            )
+            self._last_ego_collision_count = int(
+                sum(record[2] for record in collision_records)
+            )
+            self._last_ego_collision = bool(
+                any(record[3] for record in collision_records)
+            )
+
+        if traffic_safety_records:
+            # The guard runs at physics frequency while the caller receives
+            # one info dictionary per policy step. Sum event/count fields so
+            # an earlier substep is not hidden by the final diagnostics.
+            traffic_safety_summary = dict(traffic_safety_records[-1])
+            summed_fields = {
+                "constraints",
+                "traffic_constraints",
+                "ego_emergency_constraints",
+                "traffic_brakes",
+                "ego_leader_yields",
+                "lateral_yields",
+                "side_constraints",
+                "side_infeasible",
+                "side_projection_yields",
+                "ego_emergency_interventions",
+                "ego_emergency_traffic_brakes",
+                "ego_emergency_leader_yields",
+                "ego_emergency_side_constraints",
+                "ego_emergency_side_infeasible",
+                "ego_emergency_infeasible",
+                "policy_safety_failures",
+            }
+            for field in summed_fields:
+                traffic_safety_summary[field] = float(
+                    sum(record.get(field, 0.0) for record in traffic_safety_records)
+                )
+            traffic_safety_summary["enabled"] = float(
+                any(record.get("enabled", 0.0) > 0.5 for record in traffic_safety_records)
+            )
+            traffic_safety_summary["traffic_only_guard"] = float(
+                any(
+                    record.get("traffic_only_guard", 0.0) > 0.5
+                    for record in traffic_safety_records
+                )
+            )
+            self._last_traffic_safety_diagnostics = traffic_safety_summary
 
         self._last_cbf_substep_diagnostics = self._substep_filter_summary(
             substep_records, enabled=substep_enabled
@@ -1089,6 +1161,16 @@ class LaneFreeTrafficEnv(AbstractEnv):
         dx = (x[None, :] - x[:, None]) % road_length
         dy = y[None, :] - y[:, None]
         valid_pairs = (dx > 0.0) & (dx < sensing_range) & ~np.eye(count, dtype=bool)
+        if bool(self._traffic_safety_config().get("traffic_only_guard", False)):
+            is_ego = np.fromiter(
+                (bool(vehicle.is_ego) for vehicle in vehicles),
+                dtype=bool,
+                count=count,
+            )
+            # Matrix rows are reacting vehicles and columns are the vehicle
+            # they perceive.  Social vehicles must not proactively react to
+            # the controlled ego in this mode.
+            valid_pairs &= ~((~is_ego[:, None]) & is_ego[None, :])
 
         dx_scale = (
             0.5 * (lengths[:, None] + lengths[None, :])
@@ -1172,6 +1254,10 @@ class LaneFreeTrafficEnv(AbstractEnv):
             & (dx < parameters["leader_range"][:, None])
             & ~np.eye(count, dtype=bool)
         )
+        if bool(self._traffic_safety_config().get("traffic_only_guard", False)):
+            # Preserve social-social MTM interactions while removing the ego
+            # as a proactive leader for every social vehicle.
+            valid &= ~((~is_ego[:, None]) & is_ego[None, :])
         gap_x = np.maximum(dx - 0.5 * (lengths[:, None] + lengths[None, :]), 0.05)
         lateral_gap = np.maximum(
             np.abs(dy) - parameters["theta"][:, None] * 0.5 * (widths[:, None] + widths[None, :]),
@@ -1311,6 +1397,14 @@ class LaneFreeTrafficEnv(AbstractEnv):
 
         for other in vehicles:
             if other is vehicle:
+                continue
+            if (
+                bool(self._traffic_safety_config().get("traffic_only_guard", False))
+                and not bool(vehicle.is_ego)
+                and bool(other.is_ego)
+            ):
+                # The traffic-only mode deliberately does not let a social
+                # MTM controller respond to the ego at all.
                 continue
             if not (
                 np.isfinite(vehicle.position[0])
@@ -1491,26 +1585,35 @@ class LaneFreeTrafficEnv(AbstractEnv):
     def _apply_traffic_safety_guard(
         self, accelerations: np.ndarray, dt: float
     ) -> np.ndarray:
-        """Keep social traffic from creating an unavoidable ego conflict.
+        """Apply the simulator traffic rule to social vehicles.
 
-        The controlled ego acceleration is deliberately immutable here.  The
-        guard asks surrounding vehicles to brake or yield laterally whenever
-        their proposed motion would consume the ego's emergency-braking
-        envelope, and applies the same rear-end rule to traffic-traffic pairs.
-        This is a simulator traffic rule, not a hidden ego safety filter.
+        In legacy mode this includes the historical ego-related yielding rule.
+        In traffic-only mode, only social-social rear-end and side-contact
+        constraints are active; the controlled ego is never a guard target.
         """
 
         safety = self._traffic_safety_config()
         guarded = np.asarray(accelerations, dtype=float).copy()
+        traffic_only_guard = bool(safety.get("traffic_only_guard", False))
         diagnostics = {
             "enabled": float(bool(safety.get("dynamics_guard", True))),
+            "traffic_only_guard": float(traffic_only_guard),
             "constraints": 0.0,
+            "traffic_constraints": 0.0,
+            "ego_emergency_constraints": 0.0,
             "traffic_brakes": 0.0,
             "ego_leader_yields": 0.0,
             "lateral_yields": 0.0,
             "side_constraints": 0.0,
             "side_infeasible": 0.0,
             "side_projection_yields": 0.0,
+            "ego_emergency_interventions": 0.0,
+            "ego_emergency_traffic_brakes": 0.0,
+            "ego_emergency_leader_yields": 0.0,
+            "ego_emergency_side_constraints": 0.0,
+            "ego_emergency_side_infeasible": 0.0,
+            "ego_emergency_infeasible": 0.0,
+            "policy_safety_failures": 0.0,
         }
         vehicles = self.road.vehicles
         count = len(vehicles)
@@ -1538,7 +1641,10 @@ class LaneFreeTrafficEnv(AbstractEnv):
             [bool(vehicle.is_ego and ego_controlled) for vehicle in vehicles],
             dtype=bool,
         )
-
+        is_ego = np.asarray(
+            [bool(vehicle.is_ego) for vehicle in vehicles],
+            dtype=bool,
+        )
         x = np.fromiter(
             (float(vehicle.position[0]) for vehicle in vehicles),
             dtype=float,
@@ -1607,18 +1713,34 @@ class LaneFreeTrafficEnv(AbstractEnv):
         needs_guard = valid_pair & lateral_conflict & (
             longitudinal_gap < required_gap
         )
-        diagnostics["constraints"] = float(np.count_nonzero(needs_guard))
+        ego_related = is_ego[:, None] | is_ego[None, :]
+        if traffic_only_guard:
+            # In traffic-only mode the guard sees only social-social pairs.
+            # Ego-related pairs are intentionally not admitted at any
+            # distance or time-to-contact.
+            normal_pair_mask = ~ego_related
+            normal_needs_guard = needs_guard & normal_pair_mask
+        else:
+            normal_pair_mask = np.ones((count, count), dtype=bool)
+            normal_needs_guard = needs_guard
+        diagnostics["constraints"] = float(
+            np.count_nonzero(normal_needs_guard)
+        )
+        diagnostics["traffic_constraints"] = float(
+            np.count_nonzero(normal_needs_guard)
+        )
 
-        # Social followers brake for either social traffic or the ego ahead.
-        brake_mask = (~controlled) & np.any(needs_guard, axis=1)
+        # Social followers brake only for social traffic in traffic-only mode.
+        non_ego = ~is_ego if traffic_only_guard else ~controlled
+        brake_mask = non_ego & np.any(normal_needs_guard, axis=1)
         changing_brake = brake_mask & (guarded[:, 0] > ax_min + 1e-9)
         guarded[changing_brake, 0] = ax_min
         diagnostics["traffic_brakes"] = float(np.count_nonzero(changing_brake))
 
-        # The ego remains fully controlled. If it is the follower, require a
-        # social leader to accelerate/yield instead of rewriting the action.
+        # The legacy guard lets a social leader yield when the ego is the
+        # follower.  Traffic-only mode intentionally omits this behavior.
         ego_indices = np.flatnonzero(controlled)
-        if ego_indices.size:
+        if ego_indices.size and not traffic_only_guard:
             ego_index = int(ego_indices[0])
             ego_leader_mask = needs_guard[ego_index] & ~controlled
             leader_indices = np.flatnonzero(ego_leader_mask)
@@ -1642,7 +1764,7 @@ class LaneFreeTrafficEnv(AbstractEnv):
         # source of cut-ins and zig-zag motion. It is intentionally applied
         # before the narrow contact projection below, which is responsible
         # only for trimming the final inward component that would overlap.
-        lateral_yield_pairs = needs_guard & (
+        lateral_yield_pairs = normal_needs_guard & (
             longitudinal_gap
             <= np.maximum(required_gap, lateral_conflict_range)
         )
@@ -1665,7 +1787,7 @@ class LaneFreeTrafficEnv(AbstractEnv):
             max(float(safety.get("guard_lateral_yield_acceleration", 3.0)), 0.0),
             max(abs(float(bounds["ay_min"])), abs(float(bounds["ay_max"]))),
         )
-        lateral_mask = participant & ~controlled & (
+        lateral_mask = participant & non_ego & (
             np.abs(lateral_direction) > 1e-9
         )
         previous_lateral = guarded[:, 1].copy()
@@ -1700,6 +1822,7 @@ class LaneFreeTrafficEnv(AbstractEnv):
             controlled=controlled,
             dt=dt,
             safety=safety,
+            pair_mask=normal_pair_mask,
         )
         diagnostics["side_constraints"] = float(side_constraints)
         diagnostics["lateral_yields"] = float(lateral_drive_yields)
@@ -1722,6 +1845,7 @@ class LaneFreeTrafficEnv(AbstractEnv):
         controlled: np.ndarray,
         dt: float,
         safety: dict[str, Any],
+        pair_mask: np.ndarray | None = None,
     ) -> tuple[np.ndarray, int, int, int]:
         """Minimally remove imminent inward motion at a side contact.
 
@@ -1737,6 +1861,16 @@ class LaneFreeTrafficEnv(AbstractEnv):
         count = len(projected)
         if count < 2:
             return projected, 0, 0, 0
+
+        active_pair_mask = (
+            np.ones((count, count), dtype=bool)
+            if pair_mask is None
+            else np.asarray(pair_mask, dtype=bool)
+        )
+        if active_pair_mask.shape != (count, count):
+            raise ValueError(
+                "pair_mask must have shape (vehicle_count, vehicle_count)"
+            )
 
         bounds = self.config["bounds"]
         ay_min = float(bounds["ay_min"])
@@ -1754,6 +1888,11 @@ class LaneFreeTrafficEnv(AbstractEnv):
 
         for first in range(count - 1):
             for second in range(first + 1, count):
+                if not bool(
+                    active_pair_mask[first, second]
+                    or active_pair_mask[second, first]
+                ):
+                    continue
                 lateral_offset = float(y[second] - y[first])
                 if abs(lateral_offset) > 1e-9:
                     separation_sign = float(np.sign(lateral_offset))
@@ -2150,6 +2289,10 @@ class LaneFreeTrafficEnv(AbstractEnv):
         spawn = self._last_spawn_diagnostics or {}
         traffic_safety = self._last_traffic_safety_diagnostics or {}
         substep_cbf = self._last_cbf_substep_diagnostics or {}
+        policy_safety_failures = max(
+            int(traffic_safety.get("policy_safety_failures", 0.0)),
+            int(self._last_ego_collision_count),
+        )
         info.update(
             {
                 "traffic_safe_spawn": bool(spawn.get("safe_spawn", 0.0)),
@@ -2157,6 +2300,37 @@ class LaneFreeTrafficEnv(AbstractEnv):
                 "traffic_guard_constraints": int(
                     traffic_safety.get("constraints", 0.0)
                 ),
+                "traffic_guard_traffic_only": bool(
+                    traffic_safety.get("traffic_only_guard", False)
+                ),
+                "traffic_guard_traffic_constraints": int(
+                    traffic_safety.get("traffic_constraints", 0.0)
+                ),
+                "traffic_guard_ego_emergency_constraints": int(
+                    traffic_safety.get("ego_emergency_constraints", 0.0)
+                ),
+                "traffic_guard_ego_emergency_interventions": int(
+                    traffic_safety.get("ego_emergency_interventions", 0.0)
+                ),
+                "traffic_guard_ego_emergency_traffic_brakes": int(
+                    traffic_safety.get("ego_emergency_traffic_brakes", 0.0)
+                ),
+                "traffic_guard_ego_emergency_leader_yields": int(
+                    traffic_safety.get("ego_emergency_leader_yields", 0.0)
+                ),
+                "traffic_guard_ego_emergency_side_constraints": int(
+                    traffic_safety.get("ego_emergency_side_constraints", 0.0)
+                ),
+                "traffic_guard_ego_emergency_side_infeasible": int(
+                    traffic_safety.get("ego_emergency_side_infeasible", 0.0)
+                ),
+                "traffic_guard_ego_emergency_infeasible": int(
+                    traffic_safety.get("ego_emergency_infeasible", 0.0)
+                ),
+                # In traffic-only mode this is driven by actual ego collision
+                # events, not by a hidden traffic intervention.
+                "policy_safety_failure": bool(policy_safety_failures > 0),
+                "policy_safety_failures": policy_safety_failures,
                 "traffic_guard_brakes": int(
                     traffic_safety.get("traffic_brakes", 0.0)
                 ),
