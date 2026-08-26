@@ -1,0 +1,14 @@
+{
+  "schema_version": 8,
+  "variant": "ppo_cbf_nd_actor_only",
+  "training_seed": 307,
+  "log_dir": "C:\\Users\\aha173\\AppData\\Local\\highway_rl_tb\\817805f20a\\ndao_307_4f1a43b953",
+  "command": "tensorboard --logdir \"C:\\Users\\aha173\\AppData\\Local\\highway_rl_tb\\817805f20a\\ndao_307_4f1a43b953\"",
+  "new_event_files": [
+    "C:\\Users\\aha173\\AppData\\Local\\highway_rl_tb\\817805f20a\\ndao_307_4f1a43b953\\train_1\\events.out.tfevents.1787473705.DSP000107027L.1736.1"
+  ],
+  "all_event_files": [
+    "C:\\Users\\aha173\\AppData\\Local\\highway_rl_tb\\817805f20a\\ndao_307_4f1a43b953\\train_1\\events.out.tfevents.1787473705.DSP000107027L.1736.1"
+  ],
+  "retrain_note": "Stable-Baselines3 creates a new train_N subdirectory for a fresh forced retrain, so TensorBoard histories remain distinguishable."
+}

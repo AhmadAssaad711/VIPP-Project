@@ -1,0 +1,454 @@
+{
+  "schema_version": 8,
+  "variant": "ppo_cbf_diff_reward_only",
+  "variant_spec": {
+    "label": "PPO with differentiable CBF projection + reward only",
+    "level": 3,
+    "execution_mode": "cbf",
+    "reward_penalty": true,
+    "projected_mean": true,
+    "differentiable_actor_loss": false,
+    "detached_actor_loss": false,
+    "safety_critic": false
+  },
+  "training_seed": 307,
+  "timesteps": 50000,
+  "ppo_config_name": "Q1_stable",
+  "tensorboard_run_label": "b3_dfro_50k_q1_v2",
+  "ppo_config": {
+    "learning_rate": 0.0001,
+    "n_steps": 125,
+    "batch_size": 100,
+    "n_epochs": 10,
+    "gamma": 0.99,
+    "gae_lambda": 0.95,
+    "clip_range": 0.2,
+    "ent_coef": 0.005,
+    "vf_coef": 0.5,
+    "max_grad_norm": 0.5,
+    "log_std_init": -0.5,
+    "global_rollout_steps": 1000,
+    "n_envs": 8
+  },
+  "lambda_delta": 0.05,
+  "lambda_intervention": 0.1,
+  "lambda_mean": 0.0,
+  "lambda_detached_actor": 0.0,
+  "lambda_sample": 0.0,
+  "lambda_critic": 0.0,
+  "safety_critic_gamma": 0.0,
+  "safety_critic_cost_clip": 0.0,
+  "action_rate_penalty": 0.0,
+  "training_signature": {
+    "action_contract": {
+      "buffer_action": "latent Gaussian sample z",
+      "cbf_substep_filtering": true,
+      "environment_action": "hard CBF projection P_s(z)",
+      "physics_substeps_per_policy_action": 10,
+      "project_inputs_during_collection": false
+    },
+    "cbf": {
+      "CBF_AX_BOUNDS": [
+        -3.0,
+        3.0
+      ],
+      "CBF_AY_BOUNDS": [
+        -3.0,
+        3.0
+      ],
+      "CBF_EPS_SIDE": 0.1,
+      "CBF_K0": 5.29,
+      "CBF_K1": 3.68,
+      "CBF_MAX_NEIGHBOR_CONSTRAINTS": 12,
+      "CBF_NEIGHBOR_RANGE": 90.0,
+      "CBF_QP_FEASIBILITY_TOL": 0.001,
+      "CBF_TARGET_PAIR_DY": 3.0
+    },
+    "collection_topology": {
+      "backend": "subproc",
+      "n_envs": 8,
+      "start_method": "spawn"
+    },
+    "correction_epsilon": 0.03,
+    "effective_training_settings": {
+      "action_rate_penalty": 0.0,
+      "lambda_critic": 0.0,
+      "lambda_delta": 0.05,
+      "lambda_detached_actor": 0.0,
+      "lambda_intervention": 0.1,
+      "lambda_mean": 0.0,
+      "lambda_sample": 0.0,
+      "safety_critic_cost_clip": 0.0,
+      "safety_critic_gamma": 0.0
+    },
+    "env_config": {
+      "bounds": {
+        "ax_max": 3.0,
+        "ax_min": -3.0,
+        "ay_max": 3.0,
+        "ay_min": -3.0
+      },
+      "cbf_require_initial_safe_set": true,
+      "cbf_substep_filtering": true,
+      "desired_speed_range": [
+        15.0,
+        25.0
+      ],
+      "dt": 0.01,
+      "duration": 30000,
+      "ego_boundary_force": false,
+      "ego_controlled": true,
+      "ego_desired_speed": 16.0,
+      "ego_dimensions": [
+        3.5,
+        1.8
+      ],
+      "episode_steps": 30000,
+      "gamma_nudge": 0.0,
+      "initial_speed_fraction_range": [
+        0.55,
+        1.1
+      ],
+      "mtm": {
+        "continuous_driver_aggressiveness": true,
+        "leader_range": 90.0,
+        "profile_probabilities": {
+          "aggressive": 0.5,
+          "cautious": 0.25,
+          "normal": 0.25
+        }
+      },
+      "neighbors_count": 5,
+      "observation_include_vehicle_dimensions": false,
+      "observation_vmax": 24.0,
+      "observation_vymax": 7.2,
+      "placeholder_neighbor": [
+        80.0,
+        10.2,
+        0.0,
+        0.0
+      ],
+      "policy_frequency": 10,
+      "ppo_append_previous_action": true,
+      "real_time_rendering": true,
+      "road_length": 380.0,
+      "road_width": 10.2,
+      "screen_height": 260,
+      "screen_width": 900,
+      "sensing_range": 90.0,
+      "show_trajectories": false,
+      "simulation_frequency": 100,
+      "terminate_on_collision": true,
+      "traffic_model": "mtm",
+      "traffic_safety": {
+        "dynamics_guard": true,
+        "guard_horizon_s": 1.5,
+        "guard_lateral_clearance": 0.25,
+        "guard_lateral_conflict_range": 12.0,
+        "guard_lateral_yield_acceleration": 3.0,
+        "guard_longitudinal_clearance": 1.5,
+        "guard_range_m": 120.0,
+        "guard_time_headway": 0.25,
+        "safe_spawn": true,
+        "spawn_cbf_eps_side": 0.1,
+        "spawn_cbf_k1": 3.68,
+        "spawn_cbf_margin_m": 0.0,
+        "spawn_cbf_psi_margin": 0.0,
+        "spawn_cbf_safe_set": true,
+        "spawn_ego_lateral_clearance": 0.75,
+        "spawn_ego_longitudinal_clearance": 18.0,
+        "spawn_lateral_clearance": 0.35,
+        "spawn_longitudinal_clearance": 6.0,
+        "spawn_max_attempts": 1000,
+        "spawn_time_headway": 0.75
+      },
+      "vehicle_dimensions": [
+        [
+          3.5,
+          1.8
+        ],
+        [
+          3.5,
+          1.8
+        ]
+      ],
+      "vehicles_count": 55
+    },
+    "model_contract": {
+      "activation": "torch.nn.Tanh",
+      "actor_cbf_gradient_path": "differentiable_projection_only",
+      "algorithm_class": "ProjectedCBFPPO",
+      "base_observation_dim": 32,
+      "base_observation_features": [
+        "dx",
+        "dy",
+        "vx",
+        "vy",
+        "desired_speed"
+      ],
+      "detached_actor_loss_enabled": false,
+      "differentiable_actor_loss_enabled": false,
+      "max_cbf_constraints": 18,
+      "net_arch": {
+        "pi": [
+          256,
+          128
+        ],
+        "vf": [
+          256,
+          128
+        ]
+      },
+      "observation_variant": "target_y_plus_previous_executed_action",
+      "ordinary_value_critic": true,
+      "ordinary_value_target": "reward_shaped_return",
+      "policy_class": "ProjectedCBFActorCriticPolicy",
+      "previous_action_semantics": "last_normalized_executed_physics_action",
+      "safety_critic_head": false,
+      "safety_critic_loss_enabled": false
+    },
+    "ppo_config": {
+      "batch_size": 100,
+      "clip_range": 0.2,
+      "ent_coef": 0.005,
+      "gae_lambda": 0.95,
+      "gamma": 0.99,
+      "global_rollout_steps": 1000,
+      "learning_rate": 0.0001,
+      "log_std_init": -0.5,
+      "max_grad_norm": 0.5,
+      "n_envs": 8,
+      "n_epochs": 10,
+      "n_steps": 125,
+      "vf_coef": 0.5
+    },
+    "ppo_config_name": "Q1_stable",
+    "reward_config": {
+      "collision_penalty": -2.5,
+      "ego_desired_speed": 16.0,
+      "epsilon_r": 0.4,
+      "expose_target_y": true,
+      "jerk_penalty_weight": 0.02,
+      "jerk_scale": 10.0,
+      "overtake_bonus": 0.5,
+      "progress_clip": 1.25,
+      "progress_distance_scale_m": 2.0,
+      "progress_reward_weight": 0.05,
+      "target_speed_blockage_threshold": 0.55,
+      "target_speed_blockage_transition": 0.15,
+      "target_speed_lateral_transition_m": 0.45,
+      "target_speed_transition_m": 8.0,
+      "timegap": 1.5,
+      "use_current_potential": 1.0,
+      "use_safety_potential": 0.0,
+      "w_safe": 0.0,
+      "way": 0.0,
+      "wf": 1.0,
+      "wx": 1.0,
+      "wy": 0.65
+    },
+    "schema_version": 8,
+    "tensorboard_run_label": "b3_dfro_50k_q1_v2",
+    "timesteps": 50000,
+    "training_implementation_version": 12,
+    "training_seed": 307,
+    "variant": "ppo_cbf_diff_reward_only",
+    "variant_spec": {
+      "detached_actor_loss": false,
+      "differentiable_actor_loss": false,
+      "execution_mode": "cbf",
+      "label": "PPO with differentiable CBF projection + reward only",
+      "level": 3,
+      "projected_mean": true,
+      "reward_penalty": true,
+      "safety_critic": false
+    }
+  },
+  "training_signature_hash": "952e41b70f0685bb84698f8598d640c19ce934c4c5e74f2fdbc3f7155d539cd9",
+  "buffer_action": "latent Gaussian sample z",
+  "environment_action": "hard CBF projection P_s(z)",
+  "common_physical_action_bounds": {
+    "ax": [
+      -3.0,
+      3.0
+    ],
+    "ay": [
+      -3.0,
+      3.0
+    ]
+  },
+  "traffic_model": "mtm",
+  "collection_topology": {
+    "n_envs": 8,
+    "backend": "subproc",
+    "start_method": "spawn"
+  },
+  "global_rollout_steps": 1000,
+  "per_env_rollout_steps": 125,
+  "checkpoint_frequency_requested": 100000,
+  "checkpoint_frequency_effective": 100000,
+  "checkpoint_callback_frequency": 12500,
+  "tensorboard": {
+    "schema_version": 8,
+    "variant": "ppo_cbf_diff_reward_only",
+    "training_seed": 307,
+    "log_dir": "C:\\Users\\aha173\\AppData\\Local\\highway_rl_tb\\817805f20a\\dfro_307_7d84df2f7b",
+    "command": "tensorboard --logdir \"C:\\Users\\aha173\\AppData\\Local\\highway_rl_tb\\817805f20a\\dfro_307_7d84df2f7b\"",
+    "new_event_files": [
+      "C:\\Users\\aha173\\AppData\\Local\\highway_rl_tb\\817805f20a\\dfro_307_7d84df2f7b\\train_1\\events.out.tfevents.1787466659.DSP000107027L.13636.0"
+    ],
+    "all_event_files": [
+      "C:\\Users\\aha173\\AppData\\Local\\highway_rl_tb\\817805f20a\\dfro_307_7d84df2f7b\\train_1\\events.out.tfevents.1787466659.DSP000107027L.13636.0"
+    ],
+    "retrain_note": "Stable-Baselines3 creates a new train_N subdirectory for a fresh forced retrain, so TensorBoard histories remain distinguishable."
+  },
+  "resumed_from": null,
+  "resume_semantics": "rollout-aligned PPO model/optimizer continuation; simulator and process RNG state are re-seeded, so this is crash recovery rather than bit-exact trajectory replay",
+  "env_config": {
+    "road_length": 380.0,
+    "road_width": 10.2,
+    "dt": 0.01,
+    "simulation_frequency": 100,
+    "policy_frequency": 10,
+    "vehicles_count": 55,
+    "neighbors_count": 5,
+    "sensing_range": 90.0,
+    "episode_steps": 30000,
+    "duration": 30000,
+    "terminate_on_collision": true,
+    "gamma_nudge": 0.0,
+    "traffic_model": "mtm",
+    "mtm": {
+      "leader_range": 90.0,
+      "profile_probabilities": {
+        "normal": 0.25,
+        "aggressive": 0.5,
+        "cautious": 0.25
+      },
+      "continuous_driver_aggressiveness": true
+    },
+    "bounds": {
+      "ax_min": -3.0,
+      "ax_max": 3.0,
+      "ay_min": -3.0,
+      "ay_max": 3.0
+    },
+    "ego_controlled": true,
+    "ego_boundary_force": false,
+    "cbf_substep_filtering": true,
+    "cbf_require_initial_safe_set": true,
+    "ppo_append_previous_action": true,
+    "ego_dimensions": [
+      3.5,
+      1.8
+    ],
+    "vehicle_dimensions": [
+      [
+        3.5,
+        1.8
+      ],
+      [
+        3.5,
+        1.8
+      ]
+    ],
+    "placeholder_neighbor": [
+      80.0,
+      10.2,
+      0.0,
+      0.0
+    ],
+    "ego_desired_speed": 16.0,
+    "desired_speed_range": [
+      15.0,
+      25.0
+    ],
+    "initial_speed_fraction_range": [
+      0.55,
+      1.1
+    ],
+    "traffic_safety": {
+      "safe_spawn": true,
+      "spawn_cbf_safe_set": true,
+      "spawn_cbf_eps_side": 0.1,
+      "spawn_cbf_margin_m": 0.0,
+      "spawn_cbf_k1": 3.68,
+      "spawn_cbf_psi_margin": 0.0,
+      "spawn_max_attempts": 1000,
+      "spawn_longitudinal_clearance": 6.0,
+      "spawn_lateral_clearance": 0.35,
+      "spawn_ego_longitudinal_clearance": 18.0,
+      "spawn_ego_lateral_clearance": 0.75,
+      "spawn_time_headway": 0.75,
+      "dynamics_guard": true,
+      "guard_horizon_s": 1.5,
+      "guard_range_m": 120.0,
+      "guard_longitudinal_clearance": 1.5,
+      "guard_lateral_clearance": 0.25,
+      "guard_time_headway": 0.25,
+      "guard_lateral_conflict_range": 12.0,
+      "guard_lateral_yield_acceleration": 3.0
+    },
+    "observation_vmax": 24.0,
+    "observation_vymax": 7.2,
+    "observation_include_vehicle_dimensions": false,
+    "screen_width": 900,
+    "screen_height": 260,
+    "real_time_rendering": true,
+    "show_trajectories": false
+  },
+  "reward_config": {
+    "ego_desired_speed": 16.0,
+    "epsilon_r": 0.4,
+    "wx": 1.0,
+    "wy": 0.65,
+    "wf": 1.0,
+    "collision_penalty": -2.5,
+    "way": 0.0,
+    "jerk_penalty_weight": 0.02,
+    "jerk_scale": 10.0,
+    "overtake_bonus": 0.5,
+    "timegap": 1.5,
+    "progress_reward_weight": 0.05,
+    "progress_clip": 1.25,
+    "progress_distance_scale_m": 2.0,
+    "target_speed_transition_m": 8.0,
+    "target_speed_lateral_transition_m": 0.45,
+    "target_speed_blockage_threshold": 0.55,
+    "target_speed_blockage_transition": 0.15,
+    "expose_target_y": true,
+    "use_current_potential": 1.0,
+    "use_safety_potential": 0.0,
+    "w_safe": 0.0
+  },
+  "elapsed_sec": 2069.4331753,
+  "post_training_evaluation": {
+    "schema_version": 8,
+    "evaluation_kind": "post_training_complete_episodes",
+    "model_path": "C:\\Users\\aha173\\OneDrive - American University of Beirut\\VIP - AGV - ND - Ahmad Assaad 1\\highway-rl-decision-making\\highway-rl-decision-making\\artifacts\\B3_50k_v2\\dfro\\ppo_cbf_diff_reward_only\\seed_307\\model_final.zip",
+    "model_sha256": "b08b4fe3eb33bff07b0338a3936903d409545c3c4ce6d8c4fe109d9fc5858844",
+    "episodes_per_mode": 1,
+    "summary_blocks": 1,
+    "episodes_per_summary_block": 1,
+    "modes": [
+      "raw",
+      "cbf"
+    ],
+    "external_cbf": {
+      "raw": "OFF",
+      "cbf": "ON"
+    },
+    "episode_seed_start": 1100000,
+    "episode_metrics_path": "C:\\Users\\aha173\\OneDrive - American University of Beirut\\VIP - AGV - ND - Ahmad Assaad 1\\highway-rl-decision-making\\highway-rl-decision-making\\artifacts\\B3_50k_v2\\dfro\\ppo_cbf_diff_reward_only\\seed_307\\pe\\e.csv",
+    "collision_event_metrics_path": "C:\\Users\\aha173\\OneDrive - American University of Beirut\\VIP - AGV - ND - Ahmad Assaad 1\\highway-rl-decision-making\\highway-rl-decision-making\\artifacts\\B3_50k_v2\\dfro\\ppo_cbf_diff_reward_only\\seed_307\\pe\\collision_events.csv",
+    "collision_event_rows": 2,
+    "direct_qp_failure_definition": "A collision event is directly associated with a QP failure when the same policy transition reports cbf_qp_success=False. The event log separately records fallback use and substep fallbacks; this is temporal attribution, not a counterfactual proof of physical causation.",
+    "pooled_block_metrics_path": "C:\\Users\\aha173\\OneDrive - American University of Beirut\\VIP - AGV - ND - Ahmad Assaad 1\\highway-rl-decision-making\\highway-rl-decision-making\\artifacts\\B3_50k_v2\\dfro\\ppo_cbf_diff_reward_only\\seed_307\\pe\\b.csv",
+    "kpi_table_path": "C:\\Users\\aha173\\OneDrive - American University of Beirut\\VIP - AGV - ND - Ahmad Assaad 1\\highway-rl-decision-making\\highway-rl-decision-making\\artifacts\\B3_50k_v2\\dfro\\ppo_cbf_diff_reward_only\\seed_307\\pe\\kpi.csv",
+    "study_kpi_table_path": "C:\\Users\\aha173\\OneDrive - American University of Beirut\\VIP - AGV - ND - Ahmad Assaad 1\\highway-rl-decision-making\\highway-rl-decision-making\\artifacts\\B3_50k_v2\\post_train_200ep_kpis.csv",
+    "kpi_aggregation": "Collision and timestep rates are pooled within equal blocks before Mean/SD is calculated; return and episode length are episode means; h_min is the block minimum.",
+    "completion_definition": "distance_completion_rate=1 when capped task distance reaches 1000 m and distinct_ego_collision_events is zero.",
+    "parallel_workers": 1,
+    "complete": true
+  }
+}

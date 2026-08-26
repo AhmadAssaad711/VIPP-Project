@@ -1,0 +1,10 @@
+{
+  "state": "complete",
+  "variant": "ppo_cbf_diff_reward_only",
+  "expected_episodes": 30,
+  "completed_episodes": 30,
+  "workers": 20,
+  "seed_start": 1100000,
+  "elapsed_s": 79.7002003,
+  "updated_at_epoch_s": 1787737795.9571471
+}

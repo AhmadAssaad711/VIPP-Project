@@ -1,0 +1,225 @@
+{
+  "action_contract": {
+    "buffer_action": "latent Gaussian sample z",
+    "cbf_substep_filtering": true,
+    "environment_action": "hard CBF projection P_s(z)",
+    "physics_substeps_per_policy_action": 10,
+    "project_inputs_during_collection": false
+  },
+  "cbf": {
+    "CBF_AX_BOUNDS": [
+      -3.0,
+      3.0
+    ],
+    "CBF_AY_BOUNDS": [
+      -3.0,
+      3.0
+    ],
+    "CBF_EPS_SIDE": 0.1,
+    "CBF_K0": 5.29,
+    "CBF_K1": 3.68,
+    "CBF_MAX_NEIGHBOR_CONSTRAINTS": 12,
+    "CBF_NEIGHBOR_RANGE": 90.0,
+    "CBF_QP_FEASIBILITY_TOL": 0.001,
+    "CBF_TARGET_PAIR_DY": 3.0
+  },
+  "collection_topology": {
+    "backend": "subproc",
+    "n_envs": 8,
+    "start_method": "spawn"
+  },
+  "correction_epsilon": 0.03,
+  "effective_training_settings": {
+    "action_rate_penalty": 0.0,
+    "lambda_critic": 0.0,
+    "lambda_delta": 0.0,
+    "lambda_detached_actor": 0.1,
+    "lambda_intervention": 0.0,
+    "lambda_mean": 0.0,
+    "lambda_sample": 0.0,
+    "safety_critic_cost_clip": 0.0,
+    "safety_critic_gamma": 0.0
+  },
+  "env_config": {
+    "bounds": {
+      "ax_max": 3.0,
+      "ax_min": -3.0,
+      "ay_max": 3.0,
+      "ay_min": -3.0
+    },
+    "cbf_require_initial_safe_set": true,
+    "cbf_substep_filtering": true,
+    "desired_speed_range": [
+      15.0,
+      25.0
+    ],
+    "dt": 0.01,
+    "duration": 30000,
+    "ego_boundary_force": false,
+    "ego_controlled": true,
+    "ego_desired_speed": 16.0,
+    "ego_dimensions": [
+      3.5,
+      1.8
+    ],
+    "episode_steps": 30000,
+    "gamma_nudge": 0.0,
+    "initial_speed_fraction_range": [
+      0.55,
+      1.1
+    ],
+    "mtm": {
+      "continuous_driver_aggressiveness": true,
+      "leader_range": 90.0,
+      "profile_probabilities": {
+        "aggressive": 0.5,
+        "cautious": 0.25,
+        "normal": 0.25
+      }
+    },
+    "neighbors_count": 5,
+    "observation_include_vehicle_dimensions": false,
+    "observation_vmax": 24.0,
+    "observation_vymax": 7.2,
+    "placeholder_neighbor": [
+      80.0,
+      10.2,
+      0.0,
+      0.0
+    ],
+    "policy_frequency": 10,
+    "ppo_append_previous_action": true,
+    "real_time_rendering": true,
+    "road_length": 380.0,
+    "road_width": 10.2,
+    "screen_height": 260,
+    "screen_width": 900,
+    "sensing_range": 90.0,
+    "show_trajectories": false,
+    "simulation_frequency": 100,
+    "terminate_on_collision": true,
+    "traffic_model": "mtm",
+    "traffic_safety": {
+      "dynamics_guard": true,
+      "guard_horizon_s": 1.5,
+      "guard_lateral_clearance": 0.25,
+      "guard_lateral_conflict_range": 12.0,
+      "guard_lateral_yield_acceleration": 3.0,
+      "guard_longitudinal_clearance": 1.5,
+      "guard_range_m": 120.0,
+      "guard_time_headway": 0.25,
+      "safe_spawn": true,
+      "spawn_cbf_eps_side": 0.1,
+      "spawn_cbf_k1": 3.68,
+      "spawn_cbf_margin_m": 0.0,
+      "spawn_cbf_psi_margin": 0.0,
+      "spawn_cbf_safe_set": true,
+      "spawn_ego_lateral_clearance": 0.75,
+      "spawn_ego_longitudinal_clearance": 18.0,
+      "spawn_lateral_clearance": 0.35,
+      "spawn_longitudinal_clearance": 6.0,
+      "spawn_max_attempts": 1000,
+      "spawn_time_headway": 0.75
+    },
+    "vehicle_dimensions": [
+      [
+        3.5,
+        1.8
+      ],
+      [
+        3.5,
+        1.8
+      ]
+    ],
+    "vehicles_count": 55
+  },
+  "model_contract": {
+    "activation": "torch.nn.Tanh",
+    "actor_cbf_gradient_path": "stop_gradient_hard_projection_target",
+    "algorithm_class": "DetachedCBFActorPPO",
+    "base_observation_dim": 32,
+    "base_observation_features": [
+      "dx",
+      "dy",
+      "vx",
+      "vy",
+      "desired_speed"
+    ],
+    "detached_actor_loss_enabled": true,
+    "differentiable_actor_loss_enabled": false,
+    "max_cbf_constraints": 18,
+    "net_arch": {
+      "pi": [
+        256,
+        128
+      ],
+      "vf": [
+        256,
+        128
+      ]
+    },
+    "observation_variant": "target_y_plus_previous_executed_action",
+    "ordinary_value_critic": true,
+    "ordinary_value_target": "reward_shaped_return",
+    "policy_class": "DetachedCBFActorCriticPolicy",
+    "previous_action_semantics": "last_normalized_executed_physics_action",
+    "safety_critic_head": false,
+    "safety_critic_loss_enabled": false
+  },
+  "ppo_config": {
+    "batch_size": 100,
+    "clip_range": 0.2,
+    "ent_coef": 0.005,
+    "gae_lambda": 0.95,
+    "gamma": 0.99,
+    "global_rollout_steps": 1000,
+    "learning_rate": 0.0001,
+    "log_std_init": -0.5,
+    "max_grad_norm": 0.5,
+    "n_envs": 8,
+    "n_epochs": 10,
+    "n_steps": 125,
+    "vf_coef": 0.5
+  },
+  "ppo_config_name": "Q1_stable",
+  "reward_config": {
+    "collision_penalty": -2.5,
+    "ego_desired_speed": 16.0,
+    "epsilon_r": 0.4,
+    "expose_target_y": true,
+    "jerk_penalty_weight": 0.02,
+    "jerk_scale": 10.0,
+    "overtake_bonus": 0.5,
+    "progress_clip": 1.25,
+    "progress_distance_scale_m": 2.0,
+    "progress_reward_weight": 0.05,
+    "target_speed_blockage_threshold": 0.55,
+    "target_speed_blockage_transition": 0.15,
+    "target_speed_lateral_transition_m": 0.45,
+    "target_speed_transition_m": 8.0,
+    "timegap": 1.5,
+    "use_current_potential": 1.0,
+    "use_safety_potential": 0.0,
+    "w_safe": 0.0,
+    "way": 0.0,
+    "wf": 1.0,
+    "wx": 1.0,
+    "wy": 0.65
+  },
+  "schema_version": 8,
+  "tensorboard_run_label": "b2_50k_q1_nd",
+  "timesteps": 50000,
+  "training_implementation_version": 12,
+  "training_seed": 307,
+  "variant": "ppo_cbf_nd_actor_only",
+  "variant_spec": {
+    "detached_actor_loss": true,
+    "differentiable_actor_loss": false,
+    "execution_mode": "cbf",
+    "label": "PPO with non-differentiable detached CBF actor loss only",
+    "level": 2,
+    "projected_mean": false,
+    "reward_penalty": false,
+    "safety_critic": false
+  }
+}

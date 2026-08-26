@@ -1,0 +1,10 @@
+{
+  "state": "complete",
+  "variant": "ppo_cbf_projected_reward_off",
+  "expected_episodes": 30,
+  "completed_episodes": 30,
+  "workers": 20,
+  "seed_start": 1100000,
+  "elapsed_s": 120.08107280000002,
+  "updated_at_epoch_s": 1787738043.8617554
+}

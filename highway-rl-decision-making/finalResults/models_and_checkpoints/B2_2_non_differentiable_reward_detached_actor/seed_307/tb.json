@@ -1,0 +1,14 @@
+{
+  "schema_version": 8,
+  "variant": "ppo_cbf_nd_reward_actor",
+  "training_seed": 307,
+  "log_dir": "C:\\Users\\aha173\\AppData\\Local\\highway_rl_tb\\817805f20a\\ndra_307_5416bbdc3a",
+  "command": "tensorboard --logdir \"C:\\Users\\aha173\\AppData\\Local\\highway_rl_tb\\817805f20a\\ndra_307_5416bbdc3a\"",
+  "new_event_files": [
+    "C:\\Users\\aha173\\AppData\\Local\\highway_rl_tb\\817805f20a\\ndra_307_5416bbdc3a\\train_1\\events.out.tfevents.1787470951.DSP000107027L.1736.0"
+  ],
+  "all_event_files": [
+    "C:\\Users\\aha173\\AppData\\Local\\highway_rl_tb\\817805f20a\\ndra_307_5416bbdc3a\\train_1\\events.out.tfevents.1787470951.DSP000107027L.1736.0"
+  ],
+  "retrain_note": "Stable-Baselines3 creates a new train_N subdirectory for a fresh forced retrain, so TensorBoard histories remain distinguishable."
+}

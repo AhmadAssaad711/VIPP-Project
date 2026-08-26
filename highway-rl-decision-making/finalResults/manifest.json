@@ -1,0 +1,87 @@
+{
+  "package": "finalResults",
+  "created_on": "2026-08-26",
+  "source_root": "artifacts",
+  "training_scope": "50k PPO pilot runs, seed_307",
+  "true_cbf_free_evaluation": {
+    "source": "artifacts/50k_cbf_free_eval_v1",
+    "destination": "evaluation/true_cbf_free",
+    "episodes_per_variant": 200,
+    "cbf_in_environment": false,
+    "cbf_in_policy_path": false,
+    "aggregate_kpis": "evaluation/true_cbf_free/post_train_true_cbf_free_kpis.csv",
+    "episodes": "evaluation/true_cbf_free/episodes_true_cbf_free.csv"
+  },
+  "true_cbf_free_videos": {
+    "destination": "videos/true_cbf_free",
+    "videos_per_variant": 3,
+    "seeds": [1100001, 1100002, 1100003],
+    "video_count": 21,
+    "preview_and_summary_for_each_video": true,
+    "render_fps": 10
+  },
+  "external_cbf_on_off_pilot_reference": {
+    "destination": "evaluation/external_cbf_on_off_pilot",
+    "tables": [
+      "B1_nominal_external_cbf_on_off.csv",
+      "B2_variants_plus_nominal_external_cbf_on_off.csv",
+      "B2_variants_external_cbf_on_off.csv",
+      "B3_1_differentiable_reward_only_external_cbf_on_off.csv",
+      "B3_2_differentiable_reward_actor_external_cbf_on_off.csv",
+      "B3_3_differentiable_actor_only_external_cbf_on_off.csv"
+    ]
+  },
+  "variants": [
+    {
+      "id": "B1_nominal",
+      "source": "artifacts/p50n/ppo_nominal/seed_307",
+      "model": "models_and_checkpoints/B1_nominal/seed_307/model_final.zip",
+      "run_config": "models_and_checkpoints/B1_nominal/seed_307/run_config.json",
+      "checkpoints": [
+        "models_and_checkpoints/B1_nominal/seed_307/checkpoints/rollout_50000_steps.zip"
+      ]
+    },
+    {
+      "id": "B2_1_non_differentiable_reward",
+      "source": "artifacts/B2_50k_q1_stable_307/ppo_cbf_reward/seed_307",
+      "model": "models_and_checkpoints/B2_1_non_differentiable_reward/seed_307/model_final.zip",
+      "run_config": "models_and_checkpoints/B2_1_non_differentiable_reward/seed_307/run_config.json",
+      "checkpoints": []
+    },
+    {
+      "id": "B2_2_non_differentiable_reward_detached_actor",
+      "source": "artifacts/B2_50k_q1_stable_307/ppo_cbf_nd_reward_actor/seed_307",
+      "model": "models_and_checkpoints/B2_2_non_differentiable_reward_detached_actor/seed_307/model_final.zip",
+      "run_config": "models_and_checkpoints/B2_2_non_differentiable_reward_detached_actor/seed_307/run_config.json",
+      "checkpoints": []
+    },
+    {
+      "id": "B2_3_non_differentiable_detached_actor_only",
+      "source": "artifacts/B2_50k_q1_stable_307/ppo_cbf_nd_actor_only/seed_307",
+      "model": "models_and_checkpoints/B2_3_non_differentiable_detached_actor_only/seed_307/model_final.zip",
+      "run_config": "models_and_checkpoints/B2_3_non_differentiable_detached_actor_only/seed_307/run_config.json",
+      "checkpoints": []
+    },
+    {
+      "id": "B3_1_differentiable_reward_only",
+      "source": "artifacts/B3_50k_v2/dfro/ppo_cbf_diff_reward_only/seed_307",
+      "model": "models_and_checkpoints/B3_1_differentiable_reward_only/seed_307/model_final.zip",
+      "run_config": "models_and_checkpoints/B3_1_differentiable_reward_only/seed_307/run_config.json",
+      "checkpoints": []
+    },
+    {
+      "id": "B3_2_differentiable_reward_actor",
+      "source": "artifacts/B3_50k_v2/iao/ppo_cbf_integrated_actor_only/seed_307",
+      "model": "models_and_checkpoints/B3_2_differentiable_reward_actor/seed_307/model_final.zip",
+      "run_config": "models_and_checkpoints/B3_2_differentiable_reward_actor/seed_307/run_config.json",
+      "checkpoints": []
+    },
+    {
+      "id": "B3_3_differentiable_actor_only",
+      "source": "artifacts/B3_50k_v2/dfao/ppo_cbf_projected_reward_off/seed_307",
+      "model": "models_and_checkpoints/B3_3_differentiable_actor_only/seed_307/model_final.zip",
+      "run_config": "models_and_checkpoints/B3_3_differentiable_actor_only/seed_307/run_config.json",
+      "checkpoints": []
+    }
+  ]
+}

@@ -1,0 +1,7 @@
+{
+  "model_file": "model_final.zip",
+  "model_sha256": "d51d5328efb0efb43abf347114f65ea601270dbd8c7bd759641c03161cacdf9b",
+  "num_timesteps": 50000,
+  "schema_version": 3,
+  "training_signature_hash": "14afa5713fe9f9aa5f32625bde149ca6ee7b27db0cd6483fca2e1874a7892f0c"
+}

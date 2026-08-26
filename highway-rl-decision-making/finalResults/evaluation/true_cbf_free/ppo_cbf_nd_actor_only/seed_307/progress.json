@@ -1,0 +1,10 @@
+{
+  "state": "complete",
+  "variant": "ppo_cbf_nd_actor_only",
+  "expected_episodes": 30,
+  "completed_episodes": 30,
+  "workers": 20,
+  "seed_start": 1100000,
+  "elapsed_s": 70.45424590000002,
+  "updated_at_epoch_s": 1787737716.2507205
+}
