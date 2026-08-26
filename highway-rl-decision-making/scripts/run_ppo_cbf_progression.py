@@ -3995,6 +3995,10 @@ def main() -> int:
             "timesteps": int(args.timesteps),
             "collision_penalty": float(reward_config["collision_penalty"]),
             "reward_mode": str(reward_config.get("reward_mode", "reciprocal")),
+            "jerk_penalty_weight": float(
+                reward_config.get("jerk_penalty_weight", 0.02)
+            ),
+            "jerk_scale": float(reward_config.get("jerk_scale", 10.0)),
             "progress_reward_weight": float(
                 reward_config["progress_reward_weight"]
             ),
@@ -4243,6 +4247,10 @@ def main() -> int:
         "correction_epsilon": float(args.correction_epsilon),
         "collision_penalty": float(reward_config["collision_penalty"]),
         "reward_mode": str(reward_config.get("reward_mode", "reciprocal")),
+        "jerk_penalty_weight": float(
+            reward_config.get("jerk_penalty_weight", 0.02)
+        ),
+        "jerk_scale": float(reward_config.get("jerk_scale", 10.0)),
         "progress_reward_weight": float(
             reward_config["progress_reward_weight"]
         ),

@@ -154,7 +154,7 @@ def main() -> int:
     baseline_reward_config = dict(run_config.get("baseline_reward_config", reward_config))
     cbf_reward_config = dict(run_config.get("cbf_reward_config", reward_config))
     use_distance_task = bool(run_config.get("use_distance_task_eval", True))
-    task_distance_m = float(run_config.get("task_distance_m", 1000.0))
+    task_distance_m = float(run_config.get("task_distance_m", 600.0))
     task_max_steps = int(run_config.get("task_max_steps", 1200))
     event_threshold = float(run_config.get("event_threshold", 0.03))
     k0 = float(run_config["k0"])

@@ -769,7 +769,7 @@ def main() -> int:
     reward_config["safety_potential_eps_side"] = float(namespace["CBF_EPS_SIDE"])
 
     event_threshold = float(args.event_threshold if args.event_threshold is not None else run_config.get("event_threshold", 0.03))
-    task_distance_m = float(args.task_distance_m if args.task_distance_m is not None else run_config.get("task_distance_m", 1000.0))
+    task_distance_m = float(args.task_distance_m if args.task_distance_m is not None else run_config.get("task_distance_m", 600.0))
     task_max_steps = int(args.task_max_steps if args.task_max_steps is not None else run_config.get("task_max_steps", 1200))
     k0 = float(namespace["CBF_K0"])
     k1 = float(namespace["CBF_K1"])
