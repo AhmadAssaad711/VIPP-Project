@@ -1,7 +1,8 @@
 param(
     [Parameter(Mandatory = $true)]
     [int]$WaitForPid,
-    [string]$StudyRelativePath = 'artifacts\final_Results\ppo200k_nosafety5'
+    [string]$StudyRelativePath = 'artifacts\final_Results\ppo200k_nosafety5',
+    [string]$SuccessMarkerRelativePath = 'artifacts\final_Results\ppo200k_cbf5\study_success.marker'
 )
 
 $ErrorActionPreference = 'Stop'
@@ -30,6 +31,11 @@ while ($null -ne (Get-Process -Id $WaitForPid -ErrorAction SilentlyContinue)) {
     Start-Sleep -Seconds 15
 }
 
+if (-not (Test-Path -LiteralPath (Join-Path $repo $SuccessMarkerRelativePath))) {
+    Add-Content -LiteralPath $queueLog -Value ("upstream_study_success_marker_missing=" + (Get-Date).ToString('o')) -Encoding UTF8
+    exit 1
+}
+
 Add-Content -LiteralPath $queueLog -Value ("started_at=" + (Get-Date).ToString('o')) -Encoding UTF8
 $stdout = Join-Path $study 'study_stdout.log'
 $stderr = Join-Path $study 'study_stderr.log'
@@ -43,12 +49,6 @@ $pythonArgs = @(
     '--seeds', '307', '308', '309', '310', '311',
     '--variants',
     'ppo_nominal',
-    'ppo_cbf_reward',
-    'ppo_cbf_nd_reward_actor',
-    'ppo_cbf_nd_actor_only',
-    'ppo_cbf_diff_reward_only',
-    'ppo_cbf_integrated_actor_only',
-    'ppo_cbf_projected_reward_off',
     '--ppo-config', 'Q1_stable',
     '--n-steps', '1000',
     '--batch-size', '100',
@@ -72,7 +72,7 @@ $pythonArgs = @(
     '--post-train-eval-seed-start', '1100000',
     '--skip-evaluation',
     '--skip-counterfactual',
-    '--tensorboard-run-label', 'ppo200k_nosafety5',
+    '--tensorboard-run-label', 'ppo200k_nosafety_baseline5',
     '--force-retrain'
 )
 
