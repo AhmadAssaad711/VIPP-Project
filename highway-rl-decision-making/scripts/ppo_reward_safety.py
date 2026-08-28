@@ -9,10 +9,88 @@ workers, without changing the notebook's interactive state.
 
 from __future__ import annotations
 
+import math
 from typing import Any
 
 import gymnasium as gym
 import numpy as np
+
+
+def install_scalar_safe_cbf_geometry(namespace: dict[str, Any]) -> None:
+    """Replace hot scalar CBF geometry ufuncs with equivalent ``math`` calls.
+
+    The Windows worker failures captured by ``PYTHONFAULTHANDLER`` terminate
+    inside the notebook's scalar ``np.sqrt`` call in
+    ``ellipse_radius_along_line``.  These calculations do not require NumPy
+    arrays: they operate on four Python floats.  Keeping them on Python's
+    scalar math path removes that native ufunc from every finite-difference
+    CBF constraint evaluation without changing the ellipse/clearance formula.
+
+    Notebook functions resolve globals through their execution namespace, so
+    replacing these four names also hardens downstream
+    ``centerline_barrier_derivatives`` and ``pairwise_hocbf_constraint`` calls.
+    """
+
+    eps_side_default = float(namespace.get("CBF_EPS_SIDE", 0.10))
+    sqrt_two = math.sqrt(2.0)
+
+    def inflated_ellipse_axes(
+        length: float,
+        width: float,
+        eps_side: float = eps_side_default,
+    ) -> tuple[float, float]:
+        side = eps_side_default if eps_side is None else float(eps_side)
+        a = float(length) / sqrt_two + 2.0 * side
+        b = float(width) / sqrt_two + 2.0 * side
+        return max(float(a), 1e-6), max(float(b), 1e-6)
+
+    def wrap_angle(angle: float) -> float:
+        return float((float(angle) + math.pi) % (2.0 * math.pi) - math.pi)
+
+    def ellipse_radius_along_line(a: float, b: float, delta: float) -> float:
+        cos_delta = math.cos(float(delta))
+        sin_delta = math.sin(float(delta))
+        denom = math.sqrt(
+            (float(b) * cos_delta) ** 2 + (float(a) * sin_delta) ** 2
+        )
+        return float(float(a) * float(b) / max(float(denom), 1e-9))
+
+    def pairwise_centerline_clearance(
+        p: Any,
+        ego: dict[str, float],
+        other: dict[str, float],
+        eps_side: float | None = None,
+    ) -> tuple[float, float, float, float]:
+        px = float(p[0])
+        py = float(p[1])
+        radius = math.hypot(px, py)
+        phi = 0.0 if radius < 1e-9 else math.atan2(py, px)
+        side = eps_side_default if eps_side is None else float(eps_side)
+        a_ego, b_ego = inflated_ellipse_axes(
+            ego["length"], ego["width"], side
+        )
+        a_other, b_other = inflated_ellipse_axes(
+            other["length"], other["width"], side
+        )
+        l_ego = ellipse_radius_along_line(
+            a_ego,
+            b_ego,
+            wrap_angle(phi - float(ego.get("heading", 0.0))),
+        )
+        l_other = ellipse_radius_along_line(
+            a_other,
+            b_other,
+            wrap_angle(phi - float(other.get("heading", 0.0))),
+        )
+        required_distance = l_ego + l_other
+        h = radius - required_distance
+        return float(h), float(radius), float(l_ego), float(l_other)
+
+    namespace["inflated_ellipse_axes"] = inflated_ellipse_axes
+    namespace["_wrap_angle"] = wrap_angle
+    namespace["ellipse_radius_along_line"] = ellipse_radius_along_line
+    namespace["pairwise_centerline_clearance"] = pairwise_centerline_clearance
+    namespace["CBF_SCALAR_GEOMETRY_BACKEND"] = "python_math_v1"
 
 
 def install_cbf_violation_reward(namespace: dict[str, Any]) -> None:
@@ -25,6 +103,7 @@ def install_cbf_violation_reward(namespace: dict[str, Any]) -> None:
     the same reward slot; it is not an additional safety term.
     """
 
+    install_scalar_safe_cbf_geometry(namespace)
     base_reward_wrapper = namespace["KaralakouRewardWrapper"]
 
     class PPOSafetyKaralakouRewardWrapper(base_reward_wrapper):  # type: ignore[misc, valid-type]

@@ -11,6 +11,35 @@ $statusLog = Join-Path $artifactRoot 'ppo200k_resilient_status.log'
 $successMarker = Join-Path $cbfStudy 'study_success.marker'
 $maxAttempts = 6
 $staleSeconds = 600
+$expectedWorkerCount = 20
+$workerStartupGraceSeconds = 180
+$minimumAvailableMemoryMB = 8192
+$maximumCommitPercent = 85.0
+
+# Keep native numerical libraries deterministic and prevent each spawned
+# worker from creating a second thread pool.  The learner is explicitly CPU,
+# so hiding CUDA also avoids loading an unused native runtime in every child.
+$nativeProcessEnvironment = [ordered]@{
+    OMP_NUM_THREADS = '1'
+    OPENBLAS_NUM_THREADS = '1'
+    MKL_NUM_THREADS = '1'
+    NUMEXPR_NUM_THREADS = '1'
+    VECLIB_MAXIMUM_THREADS = '1'
+    TORCH_NUM_THREADS = '1'
+    OMP_DYNAMIC = 'FALSE'
+    MKL_DYNAMIC = 'FALSE'
+    OMP_WAIT_POLICY = 'PASSIVE'
+    KMP_BLOCKTIME = '0'
+    PYTHONFAULTHANDLER = '1'
+    CUDA_VISIBLE_DEVICES = '-1'
+}
+foreach ($entry in $nativeProcessEnvironment.GetEnumerator()) {
+    [Environment]::SetEnvironmentVariable(
+        [string]$entry.Key,
+        [string]$entry.Value,
+        [EnvironmentVariableTarget]::Process
+    )
+}
 
 New-Item -ItemType Directory -Path $artifactRoot -Force | Out-Null
 New-Item -ItemType Directory -Path $logRoot -Force | Out-Null
@@ -22,7 +51,9 @@ if (Test-Path -LiteralPath $successMarker) {
 function Write-Status([string]$Message) {
     $line = (Get-Date).ToString('o') + ' ' + $Message
     Add-Content -LiteralPath $statusLog -Value $line -Encoding UTF8
-    Write-Output $line
+    # Do not emit a success-stream object here.  Invoke-TrackedPython returns a
+    # Boolean, and status strings in that pipeline would make a failed process
+    # look truthy to its caller.
 }
 
 function Get-RunDirectory([string]$StudyRelativePath, [string]$Variant, [int]$Seed) {
@@ -106,6 +137,87 @@ function Stop-ProcessTree([int]$ParentProcessId) {
     return $allIds
 }
 
+function Get-DescendantProcesses([int]$ParentProcessId) {
+    $snapshot = @(Get-CimInstance Win32_Process -ErrorAction SilentlyContinue)
+    $descendantIds = @()
+    $frontier = @($ParentProcessId)
+    while ($frontier.Count -gt 0) {
+        $children = @(
+            $snapshot |
+                Where-Object { $frontier -contains [int]$_.ParentProcessId } |
+                Select-Object -ExpandProperty ProcessId
+        )
+        $newChildren = @(
+            $children | Where-Object {
+                $descendantIds -notcontains [int]$_ -and [int]$_ -ne $PID
+            }
+        )
+        if ($newChildren.Count -eq 0) {
+            break
+        }
+        foreach ($child in $newChildren) {
+            $descendantIds += [int]$child
+        }
+        $frontier = @($newChildren | ForEach-Object { [int]$_ })
+    }
+    return @(
+        $snapshot | Where-Object {
+            $descendantIds -contains [int]$_.ProcessId
+        }
+    )
+}
+
+function Stop-ProcessDescendants([int]$ParentProcessId) {
+    $descendants = @(Get-DescendantProcesses $ParentProcessId)
+    foreach ($processId in ($descendants.ProcessId | Sort-Object -Descending)) {
+        if ([int]$processId -ne $PID) {
+            Stop-Process -Id ([int]$processId) -Force -ErrorAction SilentlyContinue
+        }
+    }
+    return @($descendants.ProcessId)
+}
+
+function Get-SystemHeadroom {
+    $os = Get-CimInstance Win32_OperatingSystem -ErrorAction SilentlyContinue
+    $memory = Get-CimInstance Win32_PerfFormattedData_PerfOS_Memory -ErrorAction SilentlyContinue
+    $availableMB = if ($null -ne $memory -and $null -ne $memory.AvailableMBytes) {
+        [double]$memory.AvailableMBytes
+    } elseif ($null -ne $os -and $null -ne $os.FreePhysicalMemory) {
+        [double]$os.FreePhysicalMemory / 1024.0
+    } else {
+        [double]::PositiveInfinity
+    }
+    $committedBytes = if ($null -ne $memory) { [double]$memory.CommittedBytes } else { 0.0 }
+    $commitLimit = if ($null -ne $memory) { [double]$memory.CommitLimit } else { 0.0 }
+    $commitPercent = if ($commitLimit -gt 0.0) {
+        100.0 * $committedBytes / $commitLimit
+    } else {
+        0.0
+    }
+    return [pscustomobject]@{
+        available_mb = [math]::Round($availableMB, 2)
+        commit_percent = [math]::Round($commitPercent, 2)
+    }
+}
+
+function Wait-ForSystemHeadroom([string]$Label) {
+    while ($true) {
+        $headroom = Get-SystemHeadroom
+        if (
+            [double]$headroom.available_mb -ge $minimumAvailableMemoryMB -and
+            [double]$headroom.commit_percent -lt $maximumCommitPercent
+        ) {
+            return
+        }
+        Write-Status (
+            "waiting_for_memory_headroom label=" + $Label +
+            " available_mb=" + $headroom.available_mb +
+            " commit_percent=" + $headroom.commit_percent
+        )
+        Start-Sleep -Seconds 30
+    }
+}
+
 function New-StudyArguments(
     [string]$StudyRelativePath,
     [string]$Variant,
@@ -180,11 +292,14 @@ function Invoke-TrackedPython(
 ) {
     $stdout = Join-Path $logRoot ($Label + '_stdout.log')
     $stderr = Join-Path $logRoot ($Label + '_stderr.log')
+    Wait-ForSystemHeadroom $Label
     $process = Start-Process -FilePath 'python.exe' -ArgumentList $Arguments -WorkingDirectory $repo `
         -RedirectStandardOutput $stdout -RedirectStandardError $stderr -WindowStyle Hidden -PassThru
     Write-Status ("started label=" + $Label + " pid=" + $process.Id)
+    $processStartedAt = Get-Date
     $completionSeen = $false
     $stale = $false
+    $failureReason = ''
     while ($true) {
         $alive = Get-Process -Id $process.Id -ErrorAction SilentlyContinue
         if ($null -eq $alive) {
@@ -198,26 +313,81 @@ function Invoke-TrackedPython(
             $lastProgress = if (Test-Path -LiteralPath $progressPath) {
                 (Get-Item -LiteralPath $progressPath).LastWriteTime
             } else {
-                $process.StartTime
+                $processStartedAt
+            }
+            # A resumed run has an old CSV from before this process started.
+            # That file is valid evidence of prior progress, but must not cause
+            # the fresh process to be killed immediately.
+            if ($lastProgress -lt $processStartedAt) {
+                $lastProgress = $processStartedAt
             }
             if (((Get-Date) - $lastProgress).TotalSeconds -gt $staleSeconds) {
                 Write-Status ("stale_process label=" + $Label + " pid=" + $process.Id + " last_progress=" + $lastProgress.ToString('o'))
                 Stop-ProcessTree $process.Id | Out-Null
                 $stale = $true
+                $failureReason = 'no_progress'
+                break
+            }
+        }
+        if (-not $completionSeen) {
+            $descendants = @(Get-DescendantProcesses $process.Id)
+            $pythonWorkerCount = @(
+                $descendants | Where-Object { $_.Name -ieq 'python.exe' }
+            ).Count
+            $startupAgeSeconds = ((Get-Date) - $processStartedAt).TotalSeconds
+            if (
+                $startupAgeSeconds -gt $workerStartupGraceSeconds -and
+                $pythonWorkerCount -lt $expectedWorkerCount
+            ) {
+                Write-Status (
+                    "worker_pool_drop label=" + $Label +
+                    " pid=" + $process.Id +
+                    " workers=" + $pythonWorkerCount +
+                    " expected=" + $expectedWorkerCount
+                )
+                Stop-ProcessTree $process.Id | Out-Null
+                $stale = $true
+                $failureReason = 'worker_pool_drop'
                 break
             }
         }
         Start-Sleep -Seconds 30
     }
+    $exitCode = $null
+    try {
+        $process.WaitForExit()
+        $exitCode = $process.ExitCode
+    } catch {}
+    $orphanedIds = @(Stop-ProcessDescendants $process.Id)
+    if ($orphanedIds.Count -gt 0) {
+        Write-Status (
+            "cleaned_orphaned_descendants label=" + $Label +
+            " parent_pid=" + $process.Id +
+            " count=" + $orphanedIds.Count
+        )
+    }
+    $exitCodeText = if ($null -eq $exitCode) { 'unknown' } else { [string]$exitCode }
+    if ($exitCode -eq -1073741819 -or $exitCode -eq 3221225477) {
+        Write-Status (
+            "native_access_violation label=" + $Label +
+            " pid=" + $process.Id +
+            " exit_code=" + $exitCodeText
+        )
+    }
     if ($stale) {
-        return $false
+        Write-Status (
+            "attempt_failed label=" + $Label +
+            " reason=" + $failureReason +
+            " exit_code=" + $exitCodeText
+        )
+        return [bool]$false
     }
     if (Test-RunComplete $RunDirectory) {
-        Write-Status ("completed label=" + $Label)
-        return $true
+        Write-Status ("completed label=" + $Label + " exit_code=" + $exitCodeText)
+        return [bool]$true
     }
-    Write-Status ("exited_without_completion label=" + $Label)
-    return $false
+    Write-Status ("exited_without_completion label=" + $Label + " exit_code=" + $exitCodeText)
+    return [bool]$false
 }
 
 function Invoke-Slot(
@@ -265,6 +435,9 @@ function Invoke-Slot(
             return
         }
         Write-Status ("retrying mode=" + $Mode + " variant=" + $Variant + " seed=" + $Seed + " next_attempt=" + ($attempt + 1))
+        # Let Windows release terminated workers' private pages and handles
+        # before a fresh 20-process pool is created.
+        Start-Sleep -Seconds 15
     }
     throw "Exhausted $maxAttempts attempts for $Mode/$Variant/seed_$Seed; inspect $logRoot"
 }
