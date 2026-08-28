@@ -16,12 +16,17 @@ $workerStartupGraceSeconds = 180
 $minimumAvailableMemoryMB = 8192
 $maximumCommitPercent = 85.0
 
+Add-Type -AssemblyName System.IO.Compression.FileSystem
+
 # Keep native numerical libraries deterministic and prevent each spawned
 # worker from creating a second thread pool.  The learner is explicitly CPU,
 # so hiding CUDA also avoids loading an unused native runtime in every child.
 $nativeProcessEnvironment = [ordered]@{
     OMP_NUM_THREADS = '1'
+    OMP_THREAD_LIMIT = '1'
+    OMP_MAX_ACTIVE_LEVELS = '1'
     OPENBLAS_NUM_THREADS = '1'
+    BLIS_NUM_THREADS = '1'
     MKL_NUM_THREADS = '1'
     NUMEXPR_NUM_THREADS = '1'
     VECLIB_MAXIMUM_THREADS = '1'
@@ -32,6 +37,7 @@ $nativeProcessEnvironment = [ordered]@{
     KMP_BLOCKTIME = '0'
     PYTHONFAULTHANDLER = '1'
     CUDA_VISIBLE_DEVICES = '-1'
+    MPLBACKEND = 'Agg'
 }
 foreach ($entry in $nativeProcessEnvironment.GetEnumerator()) {
     [Environment]::SetEnvironmentVariable(
@@ -60,11 +66,51 @@ function Get-RunDirectory([string]$StudyRelativePath, [string]$Variant, [int]$Se
     return Join-Path (Join-Path (Join-Path $repo $StudyRelativePath) $Variant) ('seed_' + $Seed)
 }
 
+function Test-ZipArchiveReadable([string]$Path) {
+    if (-not (Test-Path -LiteralPath $Path -PathType Leaf)) {
+        return $false
+    }
+    $archive = $null
+    try {
+        $archive = [System.IO.Compression.ZipFile]::OpenRead($Path)
+        return [bool]($archive.Entries.Count -gt 0)
+    } catch {
+        return $false
+    } finally {
+        if ($null -ne $archive) {
+            $archive.Dispose()
+        }
+    }
+}
+
 function Test-RunComplete([string]$RunDirectory) {
-    return (
-        (Test-Path -LiteralPath (Join-Path $RunDirectory 'model_final.zip')) -and
-        (Test-Path -LiteralPath (Join-Path $RunDirectory 'training_complete.json'))
-    )
+    $modelPath = Join-Path $RunDirectory 'model_final.zip'
+    $completionPath = Join-Path $RunDirectory 'training_complete.json'
+    if (
+        -not (Test-Path -LiteralPath $modelPath -PathType Leaf) -or
+        -not (Test-Path -LiteralPath $completionPath -PathType Leaf) -or
+        -not (Test-ZipArchiveReadable $modelPath)
+    ) {
+        return $false
+    }
+    try {
+        $completion = Get-Content -LiteralPath $completionPath -Raw | ConvertFrom-Json
+        if (
+            [string]$completion.model_file -ne 'model_final.zip' -or
+            [int64]$completion.num_timesteps -ne 200000 -or
+            [string]::IsNullOrWhiteSpace([string]$completion.model_sha256)
+        ) {
+            return $false
+        }
+        $observedHash = (Get-FileHash -LiteralPath $modelPath -Algorithm SHA256).Hash
+        return [string]::Equals(
+            [string]$completion.model_sha256,
+            [string]$observedHash,
+            [System.StringComparison]::OrdinalIgnoreCase
+        )
+    } catch {
+        return $false
+    }
 }
 
 function Get-LatestCheckpoint([string]$RunDirectory) {
@@ -75,7 +121,11 @@ function Get-LatestCheckpoint([string]$RunDirectory) {
     $candidates = @()
     foreach ($path in (Get-ChildItem -LiteralPath $checkpointDirectory -Filter 'rollout_*_steps.zip' -File -ErrorAction SilentlyContinue)) {
         if ($path.Name -match '^rollout_(\d+)_steps\.zip$') {
-            $candidates += [pscustomobject]@{ step = [int64]$Matches[1]; path = $path.FullName }
+            if (Test-ZipArchiveReadable $path.FullName) {
+                $candidates += [pscustomobject]@{ step = [int64]$Matches[1]; path = $path.FullName }
+            } else {
+                Write-Status ("ignored_unreadable_checkpoint path=" + $path.FullName)
+            }
         }
     }
     if ($candidates.Count -eq 0) {
@@ -305,7 +355,7 @@ function Invoke-TrackedPython(
         if ($null -eq $alive) {
             break
         }
-        if (Test-RunComplete $RunDirectory) {
+        if (-not $completionSeen -and (Test-RunComplete $RunDirectory)) {
             $completionSeen = $true
         }
         if (-not $completionSeen -or -not $AllowStaleAfterCompletion) {
@@ -406,9 +456,18 @@ function Invoke-Slot(
         if (Test-RunComplete $runDirectory) {
             return
         }
-        $checkpoint = Get-LatestCheckpoint $runDirectory
         $force = $false
-        if (Test-Path -LiteralPath $runDirectory) {
+        $completionArtifactsPresent = (
+            (Test-Path -LiteralPath (Join-Path $runDirectory 'model_final.zip')) -or
+            (Test-Path -LiteralPath (Join-Path $runDirectory 'training_complete.json'))
+        )
+        if ($completionArtifactsPresent) {
+            Write-Status ("invalid_completion_artifacts mode=" + $Mode + " variant=" + $Variant + " seed=" + $Seed)
+            Move-PartialRun $StudyRelativePath $Variant $Seed $(if ($Mode -eq 'cbf') { 'ppo200k_cbf5' } else { 'ppo200k_nosafety5' })
+            $force = $true
+        }
+        $checkpoint = Get-LatestCheckpoint $runDirectory
+        if (-not $force -and (Test-Path -LiteralPath $runDirectory)) {
             if ($null -eq $checkpoint) {
                 Move-PartialRun $StudyRelativePath $Variant $Seed $(if ($Mode -eq 'cbf') { 'ppo200k_cbf5' } else { 'ppo200k_nosafety5' })
                 $force = $true

@@ -4,6 +4,7 @@ import copy
 import hashlib
 import json
 import sys
+import zipfile
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -898,7 +899,9 @@ def test_parallel_topology_changes_checkpoint_identity():
     assert one_env != eight_envs
 
 
-def test_parallel_worker_monitor_paths_fit_the_windows_legacy_limit():
+def test_parallel_worker_monitor_paths_are_local_and_fit_windows_limit(
+    tmp_path, monkeypatch
+):
     run_monitor = (
         PROJECT_ROOT
         / "artifacts"
@@ -907,6 +910,9 @@ def test_parallel_worker_monitor_paths_fit_the_windows_legacy_limit():
         / "seed_307"
         / "training.monitor.csv"
     )
+    local_app_data = tmp_path / "local_app_data"
+    monkeypatch.setattr(progression.os, "name", "nt")
+    monkeypatch.setenv("LOCALAPPDATA", str(local_app_data))
     paths = [
         progression.compact_worker_monitor_path(run_monitor, rank)
         for rank in range(8)
@@ -917,6 +923,29 @@ def test_parallel_worker_monitor_paths_fit_the_windows_legacy_limit():
     ]
     assert len({str(path) for path in paths}) == 8
     assert max(len(str(path)) for path in paths) < 260
+    assert all(local_app_data in path.parents for path in paths)
+
+
+def test_worker_monitors_are_copied_to_the_durable_run_directory(
+    tmp_path, monkeypatch
+):
+    run_monitor = tmp_path / "run" / "training.monitor.csv"
+    local_app_data = tmp_path / "local_app_data"
+    monkeypatch.setattr(progression.os, "name", "nt")
+    monkeypatch.setenv("LOCALAPPDATA", str(local_app_data))
+    expected_payloads = []
+    for rank in range(3):
+        source = progression.compact_worker_monitor_path(run_monitor, rank)
+        source.parent.mkdir(parents=True, exist_ok=True)
+        payload = f"worker-{rank}\n"
+        source.write_text(payload, encoding="utf-8")
+        expected_payloads.append(payload)
+
+    progression.sync_worker_monitor_artifacts(run_monitor, 3)
+
+    for rank, payload in enumerate(expected_payloads):
+        destination = run_monitor.parent / f"m{rank}.monitor.csv"
+        assert destination.read_text(encoding="utf-8") == payload
 
 
 def test_pending_signature_only_artifacts_can_be_retried(tmp_path):
@@ -1027,7 +1056,11 @@ def test_latest_checkpoint_selection_is_timestep_ordered(tmp_path):
     checkpoint_dir = tmp_path / "checkpoints"
     checkpoint_dir.mkdir()
     for step in (1_000, 20_000, 9_000):
-        (checkpoint_dir / f"rollout_{step}_steps.zip").write_bytes(b"checkpoint")
+        with zipfile.ZipFile(
+            checkpoint_dir / f"rollout_{step}_steps.zip", mode="w"
+        ) as archive:
+            archive.writestr("data", f"checkpoint-{step}")
+    (checkpoint_dir / "rollout_30000_steps.zip").write_bytes(b"truncated")
     (checkpoint_dir / "unrelated.zip").write_bytes(b"ignore")
     latest = progression._latest_rollout_checkpoint(tmp_path)
     assert latest is not None

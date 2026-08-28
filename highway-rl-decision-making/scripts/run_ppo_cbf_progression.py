@@ -33,6 +33,7 @@ import re
 import shutil
 import tempfile
 import time
+import zipfile
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from dataclasses import dataclass
 from functools import partial
@@ -44,13 +45,17 @@ from typing import Any, Iterable
 # oversubscribe the machine and freeze the desktop during a long PPO run.
 for _native_thread_key in (
     "OMP_NUM_THREADS",
+    "OMP_THREAD_LIMIT",
+    "OMP_MAX_ACTIVE_LEVELS",
     "OPENBLAS_NUM_THREADS",
+    "BLIS_NUM_THREADS",
     "MKL_NUM_THREADS",
     "NUMEXPR_NUM_THREADS",
     "VECLIB_MAXIMUM_THREADS",
     "TORCH_NUM_THREADS",
 ):
     os.environ.setdefault(_native_thread_key, "1")
+os.environ.setdefault("MPLBACKEND", "Agg")
 
 import gymnasium as gym
 import numpy as np
@@ -933,8 +938,21 @@ def _latest_rollout_checkpoint(run_dir: Path) -> Path | None:
     candidates: list[tuple[int, Path]] = []
     for path in (run_dir / "checkpoints").glob("rollout_*_steps.zip"):
         match = re.search(r"rollout_(\d+)_steps\.zip$", path.name)
-        if match:
+        if not match:
+            continue
+        try:
+            with zipfile.ZipFile(path, mode="r") as archive:
+                valid = bool(archive.infolist()) and archive.testzip() is None
+        except (OSError, zipfile.BadZipFile):
+            valid = False
+        if valid:
             candidates.append((int(match.group(1)), path))
+        else:
+            print(
+                "[ppo-progression] warning: ignoring unreadable rollout "
+                f"checkpoint {path}",
+                flush=True,
+            )
     return max(candidates, default=(0, None), key=lambda item: item[0])[1]
 
 
@@ -1268,20 +1286,61 @@ def _make_ppo_worker_env(
 
 
 def compact_worker_monitor_path(monitor_path: Path, rank: int) -> Path:
-    """Return a short, unique monitor path for a spawned rollout worker.
+    """Return a short, local monitor path for a spawned rollout worker.
 
     The experiment run path is intentionally descriptive.  On Windows, adding
     both ``training_monitors`` and a long per-worker filename can exceed the
-    legacy path limit before a subprocess has even initialized.  Monitor files
-    are internal rollout diagnostics, so keep their names compact while still
-    retaining one distinct file per worker in the variant run directory.
+    legacy path limit before a subprocess has even initialized.  More
+    importantly, the project can live under OneDrive: allowing 20 workers to
+    append continuously to that synchronized tree puts every episode write
+    through filesystem filter drivers.  Keep those high-churn files in local
+    application storage during collection and copy them into the run directory
+    once the vector environment has closed.
     """
 
     if int(rank) < 0:
         raise ValueError("worker rank must be non-negative")
+    runtime_parent = monitor_path.parent
+    if os.name == "nt":
+        local_root = Path(
+            os.environ.get("LOCALAPPDATA") or tempfile.gettempdir()
+        )
+        run_id = hashlib.sha1(
+            str(monitor_path.parent.resolve()).encode("utf-8")
+        ).hexdigest()[:16]
+        runtime_parent = (
+            local_root
+            / "highway_rl_runtime"
+            / "worker_monitors"
+            / run_id
+        )
     # Stable-Baselines3 appends ``.monitor.csv`` unless the supplied filename
     # already ends with that suffix.  Keep the short name final as written.
-    return monitor_path.parent / f"m{int(rank)}.monitor.csv"
+    return runtime_parent / f"m{int(rank)}.monitor.csv"
+
+
+def sync_worker_monitor_artifacts(monitor_path: Path, n_envs: int) -> None:
+    """Copy closed local worker monitors into the durable run directory."""
+
+    if int(n_envs) <= 1:
+        return
+    monitor_path.parent.mkdir(parents=True, exist_ok=True)
+    for rank in range(int(n_envs)):
+        source = compact_worker_monitor_path(monitor_path, rank)
+        destination = monitor_path.parent / f"m{rank}.monitor.csv"
+        try:
+            if source.resolve() == destination.resolve() or not source.exists():
+                continue
+            shutil.copy2(source, destination)
+        except OSError as error:
+            # These CSVs are redundant diagnostics; training_episodes.csv is
+            # the canonical episode record.  Never invalidate a completed
+            # checkpoint because a monitor copy was blocked by a sync client.
+            print(
+                "[ppo-progression] warning: could not archive worker monitor "
+                f"{source}: {error}",
+                flush=True,
+            )
 
 
 def make_training_vec_env(
@@ -1746,6 +1805,10 @@ def train_variant(
             )
     finally:
         train_env.close()
+        sync_worker_monitor_artifacts(
+            run_dir / "training.monitor.csv",
+            int(config["n_envs"]),
+        )
     tensorboard_event_files = _tensorboard_event_files(tensorboard_log_dir)
     tensorboard_new_event_files = [
         path for path in tensorboard_event_files if path not in tensorboard_before

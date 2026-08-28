@@ -27,8 +27,10 @@ def install_scalar_safe_cbf_geometry(namespace: dict[str, Any]) -> None:
     CBF constraint evaluation without changing the ellipse/clearance formula.
 
     Notebook functions resolve globals through their execution namespace, so
-    replacing these four names also hardens downstream
+    replacing these names also hardens downstream
     ``centerline_barrier_derivatives`` and ``pairwise_hocbf_constraint`` calls.
+    The notebook has a second copy of the same ellipse helpers in its KPI
+    wrapper, so those aliases are replaced as well for evaluation workers.
     """
 
     eps_side_default = float(namespace.get("CBF_EPS_SIDE", 0.10))
@@ -86,10 +88,27 @@ def install_scalar_safe_cbf_geometry(namespace: dict[str, Any]) -> None:
         h = radius - required_distance
         return float(h), float(radius), float(l_ego), float(l_other)
 
+    def kpi_default_eps_side(env: gym.Env) -> float:
+        if "CBF_EPS_SIDE" in namespace:
+            return float(namespace["CBF_EPS_SIDE"])
+        base = namespace["_kpi_base_env"](env)
+        config = getattr(base, "config", {})
+        ego_width = float(config.get("ego_dimensions", [3.5, 1.8])[1])
+        social_dims = config.get(
+            "vehicle_dimensions",
+            [[3.5, 1.8], [3.5, 1.8]],
+        )
+        social_width = float(social_dims[0][1]) if social_dims else ego_width
+        return float(max((3.0 - (ego_width + social_width) / sqrt_two) / 4.0, 0.0))
+
     namespace["inflated_ellipse_axes"] = inflated_ellipse_axes
     namespace["_wrap_angle"] = wrap_angle
     namespace["ellipse_radius_along_line"] = ellipse_radius_along_line
     namespace["pairwise_centerline_clearance"] = pairwise_centerline_clearance
+    namespace["_kpi_default_eps_side"] = kpi_default_eps_side
+    namespace["_kpi_inflated_axes"] = inflated_ellipse_axes
+    namespace["_kpi_wrap_angle"] = wrap_angle
+    namespace["_kpi_ellipse_radius"] = ellipse_radius_along_line
     namespace["CBF_SCALAR_GEOMETRY_BACKEND"] = "python_math_v1"
 
 
@@ -331,8 +350,9 @@ def install_cbf_violation_reward(namespace: dict[str, Any]) -> None:
             eps_side = max(float(cfg.get("safety_potential_eps_side", 0.10)), 0.0)
             sensing_range = float(base.config["sensing_range"])
             ego = base.vehicle
-            ego_a = max(float(ego.length) / np.sqrt(2.0) + 2.0 * eps_side, 1e-6)
-            ego_b = max(float(ego.width) / np.sqrt(2.0) + 2.0 * eps_side, 1e-6)
+            sqrt_two = math.sqrt(2.0)
+            ego_a = max(float(ego.length) / sqrt_two + 2.0 * eps_side, 1e-6)
+            ego_b = max(float(ego.width) / sqrt_two + 2.0 * eps_side, 1e-6)
             alpha = float(cfg.get("safety_cbf_alpha", 1.0))
             psi_scale = max(float(cfg.get("safety_cbf_psi_scale", 1.0)), 1e-6)
 
@@ -346,11 +366,11 @@ def install_cbf_violation_reward(namespace: dict[str, Any]) -> None:
                     continue
                 dy = float(vehicle.position[1] - ego.position[1])
                 other_a = max(
-                    float(vehicle.length) / np.sqrt(2.0) + 2.0 * eps_side,
+                    float(vehicle.length) / sqrt_two + 2.0 * eps_side,
                     1e-6,
                 )
                 other_b = max(
-                    float(vehicle.width) / np.sqrt(2.0) + 2.0 * eps_side,
+                    float(vehicle.width) / sqrt_two + 2.0 * eps_side,
                     1e-6,
                 )
                 A = ego_a + other_a
@@ -360,16 +380,15 @@ def install_cbf_violation_reward(namespace: dict[str, Any]) -> None:
                 dvy = float(getattr(vehicle, "vy", 0.0) - getattr(ego, "vy", 0.0))
                 h_dot = 2.0 * dx * dvx / (A**2) + 2.0 * dy * dvy / (B**2)
                 psi_value = h_dot + alpha * h_value
-                risk_value = float(
-                    np.clip(max(0.0, -psi_value / psi_scale), 0.0, 1.0) ** 2
-                )
+                normalized_violation = max(0.0, -psi_value / psi_scale)
+                risk_value = float(min(normalized_violation, 1.0) ** 2)
                 h_values.append(float(h_value))
                 risks.append(risk_value)
 
             if not risks:
                 return 0.0, float("inf"), 0.0, 0.0
             return (
-                float(np.clip(max(risks), 0.0, 1.0)),
+                float(min(max(max(risks), 0.0), 1.0)),
                 float(min(h_values)),
                 0.0,
                 0.0,
