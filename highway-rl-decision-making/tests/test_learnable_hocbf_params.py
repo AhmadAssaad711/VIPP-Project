@@ -56,8 +56,8 @@ def test_dynamic_bounds_use_p1_p2_and_nu1():
         q, h, h_dot, static, dynamic_mask, p, nu
     )
     expected = -2.0 + (2.0 + 3.0) * 0.25 + (2.0 * 3.0 + 0.4) * 1.5
-    assert np.isclose(float(bounds[0, 0]), expected)
-    assert float(bounds[0, 1]) == 7.0
+    assert np.isclose(float(bounds[0, 0].detach()), expected)
+    assert float(bounds[0, 1].detach()) == 7.0
     bounds.sum().backward()
     assert p.grad is not None and bool((p.grad.abs() > 0).any())
     assert nu.grad is not None and float(nu.grad[0, 0].abs()) > 0.0

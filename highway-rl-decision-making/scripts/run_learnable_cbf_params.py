@@ -111,8 +111,12 @@ def make_single_env(
         max_neighbor_constraints=int(namespace["CBF_MAX_NEIGHBOR_CONSTRAINTS"]),
         max_constraints=18,
         project_inputs=False,
-        lambda_delta=0.0,
-        lambda_intervention=0.0,
+        # Preserve the canonical B3.2 PPO reward shaping.  The separate
+        # parameter learner has its own intervention loss; these coefficients
+        # remain part of the driving-policy objective and are identical in the
+        # fixed and learnable arms.
+        lambda_delta=0.05,
+        lambda_intervention=0.10,
         correction_epsilon=0.03,
         action_rate_penalty_lambda=0.0,
     )
@@ -310,12 +314,26 @@ def run_arm(
                         "nu2_upper": float(rollout.nu_upper[step, env_index, 1]),
                         "p1_next": float(rollout.p_next[step, env_index, 0]),
                         "p2_next": float(rollout.p_next[step, env_index, 1]),
+                        "mu_raw_ax": float(rollout.mu_raw[step, env_index, 0]),
+                        "mu_raw_ay": float(rollout.mu_raw[step, env_index, 1]),
+                        "mu_safe_ax": float(rollout.mu_safe[step, env_index, 0]),
+                        "mu_safe_ay": float(rollout.mu_safe[step, env_index, 1]),
+                        "a_raw_ax": float(rollout.latent_raw[step, env_index, 0]),
+                        "a_raw_ay": float(rollout.latent_raw[step, env_index, 1]),
+                        "a_safe_ax": float(rollout.executed[step, env_index, 0]),
+                        "a_safe_ay": float(rollout.executed[step, env_index, 1]),
                         "slack": float(rollout.slack[step, env_index]),
                         "qp_infeasible": bool(rollout.qp_infeasible[step, env_index]),
                         "feasible": bool(rollout.feasible[step, env_index]),
                         "fallback": bool(rollout.fallback[step, env_index]),
                         "p_clipped": bool(rollout.p_clipped[step, env_index]),
                         "correction": float(rollout.correction[step, env_index]),
+                        "sample_correction": float(
+                            np.linalg.norm(
+                                rollout.latent_raw[step, env_index]
+                                - rollout.executed[step, env_index]
+                            )
+                        ),
                         "hocbf_margin": float(rollout.hocbf_margin[step, env_index]),
                         "done": bool(rollout.done[step, env_index]),
                     }
@@ -363,14 +381,34 @@ def main() -> None:
         if args.project_root is not None
         else Path(__file__).resolve().parents[1]
     )
+    if args.init_checkpoint is None:
+        default_checkpoint = (
+            project_root
+            / "artifacts"
+            / "B3_50k_v2"
+            / "iao"
+            / "ppo_cbf_integrated_actor_only"
+            / "seed_307"
+            / "model_final.zip"
+        )
+        if default_checkpoint.is_file():
+            args.init_checkpoint = default_checkpoint
     output_dir = args.output_dir.resolve()
     output_dir.mkdir(parents=True, exist_ok=True)
     namespace = load_notebook_namespace(project_root)
     env_config = learnable_env_config(namespace)
     reward_config = copy.deepcopy(namespace["REWARD_CONFIG"])
     config = LearnableCBFConfig().validate()
-    if float(env_config.get("dt", 0.01)) * int(env_config.get("simulation_frequency", 100)) / max(float(env_config.get("policy_frequency", 20)), 1.0) <= 0.0:
+    env_dt_policy = float(env_config.get("dt", 0.01)) * int(
+        env_config.get("simulation_frequency", 100)
+    ) / max(float(env_config.get("policy_frequency", 20)), 1.0)
+    if env_dt_policy <= 0.0:
         raise RuntimeError("invalid policy timing in environment configuration")
+    if abs(env_dt_policy - float(config.dt_policy)) > 1e-8:
+        raise RuntimeError(
+            "learnable-CBF dt_policy disagrees with the simulator policy step: "
+            f"{config.dt_policy} vs {env_dt_policy}"
+        )
     if args.device == "cuda" and not th.cuda.is_available():
         raise RuntimeError("CUDA was requested but is unavailable")
     manifest = {
@@ -381,6 +419,9 @@ def main() -> None:
         "n_envs": int(args.n_envs),
         "seed": int(args.seed),
         "device": str(args.device),
+        "init_checkpoint": None
+        if args.init_checkpoint is None
+        else str(args.init_checkpoint),
         "baseline": "fixed p1=p2=2.3, nu=0",
         "learnable": "Gamma_psi with H=16 truncated unroll",
     }

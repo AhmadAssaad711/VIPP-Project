@@ -436,7 +436,14 @@ def read_training_metrics_frame(path: Path) -> pd.DataFrame:
     for metric_path in training_metric_paths(Path(path)):
         rows.extend(_valid_training_metric_rows(metric_path))
     frame = pd.DataFrame(rows)
-    key_columns = ["training_seed", "variant", "global_timestep"]
+    # A vectorized callback can finish several environments on the same
+    # learner transition, so global_timestep alone is not a unique episode key.
+    key_columns = [
+        "training_seed",
+        "variant",
+        "global_timestep",
+        "episode_index",
+    ]
     if not frame.empty and set(key_columns).issubset(frame.columns):
         frame = frame.drop_duplicates(subset=key_columns, keep="last")
     return frame
@@ -492,7 +499,13 @@ def materialize_training_metrics(path: Path) -> pd.DataFrame:
     if not rows:
         return pd.DataFrame()
     frame = pd.DataFrame(rows)
-    key_columns = ["training_seed", "variant", "global_timestep"]
+    # Several worker episodes may share one global learner timestep.
+    key_columns = [
+        "training_seed",
+        "variant",
+        "global_timestep",
+        "episode_index",
+    ]
     if set(key_columns).issubset(frame.columns):
         frame = frame.drop_duplicates(subset=key_columns, keep="last")
     if "global_timestep" in frame.columns:

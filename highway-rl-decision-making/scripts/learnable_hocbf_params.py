@@ -656,6 +656,9 @@ class LearnableParameterRollout:
             "fallback_rate": float(np.mean(self.fallback)),
             "p_clipped_rate": float(np.mean(self.p_clipped)),
             "correction_mean": float(np.mean(self.correction)),
+            "sample_correction_mean": float(
+                np.mean(np.linalg.norm(self.latent_raw - self.executed, axis=-1))
+            ),
             "hocbf_margin_mean": float(np.nanmean(self.hocbf_margin)) if np.isfinite(self.hocbf_margin).any() else float("nan"),
             "hocbf_margin_min": float(np.nanmin(self.hocbf_margin)) if np.isfinite(self.hocbf_margin).any() else float("nan"),
         })
@@ -1078,6 +1081,8 @@ class LearnableProjectedCBFPPO(ProjectedCBFPPO):
             # geometry.  Freeze the entire driving policy explicitly while its
             # Gamma graph is reconstructed, making dL_CBF/dtheta=0 by
             # construction rather than only by lack of use.
+            for parameter in self.policy.parameters():
+                parameter.grad = None
             policy_flags = [
                 parameter.requires_grad for parameter in self.policy.parameters()
             ]
@@ -1110,26 +1115,27 @@ def migrate_projected_policy_weights(source_model: Any, target_model: LearnableP
     copied: list[str] = []
     expanded: list[str] = []
     skipped: list[str] = []
-    for key, value in source_state.items():
-        if key not in target_state:
+    with th.no_grad():
+        for key, value in source_state.items():
+            if key not in target_state:
+                skipped.append(key)
+                continue
+            destination = target_state[key]
+            if tuple(destination.shape) == tuple(value.shape):
+                destination.copy_(value.detach().to(destination.device, destination.dtype))
+                copied.append(key)
+                continue
+            if (
+                value.ndim == 2
+                and destination.ndim == 2
+                and destination.shape[0] == value.shape[0]
+                and destination.shape[1] == value.shape[1] + 2
+            ):
+                destination.zero_()
+                destination[:, : value.shape[1]].copy_(value.detach().to(destination.device, destination.dtype))
+                expanded.append(key)
+                continue
             skipped.append(key)
-            continue
-        destination = target_state[key]
-        if tuple(destination.shape) == tuple(value.shape):
-            destination.copy_(value.detach().to(destination.device, destination.dtype))
-            copied.append(key)
-            continue
-        if (
-            value.ndim == 2
-            and destination.ndim == 2
-            and destination.shape[0] == value.shape[0]
-            and destination.shape[1] == value.shape[1] + 2
-        ):
-            destination.zero_()
-            destination[:, : value.shape[1]].copy_(value.detach().to(destination.device, destination.dtype))
-            expanded.append(key)
-            continue
-        skipped.append(key)
     target_model.policy.load_state_dict(target_state, strict=False)
     return {"copied": copied, "expanded": expanded, "skipped": skipped}
 

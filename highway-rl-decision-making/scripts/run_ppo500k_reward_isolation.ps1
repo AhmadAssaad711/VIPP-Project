@@ -26,6 +26,9 @@ $pythonExe = if ($env:HIGHWAY_RL_PYTHON) {
 } else {
     'C:\Program Files\Python39\python.exe'
 }
+if ($studyRoot.Contains(' ')) {
+    throw "Local staging root must not contain spaces because Start-Process passes the short training argv directly: $studyRoot"
+}
 
 $nativeProcessEnvironment = [ordered]@{
     OMP_NUM_THREADS = '1'
@@ -197,7 +200,8 @@ function Get-RunLastProgress([string]$OutputDir, [datetime]$Fallback) {
 function Get-LiveWorkerCount([int]$ParentProcessId) {
     $descendants = @(Get-DescendantProcesses $ParentProcessId)
     $liveWorkers = @($descendants | Where-Object {
-        $_.Name -ieq 'python.exe' -and $_.CommandLine -match 'multiprocessing-fork' -and
+        $_.Name -ieq 'python.exe' -and
+        $_.CommandLine -match 'multiprocessing\.spawn|spawn_main' -and
         $null -ne (Get-Process -Id ([int]$_.ProcessId) -ErrorAction SilentlyContinue)
     })
     return $liveWorkers.Count
@@ -272,7 +276,10 @@ function Sync-VariantFromArchive([string]$Name, [string]$StageOutput) {
     $stageVariant = Join-Path $StageOutput 'ppo_nominal'
     if (-not (Test-Path -LiteralPath $stageVariant -PathType Container)) {
         Write-Status ("restoring_archive_variant name=" + $Name + " source=" + $archiveVariant)
-        Copy-DirectoryContents $archiveVariant $stageVariant
+        # The archive variant already contains the ppo_nominal directory;
+        # restore its contents into the experiment root, not into a second
+        # nested ppo_nominal directory.
+        Copy-DirectoryContents $archiveVariant $StageOutput
     }
 }
 
@@ -318,11 +325,11 @@ import numpy
 import torch
 import stable_baselines3
 print(json.dumps({
-    "python": ".".join(str(x) for x in sys.version_info[:3]),
-    "numpy": numpy.__version__,
-    "torch": torch.__version__,
-    "torch_cuda": torch.version.cuda,
-    "stable_baselines3": md.version("stable-baselines3"),
+    'python': '.'.join(str(x) for x in sys.version_info[:3]),
+    'numpy': numpy.__version__,
+    'torch': torch.__version__,
+    'torch_cuda': torch.version.cuda,
+    'stable_baselines3': md.version('stable-baselines3'),
 }))
 '@
     $runtimeOutput = @(& $pythonExe -c $runtimeProbe 2>&1)
@@ -369,9 +376,9 @@ function New-StudyArguments(
     $arguments = @(
         '-u', 'scripts\run_ppo_cbf_progression.py',
         '--project-root', '.',
-        # Start-Process joins ArgumentList into one Windows command line. Keep
-        # this path quoted so a user-provided staging path with spaces remains one argv.
-        '--output-dir', ('"' + $OutputDir + '"'),
+        # The default staging root has no spaces, so each argv remains literal
+        # and cannot be split by Start-Process command-line reconstruction.
+        '--output-dir', $OutputDir,
         '--run-attempt-id', $AttemptId,
         '--device', 'cpu',
         '--timesteps', ([string]$targetTimesteps),
