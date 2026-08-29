@@ -90,7 +90,7 @@ from train_safety_potential_variants import MTM_CONGESTED_UNCERTAIN_UPDATES
 
 PROGRESSION_SCHEMA_VERSION = 8
 PPO_TRAINING_IMPLEMENTATION_VERSION = 14
-POST_TRAIN_EVALUATION_PROTOCOL_VERSION = 2
+POST_TRAIN_EVALUATION_PROTOCOL_VERSION = 3
 TRAINING_SIGNATURE_FILE = "training_signature.json"
 TRAINING_PENDING_SIGNATURE_FILE = "training_signature.pending.json"
 TRAINING_COMPLETION_FILE = "training_complete.json"
@@ -1831,14 +1831,11 @@ def train_variant(
     )
     checkpoint_dir = run_dir / "checkpoints"
     checkpoint_dir.mkdir(parents=True, exist_ok=True)
-    # The requested OneDrive output path is close to Windows' MAX_PATH limit:
-    # ``rollout_100000_steps.zip`` would be one character too long.  Keep the
-    # historical name where it fits, and use the compact equivalent otherwise.
-    checkpoint_name_prefix = (
-        "r"
-        if len(str(checkpoint_dir / "rollout_100000_steps.zip")) >= 260
-        else "rollout"
-    )
+    # Checkpoints are staged locally and later copied into the durable
+    # OneDrive archive.  The archive path can exceed the legacy Windows limit
+    # even when the staging path is short, so use the compact prefix
+    # unconditionally for every new run.
+    checkpoint_name_prefix = "r"
     checkpoint_callback = CheckpointCallback(
         save_freq=checkpoint_save_freq,
         save_path=str(checkpoint_dir),
@@ -2019,9 +2016,15 @@ def make_evaluation_env(
     task_distance_m: float = DEFAULT_TASK_DISTANCE_M,
     task_max_policy_steps: int = DEFAULT_TASK_MAX_POLICY_STEPS,
 ) -> gym.Env:
+    # The comparison protocol applies the external CBF once per policy
+    # action.  The notebook's source config enables an optional 100 Hz
+    # physics-substep filter, so override that setting only for evaluation;
+    # training still preserves its saved environment/signature contract.
+    evaluation_env_config = copy.deepcopy(env_config)
+    evaluation_env_config["cbf_substep_filtering"] = False
     env = make_ppo_cbf_env(
         namespace,
-        env_config=env_config,
+        env_config=evaluation_env_config,
         reward_config=reward_config,
         project_inputs=mode == "cbf",
         cbf_enabled=mode == "cbf",
@@ -3186,6 +3189,8 @@ def evaluate_post_training_model(
         "evaluation_kind": "post_training_complete_episodes",
         "cbf_off_geometry_bypassed": True,
         "cbf_off_context": "zero_padded_empty_constraint_context",
+        "cbf_policy_rate_only": True,
+        "cbf_evaluation_substep_filtering": False,
         "model_path": str(model_path.resolve()),
         "model_sha256": protocol.file_sha256(model_path),
         **summary_geometry,

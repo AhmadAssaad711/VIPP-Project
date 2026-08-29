@@ -135,6 +135,47 @@ def make_candidates(
     return candidates
 
 
+def select_candidates(
+    requested_pairs: Iterable[Iterable[float]],
+    *,
+    min_c: float = DEFAULT_MIN_C,
+    max_c: float = DEFAULT_MAX_C,
+    step: float = DEFAULT_GRID_STEP,
+) -> list[dict[str, Any]]:
+    """Select exact symmetry-reduced pairs from the canonical grid."""
+
+    all_candidates = make_candidates(min_c=min_c, max_c=max_c, step=step)
+    lookup = {
+        (float(candidate["c1"]), float(candidate["c2"])): candidate
+        for candidate in all_candidates
+    }
+    selected: list[dict[str, Any]] = []
+    seen: set[tuple[float, float]] = set()
+    for raw_pair in requested_pairs:
+        values = list(raw_pair)
+        if len(values) != 2:
+            raise ValueError("Each --pair must contain exactly two values: c1 c2")
+        c1 = _round_grid_value(float(values[0]))
+        c2 = _round_grid_value(float(values[1]))
+        if c1 > c2:
+            raise ValueError(
+                "Each --pair must satisfy c1 <= c2; swapped pairs are identical"
+            )
+        key = (c1, c2)
+        if key in seen:
+            raise ValueError(f"Duplicate requested pair: c1={c1}, c2={c2}")
+        if key not in lookup:
+            raise ValueError(
+                f"Requested pair c1={c1}, c2={c2} is not on the configured "
+                f"grid [{min_c}, {max_c}] with step {step}"
+            )
+        selected.append(lookup[key])
+        seen.add(key)
+    if not selected:
+        raise ValueError("At least one explicit pair is required")
+    return selected
+
+
 def expected_episode_seeds(seed_start: int, episodes: int) -> list[int]:
     """Return one shared seed list used for every candidate."""
 
@@ -245,7 +286,11 @@ def _source_cbf_snapshot(run_config: dict[str, Any]) -> dict[str, Any]:
     return {key: copy.deepcopy(snapshot[key]) for key in required}
 
 
-def evaluation_env_config(run_config: dict[str, Any]) -> dict[str, Any]:
+def evaluation_env_config(
+    run_config: dict[str, Any],
+    *,
+    policy_frequency: float | None = None,
+) -> dict[str, Any]:
     """Keep source spawning but allow candidate-specific psi1 at reset.
 
     ``traffic_safety.spawn_cbf_safe_set`` remains unchanged, so the simulator
@@ -256,6 +301,8 @@ def evaluation_env_config(run_config: dict[str, Any]) -> dict[str, Any]:
 
     env_config = copy.deepcopy(run_config["env_config"])
     env_config["cbf_require_initial_safe_set"] = False
+    if policy_frequency is not None:
+        env_config["policy_frequency"] = float(policy_frequency)
     return env_config
 
 
@@ -509,7 +556,9 @@ def _manifest(
     args: argparse.Namespace,
 ) -> dict[str, Any]:
     source_snapshot = _source_cbf_snapshot(run_config)
-    env_config = evaluation_env_config(run_config)
+    env_config = evaluation_env_config(
+        run_config, policy_frequency=args.policy_frequency
+    )
     reward_config = copy.deepcopy(run_config["reward_config"])
     spawn_gain = (
         env_config.get("traffic_safety", {}).get("spawn_cbf_k1")
@@ -535,6 +584,19 @@ def _manifest(
             "values": sorted({float(candidate["c1"]) for candidate in candidates}),
             "symmetry_reduction": "evaluate only c1 <= c2",
             "candidate_count": int(len(candidates)),
+        },
+        "selection": {
+            "mode": "explicit_pairs" if args.pairs else "full_grid",
+            "pairs": [
+                {
+                    "candidate_id": str(candidate["candidate_id"]),
+                    "c1": float(candidate["c1"]),
+                    "c2": float(candidate["c2"]),
+                    "k1": float(candidate["k1"]),
+                    "k0": float(candidate["k0"]),
+                }
+                for candidate in candidates
+            ],
         },
         "evaluation": {
             "episodes_per_candidate": int(args.episodes),
@@ -830,6 +892,18 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--min-c", type=float, default=DEFAULT_MIN_C)
     parser.add_argument("--max-c", type=float, default=DEFAULT_MAX_C)
     parser.add_argument("--step", type=float, default=DEFAULT_GRID_STEP)
+    parser.add_argument(
+        "--pair",
+        dest="pairs",
+        action="append",
+        nargs=2,
+        type=float,
+        metavar=("C1", "C2"),
+        help=(
+            "Evaluate only this exact grid pair; repeat --pair for multiple "
+            "pairs. Requires c1 <= c2."
+        ),
+    )
     parser.add_argument("--episodes", type=int, default=DEFAULT_EPISODES)
     parser.add_argument("--seed-start", type=int, default=DEFAULT_SEED_START)
     parser.add_argument("--device", default=DEFAULT_DEVICE)
@@ -840,6 +914,12 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="number of independent single-threaded CPU evaluation workers",
     )
     parser.add_argument("--task-distance-m", type=float, default=DEFAULT_TASK_DISTANCE_M)
+    parser.add_argument(
+        "--policy-frequency",
+        type=float,
+        default=None,
+        help="evaluation-only ego policy frequency override in Hz",
+    )
     parser.add_argument(
         "--task-max-policy-steps",
         type=int,
@@ -872,6 +952,15 @@ def _validate_args(args: argparse.Namespace) -> None:
             raise ValueError(f"--{name.replace('_', '-')} must be finite and non-negative")
     if float(args.task_distance_m) <= 0.0:
         raise ValueError("--task-distance-m must be positive")
+    if args.policy_frequency is not None:
+        if not np.isfinite(float(args.policy_frequency)) or float(args.policy_frequency) <= 0.0:
+            raise ValueError("--policy-frequency must be finite and positive")
+    if args.pairs:
+        for pair in args.pairs:
+            if len(pair) != 2 or not np.all(np.isfinite(np.asarray(pair, dtype=float))):
+                raise ValueError("Each --pair must contain two finite values")
+            if float(pair[0]) < 0.0 or float(pair[1]) < 0.0:
+                raise ValueError("Explicit c1/c2 pairs must be non-negative")
 
 
 def _load_existing_rows(
@@ -952,7 +1041,16 @@ def main(argv: list[str] | None = None) -> int:
         pass
     args = parse_args(argv)
     _validate_args(args)
-    candidates = make_candidates(args.min_c, args.max_c, args.step)
+    candidates = (
+        select_candidates(
+            args.pairs,
+            min_c=args.min_c,
+            max_c=args.max_c,
+            step=args.step,
+        )
+        if args.pairs
+        else make_candidates(args.min_c, args.max_c, args.step)
+    )
     episode_seeds = expected_episode_seeds(args.seed_start, args.episodes)
     project_root = protocol.find_project_root(
         args.project_root or Path(__file__).resolve().parents[1]
@@ -1044,7 +1142,9 @@ def main(argv: list[str] | None = None) -> int:
     if int(args.workers) > 1:
         try:
             source_snapshot = _source_cbf_snapshot(run_config)
-            env_config = evaluation_env_config(run_config)
+            env_config = evaluation_env_config(
+                run_config, policy_frequency=args.policy_frequency
+            )
             reward_config = copy.deepcopy(run_config["reward_config"])
             eval_args = evaluation_args(args)
             return _run_parallel_sweep(
@@ -1087,7 +1187,9 @@ def main(argv: list[str] | None = None) -> int:
         )
         namespace["DEVICE"] = str(args.device)
         source_snapshot = _source_cbf_snapshot(run_config)
-        env_config = evaluation_env_config(run_config)
+        env_config = evaluation_env_config(
+            run_config, policy_frequency=args.policy_frequency
+        )
         reward_config = copy.deepcopy(run_config["reward_config"])
         eval_args = evaluation_args(args)
         print(f"[stage1] loading policy on {args.device}: {model_path}", flush=True)

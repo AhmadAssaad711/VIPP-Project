@@ -8,7 +8,8 @@ $stageStudyRoot = if ($env:HIGHWAY_RL_STAGE_ROOT) {
     'C:\agv_runs\ppo500k_reward_isolation'
 }
 $studyRoot = $stageStudyRoot
-$sessionId = (Get-Date).ToString('yyyyMMdd_HHmmss') + '_' + $PID
+$supervisorProcessId = [System.Diagnostics.Process]::GetCurrentProcess().Id
+$sessionId = (Get-Date).ToString('yyyyMMdd_HHmmss') + '_' + $supervisorProcessId
 $logRoot = Join-Path $studyRoot ('_runlogs\' + $sessionId)
 $statusLog = Join-Path $studyRoot 'study_status.log'
 $targetTimesteps = 500000
@@ -20,7 +21,7 @@ $minimumAvailableMemoryMB = 8192
 $maximumCommitPercent = 85.0
 $maxAttempts = 6
 $staleSeconds = 900
-$requiredEvaluationProtocolVersion = 2
+$requiredEvaluationProtocolVersion = 3
 $pythonExe = if ($env:HIGHWAY_RL_PYTHON) {
     [IO.Path]::GetFullPath($env:HIGHWAY_RL_PYTHON)
 } else {
@@ -45,6 +46,8 @@ $nativeProcessEnvironment = [ordered]@{
     OMP_WAIT_POLICY = 'PASSIVE'
     KMP_BLOCKTIME = '0'
     PYTHONFAULTHANDLER = '1'
+    PYTHONDONTWRITEBYTECODE = '1'
+    PYTHONUNBUFFERED = '1'
     CUDA_VISIBLE_DEVICES = '-1'
     MPLBACKEND = 'Agg'
 }
@@ -189,7 +192,8 @@ function Get-RunLastProgress([string]$OutputDir, [datetime]$Fallback) {
         return $Fallback
     }
     $files = @(Get-ChildItem -LiteralPath $runDir -Recurse -File -ErrorAction SilentlyContinue | Where-Object {
-        $_.Name -match '^(training_progress.*\.json|training_episodes.*\.csv|r_.*_steps\.zip|model_final\.zip|training_complete\.json)$'
+        $_.LastWriteTime -ge $Fallback -and
+        $_.Name -match '^(training_progress.*\.json|training_episodes.*\.csv|r_.*_steps\.zip|model_final\.zip|training_complete\.json|progress\.json|m\.json|post_train_200ep_kpis\.csv)$'
     })
     if ($files.Count -eq 0) {
         return $Fallback
@@ -248,6 +252,8 @@ function Test-EvaluationComplete([string]$OutputDir) {
         return ([bool]$manifest.complete -and
             [int]$manifest.evaluation_protocol_version -ge $requiredEvaluationProtocolVersion -and
             [bool]$manifest.cbf_off_geometry_bypassed -and
+            [bool]$manifest.cbf_policy_rate_only -and
+            -not [bool]$manifest.cbf_evaluation_substep_filtering -and
             (Get-Item -LiteralPath $summaryPath).Length -gt 0)
     } catch {
         return $false
@@ -262,6 +268,19 @@ function Copy-DirectoryContents([string]$Source, [string]$Destination) {
     foreach ($item in @(Get-ChildItem -LiteralPath $Source -Force)) {
         $target = Join-Path $Destination $item.Name
         Copy-Item -LiteralPath $item.FullName -Destination $target -Recurse -Force
+    }
+}
+
+function Ensure-CompactCheckpoints([string]$OutputDir) {
+    $checkpointDir = Join-Path (Get-RunDirectory $OutputDir) 'checkpoints'
+    if (-not (Test-Path -LiteralPath $checkpointDir -PathType Container)) {
+        return
+    }
+    foreach ($source in @(Get-ChildItem -LiteralPath $checkpointDir -File -Filter 'rollout_*_steps.zip' -ErrorAction SilentlyContinue)) {
+        $target = Join-Path $checkpointDir ($source.Name -replace '^rollout_', 'r_')
+        if (-not (Test-Path -LiteralPath $target -PathType Leaf)) {
+            Move-Item -LiteralPath $source.FullName -Destination $target
+        }
     }
 }
 
@@ -280,6 +299,7 @@ function Sync-VariantFromArchive([string]$Name, [string]$StageOutput) {
         # restore its contents into the experiment root, not into a second
         # nested ppo_nominal directory.
         Copy-DirectoryContents $archiveVariant $StageOutput
+        Ensure-CompactCheckpoints $StageOutput
     }
 }
 
@@ -287,6 +307,7 @@ function Publish-Variant([string]$Name, [string]$StageOutput) {
     if (-not (Test-RunComplete $StageOutput) -or -not (Test-EvaluationComplete $StageOutput)) {
         throw "Refusing to archive incomplete variant $Name"
     }
+    Ensure-CompactCheckpoints $StageOutput
     $archiveVariant = Join-Path $archiveStudyRoot $Name
     Copy-DirectoryContents (Join-Path $StageOutput 'ppo_nominal') $archiveVariant
     $archiveSummary = Join-Path $archiveStudyRoot 'post_train_200ep_kpis.csv'
@@ -430,14 +451,24 @@ function New-StudyArguments(
 function Invoke-TrackedPython(
     [string]$Label,
     [string[]]$Arguments,
-    [string]$OutputDir
+    [string]$OutputDir,
+    [ValidateSet('training', 'evaluation')]
+    [string]$CompletionKind = 'training'
 ) {
     $stdout = Join-Path $logRoot ($Label + '_stdout.log')
     $stderr = Join-Path $logRoot ($Label + '_stderr.log')
     $resultPath = Join-Path $logRoot ($Label + '_result.json')
+    $exitCapturePath = Join-Path $logRoot ($Label + '_exit.json')
     Wait-ForSystemHeadroom $Label
     Write-Status ("launching label=" + $Label + " python=" + $pythonExe + " output=" + $OutputDir)
-    $process = Start-Process -FilePath $pythonExe -ArgumentList $Arguments -WorkingDirectory $repo -RedirectStandardOutput $stdout -RedirectStandardError $stderr -WindowStyle Hidden -PassThru
+    $relayArguments = @(
+        '-u',
+        'scripts\supervise_python_process.py',
+        '--exit-code-path',
+        $exitCapturePath,
+        '--'
+    ) + $Arguments
+    $process = Start-Process -FilePath $pythonExe -ArgumentList $relayArguments -WorkingDirectory $repo -RedirectStandardOutput $stdout -RedirectStandardError $stderr -WindowStyle Hidden -PassThru
     $processId = [int]$process.Id
     Write-Status ("started label=" + $Label + " pid=" + $processId)
     $processStartedAt = Get-Date
@@ -448,8 +479,16 @@ function Invoke-TrackedPython(
     $lastResourceLogAt = [datetime]::MinValue
     $exitCode = $null
     while ($true) {
-        $alive = Get-Process -Id $processId -ErrorAction SilentlyContinue
-        if ($null -eq $alive) {
+        $hasExited = $null
+        try {
+            # Read the Process object while its OS handle is still owned by
+            # this supervisor; a later Get-Process lookup can miss a fast
+            # natural exit and incorrectly produce exit_code=unknown.
+            $hasExited = [bool]$process.HasExited
+        } catch {
+            $hasExited = $null
+        }
+        if ($hasExited -eq $true) {
             try {
                 $process.Refresh()
                 $exitCode = $process.ExitCode
@@ -458,9 +497,17 @@ function Invoke-TrackedPython(
             }
             break
         }
-        if (-not $completionSeen -and (Test-RunComplete $OutputDir)) {
+        if ($null -eq $hasExited -and $null -eq (Get-Process -Id $processId -ErrorAction SilentlyContinue)) {
+            break
+        }
+        $completed = if ($CompletionKind -eq 'evaluation') {
+            Test-EvaluationComplete $OutputDir
+        } else {
+            Test-RunComplete $OutputDir
+        }
+        if (-not $completionSeen -and $completed) {
             $completionSeen = $true
-            Write-Status ("training_completion_seen label=" + $Label + " pid=" + $processId)
+            Write-Status (($CompletionKind + "_completion_seen label=") + $Label + " pid=" + $processId)
         }
         if (-not $completionSeen) {
             $lastProgress = Get-RunLastProgress $OutputDir $processStartedAt
@@ -519,6 +566,17 @@ function Invoke-TrackedPython(
             $exitCode = $null
         }
     }
+    if ($null -eq $exitCode -and (Test-Path -LiteralPath $exitCapturePath -PathType Leaf)) {
+        try {
+            $capturedExit = Get-Content -LiteralPath $exitCapturePath -Raw | ConvertFrom-Json
+            if ($null -ne $capturedExit.exit_code) {
+                $exitCode = [int]$capturedExit.exit_code
+            }
+        } catch {
+            # Preserve the final stderr and unknown status if the relay was
+            # terminated before its atomic sentinel became readable.
+        }
+    }
     Stop-ProcessDescendants $processId
     $exitCodeText = if ($null -eq $exitCode) { 'unknown' } else { [string]$exitCode }
     $stderrTail = Get-LogTail $stderr
@@ -533,6 +591,7 @@ function Invoke-TrackedPython(
         output_dir = $OutputDir
         stdout_path = $stdout
         stderr_path = $stderr
+        exit_capture_path = $exitCapturePath
         stdout_tail = $stdoutTail
         stderr_tail = $stderrTail
         finished_at = (Get-Date).ToString('o')
@@ -542,7 +601,12 @@ function Invoke-TrackedPython(
         Write-Status ("attempt_failed label=" + $Label + " reason=" + $failureReason + " exit_code=" + $exitCodeText + " stderr_tail=" + $stderrTail)
         return [bool]$false
     }
-    if (Test-RunComplete $OutputDir) {
+    $completed = if ($CompletionKind -eq 'evaluation') {
+        Test-EvaluationComplete $OutputDir
+    } else {
+        Test-RunComplete $OutputDir
+    }
+    if ($completed) {
         Write-Status ("completed label=" + $Label + " exit_code=" + $exitCodeText)
         return [bool]$true
     }
@@ -566,7 +630,7 @@ function Invoke-RewardVariant(
             $attemptId = $Name + '_train_a' + $attempt + '_' + $sessionId
             $label = $Name + '_train_attempt' + $attempt
             $arguments = New-StudyArguments $OutputDir $RewardVariant $false $attemptId
-            $succeeded = Invoke-TrackedPython $label $arguments $OutputDir
+            $succeeded = Invoke-TrackedPython $label $arguments $OutputDir 'training'
             if (-not $succeeded) {
                 if ($attempt -eq $maxAttempts) {
                     throw "Exhausted training attempts for reward variant $Name"
@@ -580,7 +644,7 @@ function Invoke-RewardVariant(
             $attemptId = $Name + '_eval_a' + $attempt + '_' + $sessionId
             $label = $Name + '_evaluation_attempt' + $attempt
             $arguments = New-StudyArguments $OutputDir $RewardVariant $true $attemptId
-            $evalSucceeded = Invoke-TrackedPython $label $arguments $OutputDir
+            $evalSucceeded = Invoke-TrackedPython $label $arguments $OutputDir 'evaluation'
             if (-not $evalSucceeded -or -not (Test-EvaluationComplete $OutputDir)) {
                 if ($attempt -eq $maxAttempts) {
                     throw "Exhausted evaluation attempts for reward variant $Name"
@@ -632,6 +696,8 @@ $studySpec = [ordered]@{
     evaluation_episodes_per_mode = 200
     evaluation_workers = 20
     evaluation_seed_start = 1200000
+    evaluation_protocol_version = 3
+    cbf_evaluation_frequency = 'policy_rate_only'
     action_side_cbf_during_training = $false
     cbf_off_geometry_bypassed = $true
     shared_settings = @{
