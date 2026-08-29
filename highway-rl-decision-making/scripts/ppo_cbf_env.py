@@ -67,6 +67,7 @@ class CBFContextPhysicalActionWrapper(gym.Wrapper):
         base_observation_dim: Optional[int] = None,
         max_constraints: int = 18,
         project_inputs: bool = False,
+        cbf_enabled: bool = True,
         lambda_delta: float = 0.0,
         lambda_intervention: float = 0.0,
         correction_epsilon: float = 0.03,
@@ -107,6 +108,11 @@ class CBFContextPhysicalActionWrapper(gym.Wrapper):
                 f"CBF context capacity {self.layout.max_constraints} is below required {required_capacity}"
             )
         self.project_inputs = bool(project_inputs)
+        # ``False`` is a genuine no-CBF mode.  The wrapper retains the padded
+        # observation contract needed by policies trained with the shared
+        # interface, but it never asks the notebook for ego/neighbour geometry
+        # and emits an empty (all-mask-zero) context instead.
+        self.cbf_enabled = bool(cbf_enabled)
         self.lambda_delta = float(lambda_delta)
         self.lambda_intervention = float(lambda_intervention)
         self.correction_epsilon = float(correction_epsilon)
@@ -150,7 +156,31 @@ class CBFContextPhysicalActionWrapper(gym.Wrapper):
     def physical_high(self) -> np.ndarray:
         return np.asarray(self.action_space.high, dtype=np.float32)
 
+    def _disabled_constraint_system(self) -> dict[str, Any]:
+        """Return a geometry-free placeholder with the stable CBF schema."""
+
+        rows = np.zeros((0, 2), dtype=np.float32)
+        bounds = np.zeros(0, dtype=np.float32)
+        return {
+            "rows": rows,
+            "bounds": bounds,
+            "cbf_rows": rows.copy(),
+            "cbf_bounds": bounds.copy(),
+            "lb": self.physical_low.copy(),
+            "ub": self.physical_high.copy(),
+            "min_h": np.nan,
+            "min_center_distance": np.nan,
+            "min_required_distance": np.nan,
+            "num_neighbor_constraints": 0,
+            "left_boundary_h": np.nan,
+            "right_boundary_h": np.nan,
+            "min_boundary_h": np.nan,
+            "hash": constraint_system_hash(rows, bounds),
+        }
+
     def _constraint_system(self) -> dict[str, Any]:
+        if not self.cbf_enabled:
+            return self._disabled_constraint_system()
         ego = self.namespace["get_ego_state"](self)
         neighbors = self.namespace["get_neighbor_states"](
             self, neighbor_range=self.neighbor_range
@@ -196,6 +226,9 @@ class CBFContextPhysicalActionWrapper(gym.Wrapper):
         return copy.deepcopy(self._last_system)
 
     def project_current_action(self, raw_action: Any) -> tuple[np.ndarray, dict[str, Any]]:
+        if not self.cbf_enabled:
+            system = self.current_constraint_system()
+            return self._box_record(raw_action, system)
         system = self.current_constraint_system()
         result = project_polytope_2d_numpy(
             raw_action,
@@ -324,6 +357,13 @@ class CBFContextPhysicalActionWrapper(gym.Wrapper):
 
     def _initial_safety_diagnostics(self) -> dict[str, Any]:
         """Check h >= 0 and psi_1 = h_dot + k1 h >= 0 at reset."""
+
+        if not self.cbf_enabled:
+            return {
+                "cbf_initial_min_h": np.nan,
+                "cbf_initial_min_psi": np.nan,
+                "cbf_initial_safe_set": False,
+            }
 
         ego = self.namespace["get_ego_state"](self)
         neighbors = self.namespace["get_neighbor_states"](
@@ -511,30 +551,32 @@ class CBFContextPhysicalActionWrapper(gym.Wrapper):
         info = dict(info)
         initial_safety = self._initial_safety_diagnostics()
         info.update(initial_safety)
-        base = self.namespace["_lane_free_base"](self)
-        traffic_safety = base.config.get("traffic_safety", {})
-        # An explicit top-level setting is authoritative.  This lets an
-        # evaluation protocol retain the source run's CBF-safe spawn sampler
-        # (and therefore paired initial states) while allowing a deployment
-        # gain sweep to inspect candidates whose psi_1 condition is not
-        # satisfied at reset.  When the top-level key is absent, preserve the
-        # historical inference from the traffic safe-spawn configuration.
-        configured_initial_safe = base.config.get("cbf_require_initial_safe_set")
-        if configured_initial_safe is None:
-            require_initial_safe = bool(
-                isinstance(traffic_safety, dict)
-                and traffic_safety.get("spawn_cbf_safe_set", False)
-            )
-        else:
-            require_initial_safe = bool(configured_initial_safe)
-        if require_initial_safe and not bool(initial_safety["cbf_initial_safe_set"]):
-            raise RuntimeError(
-                "CBF reset violated h >= 0 or psi_1 >= 0: "
-                f"min_h={initial_safety['cbf_initial_min_h']:.6f}, "
-                f"min_psi={initial_safety['cbf_initial_min_psi']:.6f}"
-            )
+        if self.cbf_enabled:
+            base = self.namespace["_lane_free_base"](self)
+            traffic_safety = base.config.get("traffic_safety", {})
+            # An explicit top-level setting is authoritative.  This lets an
+            # evaluation protocol retain the source run's CBF-safe spawn sampler
+            # (and therefore paired initial states) while allowing a deployment
+            # gain sweep to inspect candidates whose psi_1 condition is not
+            # satisfied at reset.  When the top-level key is absent, preserve the
+            # historical inference from the traffic safe-spawn configuration.
+            configured_initial_safe = base.config.get("cbf_require_initial_safe_set")
+            if configured_initial_safe is None:
+                require_initial_safe = bool(
+                    isinstance(traffic_safety, dict)
+                    and traffic_safety.get("spawn_cbf_safe_set", False)
+                )
+            else:
+                require_initial_safe = bool(configured_initial_safe)
+            if require_initial_safe and not bool(initial_safety["cbf_initial_safe_set"]):
+                raise RuntimeError(
+                    "CBF reset violated h >= 0 or psi_1 >= 0: "
+                    f"min_h={initial_safety['cbf_initial_min_h']:.6f}, "
+                    f"min_psi={initial_safety['cbf_initial_min_psi']:.6f}"
+                )
         info["cbf_constraint_hash"] = str(system["hash"])
         info["cbf_constraint_count"] = int(system["rows"].shape[0])
+        info["cbf_enabled"] = bool(self.cbf_enabled)
         return self._augment_observation(observation, system), info
 
     def _box_record(self, action: Any, system: dict[str, Any]) -> dict[str, Any]:
@@ -575,9 +617,9 @@ class CBFContextPhysicalActionWrapper(gym.Wrapper):
             dtype=np.float32,
         ).reshape(-1)[:2]
         substep_records: list[dict[str, Any]] = []
-        base = self.namespace["_lane_free_base"](self)
         previous_filter = None
         if use_substep_filter:
+            base = self.namespace["_lane_free_base"](self)
             def _filter_substep(
                 proposed_physical_action: np.ndarray, _frame_index: int
             ) -> tuple[np.ndarray, dict[str, Any]]:
@@ -633,6 +675,7 @@ class CBFContextPhysicalActionWrapper(gym.Wrapper):
                 "intervention": bool(record["intervened"]),
                 "cbf_event_intervened": bool(record["intervened"]),
                 "cbf_event_intervention_threshold": float(self.correction_epsilon),
+                "cbf_enabled": bool(self.cbf_enabled),
                 "cbf_a_rl_x": float(raw[0]),
                 "cbf_a_rl_y": float(raw[1]),
                 "cbf_a_safe_x": float(safe[0]),

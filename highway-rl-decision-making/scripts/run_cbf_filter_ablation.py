@@ -24,6 +24,7 @@ import argparse
 import csv
 import copy
 import hashlib
+import io
 import importlib.metadata
 import json
 import os
@@ -360,6 +361,159 @@ class ProtocolMetricsWrapper(gym.Wrapper):
         return obs, reward, terminated, truncated, info
 
 
+def _safe_training_attempt_id(attempt_id: Any) -> str:
+    """Return a filename-safe attempt identifier."""
+
+    value = str(attempt_id or "").strip()
+    if not value:
+        return ""
+    value = "".join(
+        character if character.isalnum() or character in {"-", "_"} else "_"
+        for character in value
+    ).strip("._")
+    return value[:80]
+
+
+def attempt_training_metrics_path(path: Path, attempt_id: Any) -> Path:
+    """Map the canonical training CSV to an isolated retry CSV."""
+
+    canonical = Path(path)
+    safe_id = _safe_training_attempt_id(attempt_id)
+    if not safe_id:
+        return canonical
+    return canonical.with_name(
+        f"{canonical.stem}.attempt_{safe_id}{canonical.suffix}"
+    )
+
+
+def _valid_training_metric_rows(path: Path) -> list[dict[str, Any]]:
+    """Read only complete CSV rows, tolerating NUL-corrupted old files."""
+
+    path = Path(path)
+    if not path.is_file():
+        return []
+    try:
+        payload = path.read_bytes().replace(b"\x00", b"")
+        text = payload.decode("utf-8", errors="replace")
+        reader = csv.DictReader(io.StringIO(text))
+        rows: list[dict[str, Any]] = []
+        for row in reader:
+            if not row or not any(value not in (None, "") for value in row.values()):
+                continue
+            try:
+                global_timestep = float(row.get("global_timestep", "nan"))
+                episode_index = float(row.get("episode_index", "nan"))
+            except (TypeError, ValueError):
+                continue
+            if not np.isfinite(global_timestep) or not np.isfinite(episode_index):
+                continue
+            rows.append(dict(row))
+        return rows
+    except (OSError, UnicodeError, csv.Error):
+        return []
+
+
+def training_metric_paths(path: Path) -> list[Path]:
+    """Return canonical plus all attempt-specific metric files."""
+
+    canonical = Path(path)
+    candidates = [canonical]
+    if canonical.parent.exists():
+        candidates.extend(
+            sorted(
+                canonical.parent.glob(
+                    f"{canonical.stem}.attempt_*{canonical.suffix}"
+                )
+            )
+        )
+    return list(dict.fromkeys(candidates))
+
+
+def read_training_metrics_frame(path: Path) -> pd.DataFrame:
+    """Load valid rows from canonical and retry-specific metric files."""
+
+    rows: list[dict[str, Any]] = []
+    for metric_path in training_metric_paths(Path(path)):
+        rows.extend(_valid_training_metric_rows(metric_path))
+    frame = pd.DataFrame(rows)
+    key_columns = ["training_seed", "variant", "global_timestep"]
+    if not frame.empty and set(key_columns).issubset(frame.columns):
+        frame = frame.drop_duplicates(subset=key_columns, keep="last")
+    return frame
+
+
+def _atomic_write_training_csv(
+    path: Path, *, fieldnames: tuple[str, ...], rows: list[dict[str, Any]]
+) -> None:
+    """Rewrite one metric file atomically, with a short retry for sync locks."""
+
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    buffer = io.StringIO(newline="")
+    writer = csv.DictWriter(buffer, fieldnames=fieldnames)
+    writer.writeheader()
+    for row in rows:
+        writer.writerow({key: row.get(key, np.nan) for key in fieldnames})
+    temporary = path.with_name(
+        f".{path.name}.{os.getpid()}.{time.time_ns()}.tmp"
+    )
+    try:
+        with temporary.open("w", newline="", encoding="utf-8") as handle:
+            handle.write(buffer.getvalue())
+            handle.flush()
+            os.fsync(handle.fileno())
+        last_error: OSError | None = None
+        for retry in range(6):
+            try:
+                os.replace(temporary, path)
+                last_error = None
+                break
+            except OSError as error:
+                last_error = error
+                if retry >= 5:
+                    raise
+                time.sleep(0.05 * (retry + 1))
+        if last_error is not None:
+            raise last_error
+    finally:
+        try:
+            temporary.unlink(missing_ok=True)
+        except OSError:
+            pass
+
+
+def materialize_training_metrics(path: Path) -> pd.DataFrame:
+    """Publish a deduplicated canonical CSV after an attempt completes."""
+
+    canonical = Path(path)
+    rows: list[dict[str, Any]] = []
+    for metric_path in training_metric_paths(canonical):
+        rows.extend(_valid_training_metric_rows(metric_path))
+    if not rows:
+        return pd.DataFrame()
+    frame = pd.DataFrame(rows)
+    key_columns = ["training_seed", "variant", "global_timestep"]
+    if set(key_columns).issubset(frame.columns):
+        frame = frame.drop_duplicates(subset=key_columns, keep="last")
+    if "global_timestep" in frame.columns:
+        frame["_sort_timestep"] = pd.to_numeric(
+            frame["global_timestep"], errors="coerce"
+        )
+        frame = frame.sort_values("_sort_timestep", kind="stable").drop(
+            columns="_sort_timestep"
+        )
+    published = [
+        {key: row.get(key, np.nan) for key in TrainingMetricsCallback.FIELDNAMES}
+        for row in frame.to_dict(orient="records")
+    ]
+    _atomic_write_training_csv(
+        canonical,
+        fieldnames=TrainingMetricsCallback.FIELDNAMES,
+        rows=published,
+    )
+    return pd.DataFrame(published)
+
+
 class TrainingMetricsCallback(BaseCallback):
     """Persist episode metrics and expose action/protocol metrics to TensorBoard."""
 
@@ -389,15 +543,30 @@ class TrainingMetricsCallback(BaseCallback):
         "action_saturation_mean",
     )
 
-    def __init__(self, *, path: Path, training_seed: int, variant: str) -> None:
+    def __init__(
+        self,
+        *,
+        path: Path,
+        training_seed: int,
+        variant: str,
+        attempt_id: Any = None,
+        progress_path: Path | None = None,
+        flush_every: int = 32,
+    ) -> None:
         super().__init__(verbose=0)
-        self.path = Path(path)
+        self.canonical_path = Path(path)
+        self.attempt_id = _safe_training_attempt_id(attempt_id)
+        self.path = attempt_training_metrics_path(self.canonical_path, self.attempt_id)
+        self.progress_path = None if progress_path is None else Path(progress_path)
+        self.flush_every = max(int(flush_every), 1)
         self.training_seed = int(training_seed)
         self.variant = str(variant)
         self.episode_index = 0
         self.action_saturation_sum = 0.0
         self.action_saturation_count = 0
         self.resets_after_collision = 0
+        self._rows = _valid_training_metric_rows(self.path)
+        self._pending_rows: list[dict[str, Any]] = []
 
     def state_dict(self) -> dict[str, Any]:
         return {
@@ -414,13 +583,41 @@ class TrainingMetricsCallback(BaseCallback):
         self.resets_after_collision = int(state.get("resets_after_collision", 0))
 
     def _append_row(self, row: dict[str, Any]) -> None:
-        self.path.parent.mkdir(parents=True, exist_ok=True)
-        write_header = not self.path.exists() or self.path.stat().st_size == 0
-        with self.path.open("a", newline="", encoding="utf-8") as handle:
-            writer = csv.DictWriter(handle, fieldnames=self.FIELDNAMES)
-            if write_header:
-                writer.writeheader()
-            writer.writerow({key: row.get(key, np.nan) for key in self.FIELDNAMES})
+        self._pending_rows.append(dict(row))
+        if len(self._pending_rows) >= self.flush_every:
+            self.flush()
+
+    def flush(self) -> None:
+        """Atomically persist the current attempt and its heartbeat."""
+
+        if self._pending_rows:
+            self._rows.extend(self._pending_rows)
+            _atomic_write_training_csv(
+                self.path, fieldnames=self.FIELDNAMES, rows=self._rows
+            )
+            self._pending_rows.clear()
+        if self.progress_path is not None:
+            progress = {
+                "schema_version": PIPELINE_SCHEMA_VERSION,
+                "attempt_id": self.attempt_id or None,
+                "training_seed": self.training_seed,
+                "variant": self.variant,
+                "num_timesteps": int(getattr(self, "num_timesteps", 0)),
+                "completed_episode_rows": int(len(self._rows)),
+                "metrics_path": str(self.path.resolve()),
+                "updated_at_epoch_s": float(time.time()),
+            }
+            temporary = self.progress_path.with_suffix(
+                self.progress_path.suffix + ".tmp"
+            )
+            self.progress_path.parent.mkdir(parents=True, exist_ok=True)
+            temporary.write_text(
+                json.dumps(progress, indent=2, sort_keys=True), encoding="utf-8"
+            )
+            temporary.replace(self.progress_path)
+
+    def _on_training_end(self) -> None:
+        self.flush()
 
     def _on_step(self) -> bool:
         infos = self.locals.get("infos", [])
@@ -509,6 +706,8 @@ class TrainingMetricsCallback(BaseCallback):
             self.logger.record("rollout/reset_calls_total", row["reset_calls_total"])
             self.action_saturation_sum = 0.0
             self.action_saturation_count = 0
+        if self._pending_rows:
+            self.flush()
         return True
 
 

@@ -90,6 +90,7 @@ from train_safety_potential_variants import MTM_CONGESTED_UNCERTAIN_UPDATES
 
 PROGRESSION_SCHEMA_VERSION = 8
 PPO_TRAINING_IMPLEMENTATION_VERSION = 14
+POST_TRAIN_EVALUATION_PROTOCOL_VERSION = 2
 TRAINING_SIGNATURE_FILE = "training_signature.json"
 TRAINING_PENDING_SIGNATURE_FILE = "training_signature.pending.json"
 TRAINING_COMPLETION_FILE = "training_complete.json"
@@ -269,6 +270,7 @@ FILTERED_FACTORIAL_VARIANTS = {
 # run-name directory below the supplied root.  Stay below the project's proven
 # 248-character guard rather than relying on the system TEMP fallback.
 WINDOWS_TENSORBOARD_PATH_LIMIT = 248
+WINDOWS_LEGACY_PATH_LIMIT = 260
 TENSORBOARD_VARIANT_IDS = {
     "ppo_nominal": "nom",
     "ppo_cbf_shield_only": "shld",
@@ -989,6 +991,80 @@ def _tensorboard_path_is_safe(log_dir: Path) -> bool:
     )
 
 
+def preflight_output_paths(
+    output_dir: Path,
+    *,
+    variants: Iterable[str],
+    seeds: Iterable[int],
+    timesteps: int,
+    attempt_id: Any = None,
+) -> None:
+    """Reject every known future artifact path before a Windows run starts."""
+
+    if os.name != "nt":
+        return
+    output_dir = Path(output_dir).resolve()
+    safe_attempt = "".join(
+        character
+        if character.isalnum() or character in {"-", "_"}
+        else "_"
+        for character in str(attempt_id or "").strip()
+    ).strip("._")[:80]
+    attempt_suffix = f".attempt_{safe_attempt}" if safe_attempt else ""
+    root_files = (
+        "model_manifest.csv",
+        "study_config.json",
+        "evaluation_scenarios.csv",
+        "ten_kpi_summary.csv",
+        "factorial_effects_scenarios.csv",
+        "factorial_effects_summary.csv",
+        "post_train_200ep_kpis.csv",
+        "counterfactuals/counterfactual_episode_rows.csv",
+    )
+    run_files = (
+        "model_final.zip",
+        TRAINING_SIGNATURE_FILE,
+        TRAINING_PENDING_SIGNATURE_FILE,
+        TRAINING_COMPLETION_FILE,
+        "training_episodes.csv",
+        f"training_episodes{attempt_suffix}.csv",
+        "training_progress.json",
+        f"training_progress{attempt_suffix}.json",
+        "training.monitor.csv",
+        "actor_gradients.csv",
+        "run_config.json",
+        "checkpoints/r_100000_steps.zip",
+        "checkpoints/r_500000_steps.zip",
+        "pe/e.csv",
+        "pe/b.csv",
+        "pe/kpi.csv",
+        "pe/m.json",
+        "pe/progress.json",
+        "tensorboard/train_9999/events.out.tfevents."
+        + "x" * 72,
+    )
+    candidates = [output_dir / relative for relative in root_files]
+    for variant in variants:
+        for seed in seeds:
+            run_dir = output_dir / str(variant) / f"seed_{int(seed)}"
+            candidates.extend(run_dir / relative for relative in run_files)
+    violations = sorted(
+        ((len(str(path)), str(path)) for path in candidates if len(str(path)) >= WINDOWS_LEGACY_PATH_LIMIT),
+        reverse=True,
+    )
+    if violations:
+        rendered = "\n".join(
+            f"  {length} chars: {path}" for length, path in violations
+        )
+        raise RuntimeError(
+            "Windows legacy MAX_PATH preflight failed before training. "
+            f"All generated output paths must be shorter than {WINDOWS_LEGACY_PATH_LIMIT} "
+            "characters; use a short local staging directory such as "
+            "C:\\agv_runs\\... and archive it afterward. Violations:\n"
+            + rendered
+        )
+
+
 def _tensorboard_event_files(log_dir: Path) -> list[str]:
     if not log_dir.exists():
         return []
@@ -1203,6 +1279,7 @@ def make_ppo_cbf_env(
     lambda_intervention: float,
     correction_epsilon: float,
     action_rate_penalty_lambda: float = 0.0,
+    cbf_enabled: bool = True,
     monitor_path: Path | None = None,
 ) -> gym.Env:
     """Build the shared physical-action/context environment for every level."""
@@ -1222,6 +1299,7 @@ def make_ppo_cbf_env(
         max_neighbor_constraints=int(namespace["CBF_MAX_NEIGHBOR_CONSTRAINTS"]),
         base_observation_dim=int(np.prod(env.observation_space.shape)),
         project_inputs=bool(project_inputs),
+        cbf_enabled=bool(cbf_enabled),
         lambda_delta=float(lambda_delta),
         lambda_intervention=float(lambda_intervention),
         correction_epsilon=float(correction_epsilon),
@@ -1248,6 +1326,7 @@ def _make_ppo_worker_env(
     env_config: dict[str, Any],
     reward_config: dict[str, float],
     cbf_snapshot: dict[str, Any],
+    cbf_enabled: bool,
     lambda_delta: float,
     lambda_intervention: float,
     correction_epsilon: float,
@@ -1277,6 +1356,7 @@ def _make_ppo_worker_env(
         reward_config=copy.deepcopy(reward_config),
         # Collection stages P(z) explicitly and steps only the safe action.
         project_inputs=False,
+        cbf_enabled=bool(cbf_enabled),
         lambda_delta=float(lambda_delta),
         lambda_intervention=float(lambda_intervention),
         correction_epsilon=float(correction_epsilon),
@@ -1374,6 +1454,7 @@ def make_training_vec_env(
                 env_config=env_config,
                 reward_config=reward_config,
                 project_inputs=False,
+                cbf_enabled=(str(spec["execution_mode"]) == "cbf"),
                 lambda_delta=lambda_delta,
                 lambda_intervention=lambda_intervention,
                 correction_epsilon=float(args.correction_epsilon),
@@ -1389,6 +1470,7 @@ def make_training_vec_env(
             "env_config": copy.deepcopy(env_config),
             "reward_config": copy.deepcopy(reward_config),
             "cbf_snapshot": _cbf_training_snapshot(namespace),
+            "cbf_enabled": (str(spec["execution_mode"]) == "cbf"),
             "lambda_delta": lambda_delta,
             "lambda_intervention": lambda_intervention,
             "correction_epsilon": float(args.correction_epsilon),
@@ -1698,13 +1780,24 @@ def train_variant(
             flush=True,
         )
     training_metrics_path = run_dir / "training_episodes.csv"
+    attempt_id = getattr(args, "run_attempt_id", None)
+    attempt_metrics_path = protocol.attempt_training_metrics_path(
+        training_metrics_path, attempt_id
+    )
+    progress_path = protocol.attempt_training_metrics_path(
+        run_dir / "training_progress.json", attempt_id
+    )
     metrics_callback = protocol.TrainingMetricsCallback(
         path=training_metrics_path,
         training_seed=training_seed,
         variant=variant,
+        attempt_id=attempt_id,
+        progress_path=progress_path,
     )
-    if resume_checkpoint is not None and training_metrics_path.exists():
-        existing_metrics = pd.read_csv(training_metrics_path)
+    if resume_checkpoint is not None:
+        existing_metrics = protocol.read_training_metrics_frame(
+            training_metrics_path
+        )
         if not existing_metrics.empty:
             episode_indices = pd.to_numeric(
                 existing_metrics["episode_index"], errors="coerce"
@@ -1717,7 +1810,7 @@ def train_variant(
             # An interrupted callback can leave a final, partially-written row
             # with NaN in this column. Resume from the last valid counter.
             if not reset_counts.empty:
-                metrics_callback.resets_after_collision = int(reset_counts.iloc[-1])
+                metrics_callback.resets_after_collision = int(reset_counts.max())
     action_callback = PPOActionClipCallback()
     checkpoint_frequency_effective = max(
         int(config["global_rollout_steps"]),
@@ -1814,11 +1907,22 @@ def train_variant(
                 flush=True,
             )
     finally:
-        train_env.close()
-        sync_worker_monitor_artifacts(
-            run_dir / "training.monitor.csv",
-            int(config["n_envs"]),
-        )
+        try:
+            metrics_callback.flush()
+        finally:
+            train_env.close()
+            sync_worker_monitor_artifacts(
+                run_dir / "training.monitor.csv",
+                int(config["n_envs"]),
+            )
+            try:
+                protocol.materialize_training_metrics(training_metrics_path)
+            except Exception as metrics_error:
+                print(
+                    "[ppo-progression] warning: could not materialize training "
+                    f"metrics for {variant}: {metrics_error}",
+                    flush=True,
+                )
     tensorboard_event_files = _tensorboard_event_files(tensorboard_log_dir)
     tensorboard_new_event_files = [
         path for path in tensorboard_event_files if path not in tensorboard_before
@@ -1920,6 +2024,7 @@ def make_evaluation_env(
         env_config=env_config,
         reward_config=reward_config,
         project_inputs=mode == "cbf",
+        cbf_enabled=mode == "cbf",
         lambda_delta=0.0,
         lambda_intervention=0.0,
         correction_epsilon=correction_epsilon,
@@ -1930,6 +2035,22 @@ def make_evaluation_env(
         task_distance_m=float(task_distance_m),
         max_policy_steps=int(task_max_policy_steps),
     )
+
+
+def _evaluation_cbf_geometry_enabled(env: gym.Env, mode: str) -> bool:
+    """Detect whether an evaluation env actually exposes live CBF geometry.
+
+    The canonical builder marks raw evaluation explicitly disabled.  The
+    fallback keeps older lightweight test doubles and third-party callers
+    compatible when they do not expose the new flag.
+    """
+
+    if str(mode) == "cbf":
+        return True
+    try:
+        return bool(env.get_wrapper_attr("cbf_enabled"))
+    except (AttributeError, LookupError, RuntimeError, AssertionError):
+        return True
 
 
 def evaluate_scenario(
@@ -1956,6 +2077,7 @@ def evaluate_scenario(
     )
     try:
         observation, _ = env.reset(seed=int(scenario_seed))
+        cbf_geometry_enabled = _evaluation_cbf_geometry_enabled(env, mode)
         policy_dt = protocol._policy_dt(env)
         rewards: list[float] = []
         speed_errors: list[float] = []
@@ -1976,25 +2098,34 @@ def evaluate_scenario(
         previous_acceleration = np.zeros(2, dtype=float)
 
         for step in range(int(args.eval_timesteps)):
-            pre_state = protocol.cbf_state_occupancy_metrics(
-                namespace,
-                env,
-                eps_side=float(namespace["CBF_EPS_SIDE"]),
-                ttc_cap_s=float(args.ttc_cap),
-            )
-            h_values.append(float(pre_state.get("h_min", np.nan)))
+            if cbf_geometry_enabled:
+                pre_state = protocol.cbf_state_occupancy_metrics(
+                    namespace,
+                    env,
+                    eps_side=float(namespace["CBF_EPS_SIDE"]),
+                    ttc_cap_s=float(args.ttc_cap),
+                )
+                h_values.append(float(pre_state.get("h_min", np.nan)))
+            else:
+                # True CBF-OFF evaluation does not even compute occupancy
+                # geometry.  h is therefore intentionally not applicable.
+                pre_state = {"h_min": np.nan}
+                h_values.append(np.nan)
             action = _predict_evaluation_action(
                 model,
                 observation,
                 action_source=action_source,
             )
-            context_wrapper = env.get_wrapper_attr("project_current_action")
-            shadow_safe, shadow_record = context_wrapper(action)
-            shadow_correction = float(shadow_record["correction_norm_normalized"])
-            shadow_corrections.append(shadow_correction)
-            shadow_interventions.append(
-                float(shadow_correction > float(args.correction_epsilon))
-            )
+            if cbf_geometry_enabled:
+                context_wrapper = env.get_wrapper_attr("project_current_action")
+                _shadow_safe, shadow_record = context_wrapper(action)
+                shadow_correction = float(
+                    shadow_record["correction_norm_normalized"]
+                )
+                shadow_corrections.append(shadow_correction)
+                shadow_interventions.append(
+                    float(shadow_correction > float(args.correction_epsilon))
+                )
 
             observation, reward, terminated, truncated, info = env.step(action)
             info = dict(info)
@@ -2132,6 +2263,7 @@ def evaluate_completed_episode(
     )
     try:
         observation, _ = env.reset(seed=int(episode_seed))
+        cbf_geometry_enabled = _evaluation_cbf_geometry_enabled(env, mode)
         policy_dt = protocol._policy_dt(env)
         rewards: list[float] = []
         speed_errors: list[float] = []
@@ -2156,25 +2288,33 @@ def evaluate_completed_episode(
         previous_acceleration = np.zeros(2, dtype=float)
 
         while True:
-            pre_state = protocol.cbf_state_occupancy_metrics(
-                namespace,
-                env,
-                eps_side=float(namespace["CBF_EPS_SIDE"]),
-                ttc_cap_s=float(args.ttc_cap),
-            )
-            h_values.append(float(pre_state.get("h_min", np.nan)))
+            if cbf_geometry_enabled:
+                pre_state = protocol.cbf_state_occupancy_metrics(
+                    namespace,
+                    env,
+                    eps_side=float(namespace["CBF_EPS_SIDE"]),
+                    ttc_cap_s=float(args.ttc_cap),
+                )
+                h_values.append(float(pre_state.get("h_min", np.nan)))
+            else:
+                # Keep OFF evaluation free of all CBF occupancy/geometry work.
+                pre_state = {"h_min": np.nan, "psi1_min": np.nan}
+                h_values.append(np.nan)
             action = _predict_evaluation_action(
                 model,
                 observation,
                 action_source=action_source,
             )
-            context_wrapper = env.get_wrapper_attr("project_current_action")
-            _shadow_safe, shadow_record = context_wrapper(action)
-            shadow_correction = float(shadow_record["correction_norm_normalized"])
-            shadow_corrections.append(shadow_correction)
-            shadow_interventions.append(
-                float(shadow_correction > float(args.correction_epsilon))
-            )
+            if cbf_geometry_enabled:
+                context_wrapper = env.get_wrapper_attr("project_current_action")
+                _shadow_safe, shadow_record = context_wrapper(action)
+                shadow_correction = float(
+                    shadow_record["correction_norm_normalized"]
+                )
+                shadow_corrections.append(shadow_correction)
+                shadow_interventions.append(
+                    float(shadow_correction > float(args.correction_epsilon))
+                )
 
             observation, reward, terminated, truncated, info = env.step(action)
             info = dict(info)
@@ -3042,7 +3182,10 @@ def evaluate_post_training_model(
     root_summary_path = _upsert_post_training_kpi_summary(output_dir, table)
     manifest = {
         "schema_version": PROGRESSION_SCHEMA_VERSION,
+        "evaluation_protocol_version": POST_TRAIN_EVALUATION_PROTOCOL_VERSION,
         "evaluation_kind": "post_training_complete_episodes",
+        "cbf_off_geometry_bypassed": True,
+        "cbf_off_context": "zero_padded_empty_constraint_context",
         "model_path": str(model_path.resolve()),
         "model_sha256": protocol.file_sha256(model_path),
         **summary_geometry,
@@ -3481,6 +3624,14 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--project-root", type=Path, default=None)
     parser.add_argument("--output-dir", type=Path, default=None)
+    parser.add_argument(
+        "--run-attempt-id",
+        default=None,
+        help=(
+            "Identifier for attempt-specific atomic training metrics and "
+            "progress heartbeats; excluded from checkpoint identity."
+        ),
+    )
     parser.add_argument("--device", default="cpu")
     parser.add_argument("--timesteps", type=int, default=DEFAULT_TIMESTEPS)
     parser.add_argument(
@@ -3974,6 +4125,13 @@ def main() -> int:
         args.output_dir
         or project_root / "artifacts" / "ppo_cbf_progression_parallel_v3"
     ).resolve()
+    preflight_output_paths(
+        output_dir,
+        variants=args.variants,
+        seeds=args.seeds,
+        timesteps=int(args.timesteps),
+        attempt_id=getattr(args, "run_attempt_id", None),
+    )
     output_dir.mkdir(parents=True, exist_ok=True)
     if args.repair_post_train_summaries:
         repaired = repair_post_training_summaries(output_dir)
