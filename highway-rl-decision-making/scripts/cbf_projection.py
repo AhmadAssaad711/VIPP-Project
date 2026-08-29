@@ -405,6 +405,8 @@ def _batched_torch_inputs(
     rows: th.Tensor,
     bounds: th.Tensor,
     mask: th.Tensor | None,
+    *,
+    detach_constraints: bool = True,
 ) -> tuple[th.Tensor, th.Tensor, th.Tensor, th.Tensor]:
     if target.ndim == 1:
         target = target.unsqueeze(0)
@@ -428,8 +430,14 @@ def _batched_torch_inputs(
         if mask.shape != bounds.shape:
             raise ValueError("mask must have shape [batch, constraints]")
         mask = mask > 0.5
-    # The safety geometry is fixed during each PPO minibatch update.
-    return target, rows.detach(), bounds.detach(), mask.detach()
+    # The safety geometry is fixed during each PPO minibatch update.  The
+    # parameter-learning pass can explicitly opt out so gradients flow from
+    # the dynamic HOCBF bounds back into p/nu.  The default remains detached
+    # to preserve the existing PPO actor-loss contract.
+    if detach_constraints:
+        rows = rows.detach()
+        bounds = bounds.detach()
+    return target, rows, bounds, mask.detach()
 
 
 def _torch_action_bounds(
@@ -579,6 +587,7 @@ def project_polytope_2d_torch(
     parallel_tol: float = DEFAULT_PARALLEL_TOL,
     action_low: Any | None = None,
     action_high: Any | None = None,
+    detach_constraints: bool = True,
 ) -> TorchProjection2D:
     """Exact batched 2D projection with an almost-everywhere KKT gradient.
 
@@ -588,7 +597,13 @@ def project_polytope_2d_torch(
     at an independent two-face vertex.
     """
 
-    target, rows, bounds, mask = _batched_torch_inputs(target, rows, bounds, mask)
+    target, rows, bounds, mask = _batched_torch_inputs(
+        target,
+        rows,
+        bounds,
+        mask,
+        detach_constraints=bool(detach_constraints),
+    )
     batch_size, constraint_count, _ = rows.shape
     device, dtype = target.device, target.dtype
     physical_low, physical_high = _torch_action_bounds(

@@ -936,8 +936,8 @@ def resolve_existing_variant_checkpoint(
 
 def _latest_rollout_checkpoint(run_dir: Path) -> Path | None:
     candidates: list[tuple[int, Path]] = []
-    for path in (run_dir / "checkpoints").glob("rollout_*_steps.zip"):
-        match = re.search(r"rollout_(\d+)_steps\.zip$", path.name)
+    for path in (run_dir / "checkpoints").glob("*_steps.zip"):
+        match = re.fullmatch(r"(?:rollout|r)_(\d+)_steps\.zip", path.name)
         if not match:
             continue
         try:
@@ -1706,16 +1706,18 @@ def train_variant(
     if resume_checkpoint is not None and training_metrics_path.exists():
         existing_metrics = pd.read_csv(training_metrics_path)
         if not existing_metrics.empty:
-            metrics_callback.episode_index = int(
-                pd.to_numeric(
-                    existing_metrics["episode_index"], errors="coerce"
-                ).max()
-            )
-            metrics_callback.resets_after_collision = int(
-                pd.to_numeric(
-                    existing_metrics["resets_after_collision"], errors="coerce"
-                ).iloc[-1]
-            )
+            episode_indices = pd.to_numeric(
+                existing_metrics["episode_index"], errors="coerce"
+            ).dropna()
+            if not episode_indices.empty:
+                metrics_callback.episode_index = int(episode_indices.max())
+            reset_counts = pd.to_numeric(
+                existing_metrics["resets_after_collision"], errors="coerce"
+            ).dropna()
+            # An interrupted callback can leave a final, partially-written row
+            # with NaN in this column. Resume from the last valid counter.
+            if not reset_counts.empty:
+                metrics_callback.resets_after_collision = int(reset_counts.iloc[-1])
     action_callback = PPOActionClipCallback()
     checkpoint_frequency_effective = max(
         int(config["global_rollout_steps"]),
@@ -1736,10 +1738,18 @@ def train_variant(
     )
     checkpoint_dir = run_dir / "checkpoints"
     checkpoint_dir.mkdir(parents=True, exist_ok=True)
+    # The requested OneDrive output path is close to Windows' MAX_PATH limit:
+    # ``rollout_100000_steps.zip`` would be one character too long.  Keep the
+    # historical name where it fits, and use the compact equivalent otherwise.
+    checkpoint_name_prefix = (
+        "r"
+        if len(str(checkpoint_dir / "rollout_100000_steps.zip")) >= 260
+        else "rollout"
+    )
     checkpoint_callback = CheckpointCallback(
         save_freq=checkpoint_save_freq,
         save_path=str(checkpoint_dir),
-        name_prefix="rollout",
+        name_prefix=checkpoint_name_prefix,
         save_replay_buffer=False,
         save_vecnormalize=False,
         verbose=0,
@@ -1860,6 +1870,7 @@ def train_variant(
         "checkpoint_frequency_requested": int(args.checkpoint_freq),
         "checkpoint_frequency_effective": int(checkpoint_frequency_effective),
         "checkpoint_callback_frequency": int(checkpoint_save_freq),
+        "checkpoint_name_prefix": checkpoint_name_prefix,
         "tensorboard": tensorboard_manifest,
         "resumed_from": (
             None if resume_checkpoint is None else str(resume_checkpoint)
