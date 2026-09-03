@@ -117,14 +117,16 @@ NOTEBOOK_SUBDIR_ALIASES: dict[str, Path] = {
 }
 
 
-def find_project_root() -> Path:
-    for candidate in [Path.cwd(), *Path.cwd().parents]:
-        if (candidate / "src").exists() and (candidate / "notebooks").exists():
+def find_project_root(start: Path | None = None) -> Path:
+    """Find the standalone laned checkout containing ``src/`` and ``notebooks/``."""
+    start_path = Path(start or Path.cwd()).resolve()
+    for candidate in [start_path, *start_path.parents]:
+        if (candidate / "src").is_dir() and (candidate / "notebooks").is_dir():
             return candidate
-        nested = candidate / "highway-rl-decision-making"
-        if (nested / "src").exists() and (nested / "notebooks").exists():
-            return nested
-    raise RuntimeError("Could not locate the project root from the current working directory.")
+    raise RuntimeError(
+        "Could not locate the standalone laned project root. "
+        "Run from a directory inside the laned checkout."
+    )
 
 
 def resolve_notebook_dir(project_root: Path, notebook_subdir: str) -> Path:
