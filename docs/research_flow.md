@@ -44,12 +44,15 @@ From the repository root:
 ```powershell
 python src\deep_learning\DQN\elurant_dqn.py --help
 python src\deep_learning\DQN\attention_dqn.py --help
+python -m unittest discover -s tests -p "test_*.py" -v
 python -m compileall -q src notebooks
 ```
 
-The help commands validate imports without starting training. A full notebook
-run is intentionally not part of the smoke check because it creates model and
-TensorBoard outputs and can be lengthy.
+The help commands validate imports without starting training, while the
+laned-environment tests check profile reset/step behavior, deterministic
+seeding, observation-space bounds, and the main opt-in wrappers. A full
+notebook run is intentionally not part of the smoke check because it creates
+model and TensorBoard outputs and can be lengthy.
 
 ## Reproducibility
 

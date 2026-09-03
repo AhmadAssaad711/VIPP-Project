@@ -54,6 +54,7 @@ For a dependency/import check before opening a notebook:
 ```powershell
 python src\deep_learning\DQN\elurant_dqn.py --help
 python src\deep_learning\DQN\attention_dqn.py --help
+python -m unittest discover -s tests -p "test_*.py" -v
 ```
 
 The structured PPO notebooks are retained as historical narratives. They

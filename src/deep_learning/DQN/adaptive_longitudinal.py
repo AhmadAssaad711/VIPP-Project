@@ -421,6 +421,75 @@ def build_lane_change_safety_config(
     return merged
 
 
+def validate_laned_environment_config(config: Mapping[str, Any] | None) -> None:
+    """Validate the environment contract shared by the laned DQN runners.
+
+    ``highway-v0`` is lane based by construction, but its flexible config API
+    can still receive an observation or action specification from a different
+    experiment.  Failing here gives a clear error before a long training run
+    starts with incompatible state/action semantics.
+
+    The checks intentionally validate only settings that define this
+    repository's DQN contract.  HighwayEnv-specific optional settings remain
+    available through the rest of the config.
+    """
+    if config is None:
+        return
+    if not isinstance(config, Mapping):
+        raise TypeError(f"Laned environment config must be a mapping, got {type(config).__name__}.")
+
+    observation = config.get("observation")
+    if observation is not None:
+        if not isinstance(observation, Mapping):
+            raise TypeError("Laned environment 'observation' must be a mapping.")
+        observation_type = str(observation.get("type", "")).lower()
+        if observation_type != "kinematics":
+            raise ValueError(
+                "The laned DQN environment requires observation.type='Kinematics'; "
+                f"got {observation.get('type')!r}."
+            )
+
+    action = config.get("action")
+    if action is not None:
+        if not isinstance(action, Mapping):
+            raise TypeError("Laned environment 'action' must be a mapping.")
+        action_type = str(action.get("type", "")).lower()
+        if action_type != "discretemetaaction":
+            raise ValueError(
+                "The laned DQN environment requires action.type='DiscreteMetaAction'; "
+                f"got {action.get('type')!r}."
+            )
+
+    for key in ("lanes_count", "vehicles_count"):
+        if key not in config:
+            continue
+        value = config[key]
+        if isinstance(value, bool) or not isinstance(value, (int, np.integer)):
+            raise TypeError(f"Laned environment {key} must be an integer, got {value!r}.")
+        minimum = 1 if key == "lanes_count" else 0
+        if int(value) < minimum:
+            raise ValueError(f"Laned environment {key} must be >= {minimum}, got {value!r}.")
+
+    if "duration" in config:
+        duration = config["duration"]
+        if isinstance(duration, bool) or not isinstance(duration, (int, float, np.number)):
+            raise TypeError(f"Laned environment duration must be numeric, got {duration!r}.")
+        if not np.isfinite(float(duration)) or float(duration) <= 0.0:
+            raise ValueError(f"Laned environment duration must be positive, got {duration!r}.")
+
+    if "reward_speed_range" in config:
+        try:
+            speed_low, speed_high = list(config["reward_speed_range"])
+        except (TypeError, ValueError):
+            raise ValueError("Laned environment reward_speed_range must contain two values.") from None
+        speed_low = float(speed_low)
+        speed_high = float(speed_high)
+        if not np.isfinite(speed_low) or not np.isfinite(speed_high) or speed_low > speed_high:
+            raise ValueError(
+                "Laned environment reward_speed_range must contain finite values in ascending order."
+            )
+
+
 def split_highway_env_and_custom_configs(
     config: Mapping[str, Any] | None,
 ) -> tuple[
@@ -1816,6 +1885,7 @@ def make_highway_env_with_adaptive_longitudinal(
         ttc_observation_config,
         lane_change_safety_config,
     ) = split_highway_env_and_custom_configs(config)
+    validate_laned_environment_config(base_config)
     env = gym.make("highway-v0", render_mode=render_mode, config=base_config)
     if rear_flow_config["enabled"]:
         env = RearFlowPressureWrapper(env, rear_flow_config=rear_flow_config)
