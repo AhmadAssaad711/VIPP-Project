@@ -1,3 +1,12 @@
+"""Registry and cache helpers for reproducible laneless evaluations.
+
+This module resolves a completed training request to an immutable checkpoint,
+constructs stable evaluation/cache paths, hashes inputs, and writes manifests
+that connect KPI tables to their training configuration. It keeps evaluation
+protocols separate so true CBF-free, external CBF ON/OFF, and deployment
+results are not silently merged.
+"""
+
 from __future__ import annotations
 
 import hashlib

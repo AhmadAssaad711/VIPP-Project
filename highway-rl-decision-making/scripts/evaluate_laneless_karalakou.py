@@ -1,3 +1,17 @@
+"""Evaluate registered laneless Karalakou/PPO checkpoints reproducibly.
+
+This entry point resolves a named training request, loads the matching
+checkpoint and environment configuration, runs parallel evaluation blocks,
+aggregates the ten core safety/performance KPIs, and writes cacheable
+evaluation artifacts plus a manifest. It is an evaluation/reporting script,
+not a trainer: it should be run after a checkpoint has been registered by the
+laneless training flow.
+
+The script keeps true CBF-free evaluation, external CBF ON/OFF pilots, and
+deployment-style evaluation as separate protocols. A result is comparable
+only when its checkpoint, traffic model, route length, seed set, episode
+count, and CBF mode are recorded together.
+"""
 from __future__ import annotations
 
 import argparse

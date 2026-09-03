@@ -1,11 +1,16 @@
-"""
-Attention-based DQN baseline for highway-v0.
+"""Attention-based DQN runner for the laned HighwayEnv experiment.
 
-This mirrors the repo's existing DQN baseline workflow, but swaps the default
-MLP feature extractor for the ego-attention architecture from the Kourani
-setup. The module is notebook-friendly: the notebook can override
-`make_config()` and `build_policy_kwargs()` so environment and model settings
-stay editable from cells.
+This module mirrors the baseline DQN training/evaluation workflow while
+replacing the default MLP feature extraction path with the ego-attention
+architecture used by the structured representation study. It supports the
+same highway-v0 profiles, reward/wrapper configuration, vectorized rollout,
+checkpointing, TensorBoard logging, and evaluation reporting as the baseline
+so the representation is the controlled factor in the clean comparison.
+
+The structured notebook may override make_config and build_policy_kwargs for
+an explicit experiment, but the selected configuration must be serialized
+with the run. This is not the laneless policy: it still consumes native
+lane-based HighwayEnv observations and discrete lane-level actions.
 """
 
 from __future__ import annotations

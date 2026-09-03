@@ -1,5 +1,22 @@
-"""
-Shared adaptive TTC-based longitudinal controller for DQN highway-env runs.
+"""Optional structured HighwayEnv reward, observation, and control wrappers.
+
+The laned experiments use native highway-v0 as their environment and compose
+these wrappers around it from notebooks/_shared/dqn_notebook_utils. The
+module keeps the structured research terms in one importable place:
+
+* adaptive longitudinal target-speed control driven by front/rear TTC;
+* rear-flow pressure and traffic-flow reward signals;
+* TTC safety and potential-field reward extensions;
+* driver-aggressiveness and TTC observation features; and
+* lane-change safety penalties and diagnostics.
+
+Every feature is disabled in the default configuration. The wrappers are
+therefore intended for controlled ablations: enable one term or an explicitly
+named combination, preserve the resulting configuration in the run manifest,
+and compare only runs with the same environment and evaluation protocol.
+This module belongs to the laned/structured track even when the potential
+field is conceptually inspired by the laneless Karalakou work; it operates on
+HighwayEnv lane geometry and lane-based actions.
 """
 
 from __future__ import annotations

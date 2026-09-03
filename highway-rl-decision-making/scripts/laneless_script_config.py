@@ -1,3 +1,13 @@
+"""Configuration helpers shared by laneless PPO/CBF command-line scripts.
+
+The laneless studies use nested dictionaries for environment, reward, CBF,
+and evaluation settings. This module provides a predictable merge boundary:
+start from an immutable caller-owned base configuration, apply an optional
+JSON file, apply an optional inline JSON object, and finally apply explicit
+CLI overrides such as --traffic-model. The resulting dictionary is
+independent of the base configuration and can be serialized into a run
+manifest.
+"""
 from __future__ import annotations
 
 import argparse

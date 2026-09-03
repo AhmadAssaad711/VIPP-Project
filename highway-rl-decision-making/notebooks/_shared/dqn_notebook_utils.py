@@ -1,3 +1,16 @@
+"""Shared orchestration helpers for the structured DQN notebooks.
+
+This module is the boundary between the notebook narrative and the reusable
+laned experiment code. It defines the structured environment profiles, merges
+native HighwayEnv settings with optional reward/observation wrappers, loads
+the selected DQN backend, and provides common training, evaluation, plotting,
+and result-table helpers.
+
+The profiles named semi_unstructured and unstructured_stress remain in this
+module for historical experiments, but they still use lane counts and
+lane-based HighwayEnv semantics. They therefore belong to the structured
+track until a genuinely lane-free environment is selected.
+"""
 from __future__ import annotations
 
 import importlib

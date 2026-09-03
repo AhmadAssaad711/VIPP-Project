@@ -1,3 +1,18 @@
+"""Custom lane-free HighwayEnv-compatible environment.
+
+The module registers lane-free-v0 and extends HighwayEnv primitives with a
+wide single-corridor/ring-road simulation. Controlled ego actions are
+continuous longitudinal/lateral accelerations; background vehicles use the
+configured force or MTM-style traffic behavior. Observations describe nearby
+vehicles in Cartesian relative coordinates and contain no lane index, lane
+center, target lane, or discrete lane-change action.
+
+The environment owns physical state evolution, collision/off-road termination,
+traffic spawning, and lane-free rendering. PPO reward and CBF logic stays in
+the laneless scripts so the environment can also be smoke-tested independently
+from the research formulation.
+"""
+
 from __future__ import annotations
 
 from collections import deque

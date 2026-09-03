@@ -1,4 +1,17 @@
-"""Congested-traffic diagnostic labels for DQN highway-env policies."""
+"""Post-hoc congestion and safety diagnostics for structured DQN policies.
+
+The functions in this module label lane-based rollouts using front/rear TTC,
+lane gaps, traffic-flow context, action quality, and final-episode behavior.
+They aggregate evidence for analysis and reporting; they do not alter the
+training reward and must not be confused with adaptive_longitudinal.py reward
+wrappers.
+
+Inputs are normally an evaluated HighwayEnv environment plus action/episode
+records. Outputs are scalar labels, row-level diagnostic fields, and
+DataFrame/JSON summaries suitable for the structured congested-traffic
+notebooks. Thresholds are kept in DEFAULT_DIAGNOSTIC_CONFIG so a report can
+record exactly which diagnostic definition was used.
+"""
 
 from __future__ import annotations
 

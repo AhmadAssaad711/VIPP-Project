@@ -1,3 +1,12 @@
+"""Registry and artifact-resolution helpers for laneless training runs.
+
+The registry maps stable task names to variant labels, output locations,
+checkpoint names, and metadata fields used by the PPO/CBF and legacy DDPG
+training scripts. It is the naming/provenance boundary between a requested
+experiment and the files produced on disk; it does not implement the learner
+or the environment.
+"""
+
 from __future__ import annotations
 
 import json

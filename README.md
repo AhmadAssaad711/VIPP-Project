@@ -29,9 +29,15 @@ The repo is intentionally notebook-first. Each notebook captures a specific expe
 
 ## Research Flow
 
-1. Establish baselines in structured highway environments.
-2. Improve those baselines with attention models, PPO variants, and reward-safety studies.
-3. Extend and test the ideas in harder settings: congested traffic and laneless highway environments.
+The workspace now has two explicit scientific tracks:
+
+1. laned/structured HighwayEnv: baseline and attention DQN, followed by
+   controlled reward and safety-term integration in congested traffic;
+2. laneless/unstructured HighwayEnv: the custom lane-free environment,
+   Karalakou reward formulation, PPO progression, and CBF research.
+
+The detailed notebook-to-script flow is documented in
+[research_flow.md](highway-rl-decision-making/docs/research_flow.md).
 
 Associated paper: [`highway-rl-decision-making-paper.pdf`](highway-rl-decision-making/docs/paper/highway-rl-decision-making-paper.pdf)
 
@@ -43,6 +49,7 @@ Associated paper: [`highway-rl-decision-making-paper.pdf`](highway-rl-decision-m
 | Attention and hybrid PPO | Improvements over baseline policy structure. | [`Attention_PPO_baseline`](highway-rl-decision-making/notebooks/structured_highway/ppo/Attention_PPO_baseline.ipynb), [`Hybrid_PPO_baseline`](highway-rl-decision-making/notebooks/structured_highway/ppo/Hybrid_PPO_baseline.ipynb) |
 | Congested traffic | Baseline extensions under dense traffic and safety constraints. | [`congested_traffic_policy`](highway-rl-decision-making/notebooks/congested_traffic/congested_traffic_policy.ipynb), [`congested_traffic_policy_v2`](highway-rl-decision-making/notebooks/congested_traffic/congested_traffic_policy_v2.ipynb), [`potential_field_reward_test`](highway-rl-decision-making/notebooks/congested_traffic/congested_reward_safety_factor_study.ipynb) |
 | Laneless environments | Baseline extensions when lane assumptions break down. | [`laneless_highway_env`](highway-rl-decision-making/notebooks/laneless_unstructured/laneless_highway_env.ipynb) |
+| Laneless PPO/CBF formulation | Continuous-policy and high-order CBF research without lane labels. | [`lanelessKaralakou`](highway-rl-decision-making/notebooks/lanelessKaralakou.ipynb), [`run_ppo_cbf_progression`](highway-rl-decision-making/scripts/run_ppo_cbf_progression.py) |
 | Planning comparison | How do planning-based methods compare as decision baselines? | [`CEM_planning_trials`](highway-rl-decision-making/notebooks/planning/CEM_planning_trials.ipynb) |
 
 ## Repository Layout
@@ -62,6 +69,10 @@ highway-rl-decision-making/
 
 ## What Is Included
 
+The active reusable implementation is in the nested project workspace,
+including structured DQN modules, laneless PPO/CBF scripts, documented
+notebook flow, and the associated paper.
+
 - clean notebook portfolio
 - associated paper
 - reproducible environment requirements
@@ -75,6 +86,10 @@ highway-rl-decision-making/
 - vendored external repositories
 - generated logs, videos, checkpoints, and artifacts
 - material outside decision-level highway RL
+
+Python caches and local virtual environments are also excluded from the
+source package. Historical result manifests remain in this checkout while
+the two track-specific repositories are prepared.
 
 ## Setup
 

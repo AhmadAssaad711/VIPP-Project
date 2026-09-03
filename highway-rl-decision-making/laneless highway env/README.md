@@ -2,6 +2,10 @@
 
 Custom highway-env extension for lane-free traffic inspired by the TrafficFluid artificial-fluid concept.
 
+This is the environment layer for the laneless/unstructured research track.
+The scientific PPO/CBF formulation is described in notebooks/lanelessKaralakou.ipynb
+and its reusable training/evaluation path is documented in ../scripts/README.md.
+
 The environment is implemented in `lane_free_env.py` and registers as `lane-free-v0`. It uses highway-env's existing `AbstractEnv`, `Road`, `RoadNetwork`, vehicle graphics, and native `EnvViewer`, but does not edit highway-env source files.
 
 It intentionally has no lane indices, lane centers, target lanes, lane-change actions, or `DiscreteMetaAction`.
@@ -11,6 +15,10 @@ It intentionally has no lane indices, lane centers, target lanes, lane-change ac
 - `lane_free_env.py` defines `LaneFreeTrafficEnv`, `LaneFreeVehicle`, Gymnasium registration, and the small runtime renderer extension needed for a lane-free road surface
 - `demo_lane_free.py` runs nudging/no-nudging demos
 - `outputs/` is created by the demo for plots
+
+The environment boundary is intentionally separate from the Karalakou reward
+and CBF boundary: changing the reward or projection should not require editing
+the simulator unless the physical dynamics or observation contract changes.
 
 ## Usage
 

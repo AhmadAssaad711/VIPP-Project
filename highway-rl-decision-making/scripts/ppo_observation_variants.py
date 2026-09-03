@@ -1,4 +1,12 @@
-"""Small, picklable observation variants shared by PPO pilot workers."""
+"""Picklable observation variants for laneless PPO pilot workers.
+
+The current variants extend the notebook-defined Karalakou observation with
+the previous normalized action actually executed by the simulator. In a CBF
+rollout that means the final filtered physics command, not merely the raw
+policy request. The installer receives the notebook namespace so the wrapper
+can subclass the active reward/observation wrapper while remaining importable
+by spawned worker processes.
+"""
 
 from __future__ import annotations
 

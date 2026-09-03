@@ -1,9 +1,17 @@
-"""
-Configurable DQN baseline for highway-env.
+"""Configurable baseline DQN runner for the laned HighwayEnv experiment.
 
-This keeps the original Leurent-style highway-v0 setup, but adds CLI
-configuration, per-run artifact folders, and TensorBoard logging so we can
-run repeatable sweeps and keep the outputs organized.
+The module preserves the Leurent-style discrete DQN formulation for
+highway-v0 and adds the operational pieces needed for repeatable research:
+CLI/configuration parsing, deterministic run metadata, vectorized training
+environments, per-run artifact folders, TensorBoard logging, checkpoint
+saving, and evaluation summaries. The notebook-facing helpers can override
+the environment profile and wrapper configuration without changing the
+baseline learner itself.
+
+Use this module to establish the structured reference before enabling the
+attention extractor or any custom reward/safety wrapper. Results are only
+comparable when the environment profile, reward configuration, timestep
+budget, seeds, and evaluation protocol are recorded together.
 """
 
 from __future__ import annotations

@@ -11,3 +11,10 @@ This folder contains the 50k PPO pilot-study artifacts for all seven variants. T
 - `manifest.json` records the variant mapping, source artifact paths, and packaged result locations.
 
 The seven variants are B1 nominal, B2.1 non-differentiable reward, B2.2 non-differentiable reward with detached actor term, B2.3 non-differentiable detached actor-only, B3.1 differentiable reward-only, B3.2 differentiable reward plus actor, and B3.3 differentiable actor-only.
+
+## Provenance warning
+
+Before publication, reconcile the episode count in manifest.json with
+evaluation/true_cbf_free/metadata.json. They currently describe different
+evaluation counts, so this package must not be treated as a single
+fully-reproducible leaderboard until the provenance is corrected.
