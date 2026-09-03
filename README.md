@@ -1,8 +1,12 @@
 # Laned Highway RL
 
-This repository is the structured/laned track extracted from the combined
-workspace. It studies baseline DQN, ego-attention DQN, and controlled
-reward/safety integration in native HighwayEnv highway-v0.
+Standalone repository for the structured/laned track of the Highway RL
+project. It studies baseline DQN, ego-attention DQN, and controlled
+reward/safety integration in native HighwayEnv `highway-v0`.
+
+This repository has no runtime dependency on the combined migration source or
+on the laneless track. The source workspace may still be useful for historical
+provenance, but a fresh clone should be run from this repository root.
 
 ## Scientific flow
 
@@ -16,6 +20,10 @@ reward/safety integration in native HighwayEnv highway-v0.
 
 The notebooks are experiment narratives. Reusable code lives in
 src/deep_learning/DQN/ and notebooks/_shared/dqn_notebook_utils.py.
+
+See [notebooks/README.md](notebooks/README.md) for the notebook map and
+[docs/research_flow.md](docs/research_flow.md) for the controlled comparison
+protocol and validation commands.
 
 ## Environment and code
 
@@ -31,13 +39,28 @@ HighwayEnv semantics.
 
 ## Setup
 
-    python -m venv .venv
-    .venv/Scripts/Activate.ps1
-    python -m pip install -r requirements.txt
+```powershell
+py -3.10 -m venv .venv
+.\.venv\Scripts\Activate.ps1
+python -m pip install --upgrade pip
+python -m pip install -r requirements.txt
+```
 
 Open notebooks from this repository root so their project-root discovery
 finds src/ and notebooks/. Generated artifacts should stay outside Git.
 
-The source workspace contains the full combined documentation and split map;
-the structured PPO notebooks in this extracted snapshot still reference
-backends that must be restored or rewritten before they are reproducible.
+For a dependency/import check before opening a notebook:
+
+```powershell
+python src\deep_learning\DQN\elurant_dqn.py --help
+python src\deep_learning\DQN\attention_dqn.py --help
+```
+
+The structured PPO notebooks are retained as historical narratives. They
+currently reference backend modules that are not present in this repository;
+restore those backends or rewrite the notebooks before presenting them as
+reproducible entry points.
+
+The CEM planning notebook is not part of this extraction because it requires
+an unpinned external `rl-agents` checkout. Promote it only after deciding
+whether it belongs in this repository and recording that dependency.
