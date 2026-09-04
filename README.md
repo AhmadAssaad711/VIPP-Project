@@ -2,7 +2,7 @@
 
 # Highway RL Decision Making
 
-**Baselines, improvements, and extensions for structured, congested, and laneless highway environments.**
+**Structured highway decision-making research, with the unstructured track maintained separately.**
 
 [Project Workspace](highway-rl-decision-making/) | [Notebook Map](highway-rl-decision-making/notebooks/) | [Paper](highway-rl-decision-making/docs/paper/highway-rl-decision-making-paper.pdf) | [Setup](#setup)
 
@@ -22,22 +22,36 @@ This repository presents work on high-level decision making for autonomous drivi
 - lane-based highway policies
 - dense traffic behavior
 - safety-aware reward design
-- laneless and unstructured highway environments
 - planning comparisons for decision-level behavior
 
 The repo is intentionally notebook-first. Each notebook captures a specific experiment, baseline, reproduction, or environment study.
 
 ## Research Flow
 
-The workspace now has two explicit scientific tracks:
-
-1. laned/structured HighwayEnv: baseline and attention DQN, followed by
-   controlled reward and safety-term integration in congested traffic;
-2. laneless/unstructured HighwayEnv: the custom lane-free environment,
-   Karalakou reward formulation, PPO progression, and CBF research.
+The structured source retained in this workspace covers baseline and
+attention DQN, controlled reward/safety studies in congested traffic, and
+the historical planning notebook. The unstructured SafeRL track was extracted
+to the standalone `laneless-karalakou-cbf` repository and removed from this
+source tree.
 
 The detailed notebook-to-script flow is documented in
 [research_flow.md](highway-rl-decision-making/docs/research_flow.md).
+
+## Split repositories
+
+The local staging roots are intentionally ignored by this parent repository:
+
+- [laned-highway-rl/](laned-highway-rl/) contains the structured, lane-based
+  HighwayEnv experiments.
+- [laneless-karalakou-cbf/](laneless-karalakou-cbf/) is the preserved
+  standalone source for the custom lane-free environment and PPO/CBF
+  experiments.
+
+Each staging root has its own `.git` directory and can be cloned, tested, and
+published independently. The parent checkout no longer contains the
+unstructured implementation or its generated result trees. The extraction
+boundary and remaining publication gates are recorded in
+[repository_split_status.md](highway-rl-decision-making/docs/repository_split_status.md).
 
 Associated paper: [`highway-rl-decision-making-paper.pdf`](highway-rl-decision-making/docs/paper/highway-rl-decision-making-paper.pdf)
 
@@ -47,9 +61,7 @@ Associated paper: [`highway-rl-decision-making-paper.pdf`](highway-rl-decision-m
 | --- | --- | --- |
 | Structured highway RL | Baseline DQN and PPO behavior in lane-based highway settings. | [`baseline_dqn`](highway-rl-decision-making/notebooks/structured_highway/baseline_dqn/baseline_dqn.ipynb), [`attention_dqn`](highway-rl-decision-making/notebooks/structured_highway/attention_dqn/attention_dqn.ipynb), [`PPO_trials`](highway-rl-decision-making/notebooks/structured_highway/ppo/PPO_trials.ipynb) |
 | Attention and hybrid PPO | Improvements over baseline policy structure. | [`Attention_PPO_baseline`](highway-rl-decision-making/notebooks/structured_highway/ppo/Attention_PPO_baseline.ipynb), [`Hybrid_PPO_baseline`](highway-rl-decision-making/notebooks/structured_highway/ppo/Hybrid_PPO_baseline.ipynb) |
-| Congested traffic | Baseline extensions under dense traffic and safety constraints. | [`congested_traffic_policy`](highway-rl-decision-making/notebooks/congested_traffic/congested_traffic_policy.ipynb), [`congested_traffic_policy_v2`](highway-rl-decision-making/notebooks/congested_traffic/congested_traffic_policy_v2.ipynb), [`potential_field_reward_test`](highway-rl-decision-making/notebooks/congested_traffic/congested_reward_safety_factor_study.ipynb) |
-| Laneless environments | Baseline extensions when lane assumptions break down. | [`laneless_highway_env`](highway-rl-decision-making/notebooks/laneless_unstructured/laneless_highway_env.ipynb) |
-| Laneless PPO/CBF formulation | Continuous-policy and high-order CBF research without lane labels. | [`lanelessKaralakou`](highway-rl-decision-making/notebooks/lanelessKaralakou.ipynb), [`run_ppo_cbf_progression`](highway-rl-decision-making/scripts/run_ppo_cbf_progression.py) |
+| Congested traffic | Baseline extensions under dense traffic and safety constraints. | [`congested_traffic_policy`](highway-rl-decision-making/notebooks/congested_traffic/congested_traffic_policy.ipynb), [`potential_field_reward_test`](highway-rl-decision-making/notebooks/congested_traffic/congested_reward_safety_factor_study.ipynb) |
 | Planning comparison | How do planning-based methods compare as decision baselines? | [`CEM_planning_trials`](highway-rl-decision-making/notebooks/planning/CEM_planning_trials.ipynb) |
 
 ## Repository Layout
@@ -63,15 +75,18 @@ highway-rl-decision-making/
   notebooks/
     structured_highway/
     congested_traffic/
-    laneless_unstructured/
     planning/
 ```
 
 ## What Is Included
 
-The active reusable implementation is in the nested project workspace,
-including structured DQN modules, laneless PPO/CBF scripts, documented
-notebook flow, and the associated paper.
+The active reusable implementation is in the nested project workspace and
+contains the structured DQN modules, structured notebook flow, planning
+notebook, and associated paper.
+
+The nested project remains a read-only migration source while the two
+track-specific repositories are reviewed. Do not add new experiments to the
+parent workspace when they belong in one of the staging repositories.
 
 - clean notebook portfolio
 - associated paper
@@ -84,12 +99,13 @@ notebook flow, and the associated paper.
 - unrelated practice problems
 - old experimental folders
 - vendored external repositories
+- the extracted unstructured SafeRL implementation and result trees
 - generated logs, videos, checkpoints, and artifacts
 - material outside decision-level highway RL
 
 Python caches and local virtual environments are also excluded from the
-source package. Historical result manifests remain in this checkout while
-the two track-specific repositories are prepared.
+source package. The standalone laneless repository remains beside this
+checkout; it is not part of the parent source tree.
 
 ## Setup
 

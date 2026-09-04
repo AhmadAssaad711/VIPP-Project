@@ -2,15 +2,15 @@
 
 Notebooks are experiment narratives. Run setup/configuration cells first,
 then training/evaluation cells in order. Reusable implementation belongs in
-src/ or scripts/; the notebook should make the hypothesis, controlled
+src/; the notebook should make the hypothesis, controlled
 variables, inputs, outputs, and interpretation visible.
 
 The complete dependency and artifact flow is in
 [../docs/research_flow.md](../docs/research_flow.md).
 
 Recommended order: structured baseline DQN, attention DQN, the controlled
-congested four-experiment ablation, broader structured reward studies, then
-the laneless environment smoke test and canonical lanelessKaralakou study.
+congested four-experiment ablation, broader structured reward studies, and
+the planning comparison notebook.
 
 Associated paper: [`../docs/paper/highway-rl-decision-making-paper.pdf`](../docs/paper/highway-rl-decision-making-paper.pdf)
 
@@ -35,19 +35,7 @@ are restored or the notebooks are rewritten.
 | Notebook | Focus |
 | --- | --- |
 | [`congested_traffic_policy.ipynb`](congested_traffic/congested_traffic_policy.ipynb) | Dense traffic policy experiment. |
-| [`congested_traffic_policy_v2.ipynb`](congested_traffic/congested_traffic_policy_v2.ipynb) | Second congested traffic policy variant. |
 | [`congested_reward_safety_factor_study.ipynb`](congested_traffic/congested_reward_safety_factor_study.ipynb) | Attention DQN with base reward plus potential-field reward shaping. |
-
-## Laneless and Unstructured
-
-| Notebook | Focus |
-| --- | --- |
-| [`laneless_highway_env.ipynb`](laneless_unstructured/laneless_highway_env.ipynb) | Laneless highway environment study. |
-| [`lanelessKaralakou.ipynb`](lanelessKaralakou.ipynb) | Canonical seven-policy PPO/CBF formulation and paired evaluation. |
-
-The laneless notebooks use the custom lane-free-v0 environment and
-continuous [a_x, a_y] actions; they are separate from the lane-based
-structured profiles named semi_unstructured and unstructured_stress.
 
 ## Planning
 

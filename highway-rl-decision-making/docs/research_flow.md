@@ -1,16 +1,16 @@
 # Research flow
 
-This checkout currently contains two related, but scientifically different,
-research tracks. The intended split is by environment and research question,
-not by the order in which files were created:
+This checkout contains the retained structured/lane-based research track. The
+unstructured SafeRL track was extracted to the standalone
+`laneless-karalakou-cbf` repository and is no longer implemented or evaluated
+from this source tree. The intended structured flow is:
 
 | Track | Environment | Scientific question | Main entry points |
 | --- | --- | --- | --- |
 | Laned / structured | highway-v0 from HighwayEnv | Does better scene representation, followed by carefully isolated reward and safety terms, improve lane-based decision making? | notebooks/structured_highway/, notebooks/congested_traffic/, src/deep_learning/DQN/ |
-| Laneless / unstructured | lane-free-v0 from laneless highway env/lane_free_env.py | Can a continuous policy and a high-order CBF formulation produce useful, collision-aware behavior without lane labels? | notebooks/lanelessKaralakou.ipynb, scripts/*ppo*cbf*, scripts/run_ppo_cbf_progression.py |
 
 Notebooks are the scientific narratives and experiment orchestrators. Python
-modules and scripts contain reusable environment construction, model,
+modules contain reusable environment construction, model,
 reward, safety, evaluation, and reporting logic. A notebook should explain
 the hypothesis, define the controlled variables, call those modules, and
 collect the resulting artifacts; it should not be the only place where the
@@ -29,12 +29,13 @@ core algorithm exists.
    for the clean 2x2 factorial comparison: baseline versus attention, each
    with and without the TTC safety reward.
 4. Use [congested_traffic_policy.ipynb](../notebooks/congested_traffic/congested_traffic_policy.ipynb)
-   and its v2 variant for the broader combination of traffic-flow,
+   for the broader combination of traffic-flow,
    adaptive-longitudinal, driver-aggressiveness, TTC-observation, potential
    field, and lane-change-safety terms.
 5. Run [congested_reward_safety_factor_study.ipynb](../notebooks/congested_traffic/congested_reward_safety_factor_study.ipynb)
-   only as the focused potential-field test. It borrows the proximity-field
-   idea from the laneless work but remains a laned highway-v0 experiment.
+   only as the focused potential-field test. It remains a laned
+   highway-v0 experiment and should be interpreted as a single-factor
+   reward study.
 
 The PPO notebooks under structured_highway/ppo/ are part of the intended
 laned track, but their imports should be checked before treating them as
@@ -66,63 +67,20 @@ the two intended factors: attention and TTC safety reward. The larger
 congested notebooks are follow-up studies and should not be presented as the
 same ablation.
 
-## Track B: laneless / unstructured HighwayEnv
+## Planning comparison
 
-### Recommended order
-
-1. Start with [laneless_highway_env.ipynb](../notebooks/laneless_unstructured/laneless_highway_env.ipynb)
-   to inspect and smoke-test the custom lane-free-v0 environment.
-2. Read and run [lanelessKaralakou.ipynb](../notebooks/lanelessKaralakou.ipynb) as the
-   canonical scientific formulation. It defines the shared continuous
-   observation/action contract, the Karalakou-style reward path, the CBF
-   geometry, the seven-policy progression, and the paired evaluation.
-3. Use [run_ppo_cbf_progression.py](../scripts/run_ppo_cbf_progression.py) for
-   repeatable command-line training of the PPO/CBF ladder. The progression
-   separates nominal PPO, non-differentiable hard projection, and
-   differentiable projection with reward and/or actor-internalization terms.
-4. Use the evaluate_ppo_cbf_*.py scripts for deployment, timing,
-   counterfactual, gain-grid, and CBF-free evaluation. Keep CBF-OFF and
-   CBF-ON results separate: removing a projection at evaluation time is not
-   the same as evaluating a policy that was trained without the CBF path.
-5. Use the render scripts only after the numeric evaluation has completed.
-   Videos are qualitative evidence and should be linked to a seed, checkpoint,
-   and evaluation manifest.
-
-### Code path
-
-    laneless notebook or CLI configuration
-      -> lane_free_env.py
-          -> ppo_cbf_env.py
-              -> cbf_projection.py
-              -> cbf_ray_mask.py (legacy DDPG path only)
-          -> ppo_reward_safety.py
-          -> ppo_observation_variants.py
-      -> projected_ppo_cbf.py
-          -> run_ppo_cbf_progression.py
-      -> finalResults/ or artifacts/<run>
-
-The custom environment has no lane index and no lane-change action. The ego
-action is a continuous longitudinal/lateral acceleration command. The CBF
-formulation inflates an elliptical clearance set, differentiates the barrier
-through the relative dynamics, imposes the HOCBF condition
-h_ddot + k1 h_dot + k0 h >= 0, and converts those conditions into
-two-dimensional linear inequalities. cbf_projection.py enumerates the target,
-one-face, and two-face candidates exactly. If the no-slack set is empty, it
-returns an explicitly labelled least-violating fallback; that fallback must
-not be reported as a safe QP solution.
-
-The canonical 1M study currently describes seven policies, five physics
-substeps per policy step, a 32-dimensional learned state, and paired CBF-OFF
-/ CBF-ON evaluation. Keep those protocol values in the run manifest and
-avoid comparing runs with different route length, episode count, or traffic
-model as though they were one leaderboard.
+[CEM_planning_trials.ipynb](../notebooks/planning/CEM_planning_trials.ipynb) is
+retained as a historical planning comparison. It depends on an external
+`rl-agents` checkout that is not included here, so it is not a clean smoke-test
+entry point until that dependency is pinned.
 
 ## Artifact and reproducibility rules
 
 Generated checkpoints, TensorBoard logs, monitor CSVs, videos, and Python
 caches belong outside version control. Commit small manifests, configuration
-snapshots, KPI tables, and selected figures. The current artifacts/ tree is
-useful for local continuation but is not a clean publication boundary.
+snapshots, KPI tables, and selected figures. The retained `artifacts/dqn/`
+tree contains the structured result summaries; new generated output should
+remain outside Git.
 
 Every promoted result should identify:
 
@@ -135,22 +93,13 @@ Every promoted result should identify:
 - checkpoint and artifact root;
 - whether CBF was present during training, evaluation, both, or neither.
 
-finalResults/ is a curated laneless package, not a replacement for the
-training manifest. Its current package contains a provenance inconsistency:
-the top-level manifest and the true-CBF-free evaluation metadata report
-different episode counts. Resolve that mismatch before using the package for
-publication claims.
-
-## Boundary for the eventual split
+## Boundary after the split
 
 The laned repository should contain the native highway-v0 experiments,
 attention DQN, baseline DQN, structured reward/safety wrappers, structured
 diagnostics, and their curated artifacts/dqn/* results.
 
-The laneless repository should contain lane_free_env.py, the
-lanelessKaralakou notebook, the PPO/CBF training and evaluation scripts,
-CBF tests, laneless registries/configuration, and curated laneless results.
-The upstream HighwayEnv checkout is currently a clean v1.11 gitlink with only
-a local .DS_Store deletion in its nested status; it should be pinned as a
-common dependency or explicit third-party revision rather than duplicated as
-part of the laneless implementation.
+The standalone `../laneless-karalakou-cbf/` repository is now the source of
+record for `lane-free-v0`, continuous PPO, Karalakou reward, CBF projection,
+and their tests/results. The parent source intentionally keeps no copy of
+that implementation, its laneless notebooks, or its generated result trees.
