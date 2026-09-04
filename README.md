@@ -4,9 +4,8 @@ Standalone repository for the structured/lane-based track of the Highway RL
 project. It studies baseline DQN, ego-attention DQN, and controlled
 reward/safety integration in native HighwayEnv `highway-v0`.
 
-The unstructured SafeRL track is maintained separately in the
-`laneless-karalakou-cbf` repository. This repository has no runtime dependency
-on that track or on the historical combined migration source.
+This repository contains only the structured/lane-based track. The historical
+combined migration source is not a runtime dependency.
 
 ## Scientific flow
 
@@ -23,7 +22,8 @@ The notebooks are experiment narratives. Reusable code lives in
 
 See [notebooks/README.md](notebooks/README.md) for the notebook map and
 [docs/research_flow.md](docs/research_flow.md) for the controlled comparison
-protocol and validation commands.
+protocol and validation commands. The retained graph and diagram index is in
+[docs/visualizations.md](docs/visualizations.md).
 
 ## Environment and code
 

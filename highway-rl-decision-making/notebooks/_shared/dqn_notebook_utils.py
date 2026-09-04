@@ -7,9 +7,8 @@ the selected DQN backend, and provides common training, evaluation, plotting,
 and result-table helpers.
 
 The profiles named semi_unstructured and unstructured_stress remain in this
-module for historical experiments, but they still use lane counts and
-lane-based HighwayEnv semantics. They therefore belong to the structured
-track until a genuinely lane-free environment is selected.
+module as historical structured stress configurations. They use lane counts
+and lane-based HighwayEnv semantics.
 """
 from __future__ import annotations
 

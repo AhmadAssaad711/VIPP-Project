@@ -14,9 +14,8 @@ Every feature is disabled in the default configuration. The wrappers are
 therefore intended for controlled ablations: enable one term or an explicitly
 named combination, preserve the resulting configuration in the run manifest,
 and compare only runs with the same environment and evaluation protocol.
-This module belongs to the laned/structured track even when the potential
-field is conceptually inspired by the laneless Karalakou work; it operates on
-HighwayEnv lane geometry and lane-based actions.
+This module belongs to the structured track. Its optional potential field
+operates on HighwayEnv lane geometry and lane-based actions.
 """
 
 from __future__ import annotations

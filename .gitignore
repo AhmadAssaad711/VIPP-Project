@@ -31,7 +31,12 @@ tmp/
 temp/
 
 # Generated experiment outputs, models, and datasets
-artifacts/
+**/artifacts/
+!/artifacts/
+!/artifacts/dqn/
+!/artifacts/dqn/**
+/artifacts/dqn/**/models/
+/artifacts/dqn/**/*.zip
 results/
 runs/
 wandb/
@@ -61,6 +66,14 @@ models/
 *.csv
 *.xlsx
 
+# Curated structured figures and metadata are intentionally versioned.
+!/artifacts/dqn/**/*.png
+!/artifacts/dqn/**/*.jpg
+!/artifacts/dqn/**/*.jpeg
+!/artifacts/dqn/**/*.gif
+!/artifacts/dqn/**/*.json
+!/artifacts/dqn/**/*.csv
+
 # Reports, deliverables, references, and literature
 external_work/
 my_work/non_code/
@@ -85,4 +98,3 @@ notes/
 
 # Local split repositories
 /laned-highway-rl/
-/laneless-karalakou-cbf/

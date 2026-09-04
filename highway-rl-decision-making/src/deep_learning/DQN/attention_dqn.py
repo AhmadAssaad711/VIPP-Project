@@ -9,8 +9,8 @@ so the representation is the controlled factor in the clean comparison.
 
 The structured notebook may override make_config and build_policy_kwargs for
 an explicit experiment, but the selected configuration must be serialized
-with the run. This is not the laneless policy: it still consumes native
-lane-based HighwayEnv observations and discrete lane-level actions.
+with the run. This backend consumes native lane-based HighwayEnv observations
+and discrete lane-level actions.
 """
 
 from __future__ import annotations

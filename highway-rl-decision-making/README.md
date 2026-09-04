@@ -9,11 +9,8 @@ The canonical scientific map is [docs/research_flow.md](docs/research_flow.md).
 It defines the retained structured track, its execution order, code paths,
 and artifact ownership.
 
-The unstructured SafeRL track was extracted from this directory. Its
-standalone source remains beside the parent checkout as
-`../laneless-karalakou-cbf/`; that directory has its own Git history and is
-intentionally ignored by this source repository. The structured staging copy
-is `../laned-highway-rl/`.
+The structured staging copy is `../laned-highway-rl/`. This source directory
+does not depend on any sibling checkout.
 
 Use [notebooks/README.md](notebooks/README.md) for notebook flow and
 [docs/research_flow.md](docs/research_flow.md) for reusable module
@@ -31,9 +28,7 @@ This work focuses on structured decision-level behavior:
 ## Research Flow
 
 The retained work uses the lane-based HighwayEnv contract. Read
-docs/research_flow.md for the detailed notebook-to-module flow. For the
-unstructured environment and PPO/CBF formulation, use the standalone
-`../laneless-karalakou-cbf/` repository.
+docs/research_flow.md for the detailed notebook-to-module flow.
 
 Paper: [`docs/paper/highway-rl-decision-making-paper.pdf`](docs/paper/highway-rl-decision-making-paper.pdf)
 
@@ -46,6 +41,9 @@ Paper: [`docs/paper/highway-rl-decision-making-paper.pdf`](docs/paper/highway-rl
 | [`planning/`](notebooks/planning/) | CEM planning trials used as decision-level comparisons. |
 
 Full notebook list: [`notebooks/README.md`](notebooks/README.md)
+
+Rendered result figures and the archived result summaries are indexed in the
+parent workspace's [`docs/visualizations.md`](../docs/visualizations.md).
 
 ## Install
 
@@ -60,5 +58,4 @@ documentation and should not be committed by default. The local virtual
 environments are development environments rather than repository content;
 remove duplicates only after confirming which interpreter is still needed.
 Read [docs/repo_split_plan.md](docs/repo_split_plan.md) for the completed
-file-ownership decision and cleanup record. The parent no longer contains
-the unstructured implementation or its generated results.
+file-ownership decision and cleanup record.

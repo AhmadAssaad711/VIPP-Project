@@ -66,5 +66,5 @@ Every comparison must record:
 - checkpoint path; and
 - evaluation seeds, episode count, and metrics.
 
-Do not compare the structured results with the laneless `lane-free-v0` track:
-the state semantics, action space, and research question are different.
+Compare only runs with matching state semantics, action spaces, environment
+contracts, and evaluation protocols.

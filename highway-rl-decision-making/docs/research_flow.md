@@ -1,9 +1,8 @@
 # Research flow
 
-This checkout contains the retained structured/lane-based research track. The
-unstructured SafeRL track was extracted to the standalone
-`laneless-karalakou-cbf` repository and is no longer implemented or evaluated
-from this source tree. The intended structured flow is:
+This checkout contains the retained structured/lane-based research track. It
+is self-contained and is not evaluated through any sibling checkout. The
+intended structured flow is:
 
 | Track | Environment | Scientific question | Main entry points |
 | --- | --- | --- | --- |
@@ -93,13 +92,9 @@ Every promoted result should identify:
 - checkpoint and artifact root;
 - whether CBF was present during training, evaluation, both, or neither.
 
-## Boundary after the split
+## Repository boundary
 
-The laned repository should contain the native highway-v0 experiments,
-attention DQN, baseline DQN, structured reward/safety wrappers, structured
-diagnostics, and their curated artifacts/dqn/* results.
-
-The standalone `../laneless-karalakou-cbf/` repository is now the source of
-record for `lane-free-v0`, continuous PPO, Karalakou reward, CBF projection,
-and their tests/results. The parent source intentionally keeps no copy of
-that implementation, its laneless notebooks, or its generated result trees.
+This source tree owns the native highway-v0 experiments, attention DQN,
+baseline DQN, structured reward/safety wrappers, structured diagnostics, and
+their curated `artifacts/dqn/` results. Generated checkpoints, logs, videos,
+and caches remain outside version control.

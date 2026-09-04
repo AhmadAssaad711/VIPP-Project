@@ -26,8 +26,13 @@ code belongs under `src/deep_learning/DQN/`.
 
 The environment remains the lane-based HighwayEnv contract: lane counts and
 lane indices are meaningful, and the policy uses discrete lane-level actions.
-Profiles called `semi_unstructured` and `unstructured_stress` remain in this
-repository because they still use that structured contract.
+Profiles called `semi_unstructured` and `unstructured_stress` remain as
+historical structured stress configurations because they still use that
+structured contract.
+
+See [the visualization index](../docs/visualizations.md) for the retained
+graphs, diagram, archived result values, and the source notebook for each
+figure.
 
 ## Artifact rule
 

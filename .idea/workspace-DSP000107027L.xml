@@ -547,9 +547,6 @@
     <breakpoint-manager>
       <breakpoints>
         <line-breakpoint enabled="true" suspend="THREAD" type="jupyter-line">
-          <url>file://$PROJECT_DIR$/highway-rl-decision-making/notebooks/lanelessKaralakou.ipynb</url>
-          <line>6758</line>
-          <option name="timeStamp" value="1" />
         </line-breakpoint>
       </breakpoints>
     </breakpoint-manager>

@@ -14,6 +14,9 @@ the planning comparison notebook.
 
 Associated paper: [`../docs/paper/highway-rl-decision-making-paper.pdf`](../docs/paper/highway-rl-decision-making-paper.pdf)
 
+The retained graphs, diagram, and archived result values are catalogued in
+the parent workspace's [`docs/visualizations.md`](../../docs/visualizations.md).
+
 ## Structured Highway
 
 | Notebook | Focus |
