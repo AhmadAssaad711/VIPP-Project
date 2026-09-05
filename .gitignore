@@ -34,9 +34,19 @@ temp/
 **/artifacts/
 !/artifacts/
 !/artifacts/dqn/
-!/artifacts/dqn/**
-/artifacts/dqn/**/models/
-/artifacts/dqn/**/*.zip
+/artifacts/dqn/**
+!/artifacts/dqn/README.md
+!/artifacts/dqn/baseline_dqn/
+!/artifacts/dqn/baseline_dqn/baseline_dqn_driver_spectrum_20k/
+!/artifacts/dqn/baseline_dqn/baseline_dqn_driver_spectrum_20k/saved_model_eval_1000_episodes/
+!/artifacts/dqn/congested_potential_field_reward_test/
+!/artifacts/dqn/congested_potential_field_reward_test/attention_dqn_base_potential_field_20k/
+!/artifacts/dqn/congested_traffic_four_experiments/
+!/artifacts/dqn/congested_traffic_four_experiments/four_way_baseline_dqn_20k/
+!/artifacts/dqn/congested_traffic_four_experiments/four_way_baseline_dqn_20k/eval1/
+!/artifacts/dqn/ct_pf/
+!/artifacts/dqn/ct_pf/attn_pf20k/
+!/artifacts/dqn/ct_pf/attn_pf20k/eval1000/
 results/
 runs/
 wandb/
@@ -66,13 +76,21 @@ models/
 *.csv
 *.xlsx
 
-# Curated structured figures and metadata are intentionally versioned.
-!/artifacts/dqn/**/*.png
-!/artifacts/dqn/**/*.jpg
-!/artifacts/dqn/**/*.jpeg
-!/artifacts/dqn/**/*.gif
-!/artifacts/dqn/**/*.json
-!/artifacts/dqn/**/*.csv
+# Curated structured figures are intentionally versioned. New generated
+# outputs remain ignored unless they are explicitly promoted here.
+!/artifacts/dqn/baseline_dqn/baseline_dqn_driver_spectrum_20k/evaluation_metrics.png
+!/artifacts/dqn/baseline_dqn/baseline_dqn_driver_spectrum_20k/training_evaluation_summary.png
+!/artifacts/dqn/baseline_dqn/baseline_dqn_driver_spectrum_20k/saved_model_eval_1000_episodes/evaluation_metrics.png
+!/artifacts/dqn/baseline_dqn/baseline_dqn_driver_spectrum_20k/saved_model_eval_1000_episodes/evaluation_summary.png
+!/artifacts/dqn/congested_potential_field_reward_test/attention_dqn_base_potential_field_20k/evaluation_metrics.png
+!/artifacts/dqn/congested_traffic_four_experiments/four_way_baseline_dqn_20k/evaluation_metrics.png
+!/artifacts/dqn/congested_traffic_four_experiments/four_way_baseline_dqn_20k/training_evaluation_summary.png
+!/artifacts/dqn/congested_traffic_four_experiments/four_way_baseline_dqn_20k/eval1/metrics.png
+!/artifacts/dqn/congested_traffic_four_experiments/four_way_baseline_dqn_20k/eval1/summary.png
+!/artifacts/dqn/ct_pf/attn_pf20k/evaluation_metrics.png
+!/artifacts/dqn/ct_pf/attn_pf20k/training_evaluation_summary.png
+!/artifacts/dqn/ct_pf/attn_pf20k/eval1000/metrics.png
+!/artifacts/dqn/ct_pf/attn_pf20k/eval1000/summary.png
 
 # Reports, deliverables, references, and literature
 external_work/
