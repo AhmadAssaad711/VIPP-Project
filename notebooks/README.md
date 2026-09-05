@@ -15,6 +15,9 @@ code belongs under `src/deep_learning/DQN/`.
 4. The remaining congested-traffic notebooks are follow-up combinations of
    reward, traffic, and safety terms and should not be reported as the same
    factorial study.
+5. [`planning/CEM_planning_trials.ipynb`](planning/CEM_planning_trials.ipynb)
+   is a historical planning comparison and requires an external `rl-agents`
+   checkout.
 
 ## Notebook inventory
 
@@ -23,6 +26,7 @@ code belongs under `src/deep_learning/DQN/`.
 | Baseline and attention DQN | `structured_highway/baseline_dqn/`, `structured_highway/attention_dqn/` |
 | Structured PPO history | `structured_highway/ppo/` |
 | Congested traffic | `congested_traffic/` |
+| Planning comparison | `planning/CEM_planning_trials.ipynb` |
 
 The environment remains the lane-based HighwayEnv contract: lane counts and
 lane indices are meaningful, and the policy uses discrete lane-level actions.
@@ -33,6 +37,10 @@ structured contract.
 See [the visualization index](../docs/visualizations.md) for the retained
 graphs, diagram, archived result values, and the source notebook for each
 figure.
+
+Folder-level READMEs document the supported baseline, attention, congested,
+and historical PPO notebook families. Each one records its purpose, cell
+flow, expected outputs, and result status.
 
 ## Artifact rule
 

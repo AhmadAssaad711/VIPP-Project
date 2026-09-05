@@ -16,6 +16,8 @@ combined migration source is not a runtime dependency.
    for the controlled attention x TTC-safety 2x2 study.
 4. Use the other congested-traffic notebooks for explicitly labelled
    follow-up reward/control combinations.
+5. Use `notebooks/planning/CEM_planning_trials.ipynb` only as a historical
+   planning comparison until its external dependency is pinned.
 
 The notebooks are experiment narratives. Reusable code lives in
 `src/deep_learning/DQN/` and `notebooks/_shared/dqn_notebook_utils.py`.
@@ -24,6 +26,9 @@ See [notebooks/README.md](notebooks/README.md) for the notebook map and
 [docs/research_flow.md](docs/research_flow.md) for the controlled comparison
 protocol and validation commands. The retained graph and diagram index is in
 [docs/visualizations.md](docs/visualizations.md).
+
+The associated paper is available at
+[docs/paper/highway-rl-decision-making-paper.pdf](docs/paper/highway-rl-decision-making-paper.pdf).
 
 ## Environment and code
 
@@ -58,6 +63,6 @@ currently reference backend modules that are not present in this repository;
 restore those backends or rewrite the notebooks before presenting them as
 reproducible entry points.
 
-The CEM planning notebook is not part of this extraction because it requires
-an unpinned external `rl-agents` checkout. Promote it only after deciding
-whether it belongs in this repository and recording that dependency.
+The CEM planning notebook is retained as a historical comparison, but it
+requires an unpinned external `rl-agents` checkout and is not a clean
+reproducible entry point yet.

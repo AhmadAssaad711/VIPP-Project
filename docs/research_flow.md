@@ -37,6 +37,13 @@ attention backend uses an ego-centered extractor while preserving the same
 structured observation and action contract. Reward wrappers are opt-in and
 must be recorded in the run configuration.
 
+## Planning comparison
+
+[`CEM_planning_trials.ipynb`](../notebooks/planning/CEM_planning_trials.ipynb)
+is retained as a historical decision-level planning comparison. It depends on
+an external `rl-agents` checkout, so it is not a clean smoke-test entry point
+until that dependency is pinned and the notebook is rerun successfully.
+
 ## Quick checks
 
 From the repository root:

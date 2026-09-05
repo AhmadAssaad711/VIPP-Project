@@ -81,7 +81,7 @@ deliverables/
 study reports/
 references/
 *.pdf
-!highway-rl-decision-making/docs/paper/highway-rl-decision-making-paper.pdf
+!docs/paper/highway-rl-decision-making-paper.pdf
 *.ppt
 *.pptx
 **/literature review/
@@ -95,6 +95,3 @@ notes/
 **/*.canvas
 **/Pasted image*.png
 **/Screenshot *.png
-
-# Local split repositories
-/laned-highway-rl/
